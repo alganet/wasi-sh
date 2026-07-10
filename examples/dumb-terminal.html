@@ -1,0 +1,67 @@
+<!doctype html>
+<!-- wasi-sh use case B on the RAW Session contract — no xterm, no terminal
+     library at all. A Session is just a byte duplex: anything that feeds
+     session.write() and renders session.onOutput() bytes is a "terminal".
+     This hand-rolled one is a <pre> and an <input>. If a new web terminal
+     appears tomorrow, its adapter is the same handful of lines.
+
+     Interactive sessions park the shell on a SharedArrayBuffer, so this page
+     needs cross-origin isolation: serve with `npm run serve` (it sends the
+     COOP/COEP headers). -->
+<meta charset="utf-8">
+<title>wasi-sh — dumb terminal (no xterm)</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { background: #0b0e14; color: #d8dee9; padding: 1rem; min-height: 14rem; white-space: pre-wrap; }
+  input { width: 100%; font: 14px ui-monospace, monospace; padding: .4rem; box-sizing: border-box; }
+</style>
+
+<h1>wasi-sh: hand-rolled terminal</h1>
+<p>An interactive shell session wired to a <code>&lt;pre&gt;</code> and an
+<code>&lt;input&gt;</code> — the whole integration is the few lines marked
+below. Type a line and press Enter; <code>quit</code> ends the session.</p>
+
+<pre id="screen"></pre>
+<input id="line" placeholder="type here, Enter to send" autofocus>
+
+<script type="module">
+  import { spawn } from '../src/index.mjs';
+
+  const screen = document.getElementById('screen');
+  const line = document.getElementById('line');
+  const dec = new TextDecoder();
+
+  const session = await spawn({
+    script: `
+echo "guess my number (1-100), or 'quit'"
+n=$(( ($$ + ${Date.now() % 97}) % 100 + 1 ))
+while read -r g; do
+  case "$g" in
+    quit) echo "it was $n. bye"; exit 0;;
+    *[!0-9]*|'') echo "numbers only (or quit)";;
+    *) if [ "$g" -lt "$n" ]; then echo "higher"
+       elif [ "$g" -gt "$n" ]; then echo "lower"
+       else echo "yes! $g in $tries tries"; exit 0; fi;;
+  esac
+  tries=$((tries+1))
+done`,
+  });
+
+  // ── The entire terminal integration ──────────────────────────────
+  session.onOutput((bytes) => {                 // shell → screen
+    screen.textContent += dec.decode(bytes);
+    screen.scrollTop = screen.scrollHeight;
+  });
+  line.onkeydown = (e) => {                     // keyboard → shell
+    if (e.key !== 'Enter') return;
+    screen.textContent += `> ${line.value}\n`;
+    session.write(line.value + '\n');
+    line.value = '';
+  };
+  // ─────────────────────────────────────────────────────────────────
+
+  session.exited.then((code) => {
+    screen.textContent += `\n[session ended: exit ${code}]\n`;
+    line.disabled = true;
+  });
+</script>

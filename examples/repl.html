@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- wasi-sh use case B with a real terminal: xterm.js loaded from a CDN.
+     xterm is NOT a dependency of wasi-sh — the integration is the two marked
+     lines below (keystrokes → session.write, session.onOutput → term.write).
+
+     Interactive sessions need cross-origin isolation (SharedArrayBuffer):
+     serve with `npm run serve`, or on a static host add COOP/COEP headers or
+     a service-worker shim such as https://github.com/gzuidhof/coi-serviceworker -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wasi-sh REPL — cmdsubst · pipes · isolation</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.min.css">
+<style>
+  html,body{margin:0;height:100%;background:#0b0e14;color:#c5c8c6;font-family:ui-monospace,monospace}
+  header{padding:8px 12px;font-size:13px;color:#8a8f98;border-bottom:1px solid #1c2230}
+  header b{color:#d7dae0}
+  #bar{padding:6px 12px;border-bottom:1px solid #1c2230;font-size:12px;color:#8a8f98}
+  #bar button{background:#141a26;color:#9cc4ff;border:1px solid #24304a;border-radius:5px;
+    padding:3px 8px;margin:2px 3px 2px 0;font:inherit;font-size:11px;cursor:pointer}
+  #bar button:hover{background:#1b2436}
+  #term{position:absolute;top:96px;bottom:0;left:0;right:0;padding:6px 8px}
+  code{color:#c5b3ff}
+</style>
+</head>
+<body>
+<header>
+  <b>busybox ash</b> via <code>wasi-sh</code> — plain <code>wasm32-wasi</code>,
+  <b>fork stubbed to ENOSYS</b>, yet <code>$(...)</code>, pipes and subshell isolation
+  work (fork-free, in-process). Builtins only — there is no <code>exec</code>.
+</header>
+<div id="bar">Try:
+  <button data-cmd='echo "today: $(date 2>/dev/null || echo no-date-applet), pid $$"'>cmdsubst</button>
+  <button data-cmd='printf "3\n1\n2\n" | while read n; do echo "line $n"; done'>pipe → while read</button>
+  <button data-cmd='x=$(y=5; echo captured); echo "x=[$x]  y=[$y]  (y did NOT leak)"'>isolation</button>
+  <button data-cmd='a=1; b=$(a=99; echo "$a"); echo "inner saw a=$b, outer a=$a (restored)"'>restore on exit</button>
+  <button data-cmd='echo "$(i=1; while [ $i -le 5 ]; do printf "%s " $((i*i)); i=$((i+1)); done)"'>squares</button>
+  <button data-cmd='set +e; z=$(set -e; false; echo unreached); echo "z=[$z] rc=$? — parent errexit still off"'>set -e contained</button>
+  <button data-cmd='echo hi | read foo; echo "foo=[$foo]  (pipe stage is a subshell)"'>pipe subshell</button>
+  <button data-cmd='w=$(printf "a b c" | while read p q r; do echo "$r$q$p"; done); echo "[$w]"'>nested pipe in $()</button>
+  <button data-cmd='r=$(exit 7); echo "rc=$?  (exit status propagates)"; echo still-alive'>exit status</button>
+</div>
+<div id="term"></div>
+<script type="module">
+import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/+esm";
+import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/+esm";
+import { spawn } from "../src/index.mjs";
+
+const term = new Terminal({ cursorBlink:true, fontSize:14, convertEol:false, theme:{background:"#0b0e14"} });
+const fit = new FitAddon(); term.loadAddon(fit);
+term.open(document.getElementById("term")); fit.fit();
+addEventListener("resize", () => fit.fit());
+const say = (s) => term.write(s);
+
+// ── tiny REPL: local line editing at the prompt, sentinel to detect that a
+//    command finished. The shell runs each typed line, then we ask it to print
+//    \x1e<status>\x1e so we know to draw the next prompt (and strip the marker).
+const RS = "\x1e";
+let line = "";       // current input line
+let running = false; // a command is executing
+let acc = "";        // output accumulator (to catch the sentinel across chunks)
+const PROMPT = "\x1b[36m$\x1b[0m ";
+const prompt = () => term.write("\r\n" + PROMPT);
+
+let session;
+try {
+  say("Loading busybox.wasm…\r\n");
+  session = await spawn({
+    args: ["busybox", "sh"],
+    env: { PS1: "", LC_ALL: "C" },
+  });
+} catch (e) {
+  say("\r\n\x1b[31m" + (e?.message || e) + "\x1b[0m\r\n");
+  throw e;
+}
+
+function runLine(cmd){
+  const trimmed = cmd.trim();
+  if (!trimmed){ prompt(); return; }
+  running = true;
+  // run the line, then emit the exit status wrapped in RS markers
+  session.write(cmd + "\n");
+  session.write('printf "' + RS + '%d' + RS + '\\n" "$?"\n');
+}
+
+const dec = new TextDecoder();
+session.onOutput((bytes) => {                                  // shell → terminal
+  acc += dec.decode(bytes);
+  // process complete \x1e...\x1e markers; write everything else
+  for (;;){
+    const i = acc.indexOf(RS);
+    if (i < 0){ term.write(acc); acc = ""; return; }
+    term.write(acc.slice(0, i));            // text before the marker
+    const rest = acc.slice(i + 1);
+    const j = rest.indexOf(RS);
+    if (j < 0){ acc = RS + rest; return; }  // marker not complete yet — wait
+    // full marker consumed (status in rest.slice(0,j)); command finished
+    acc = rest.slice(j + 1);
+    running = false;
+    prompt();
+  }
+});
+session.exited.then((code) => say("\r\n[shell exited: " + code + "]\r\n"));
+session.onError((e) => say("\r\n[error: " + e.message + "]\r\n"));
+
+term.onData(d => {
+  if (running){ session.write(d); return; }                    // keyboard → shell
+  for (const ch of d){
+    if (ch === "\r"){ term.write("\r\n"); const l = line; line = ""; runLine(l); }
+    else if (ch === "\x7f" || ch === "\b"){ if (line){ line = line.slice(0,-1); term.write("\b \b"); } }
+    else if (ch === "\x03"){ line = ""; term.write("^C"); prompt(); }
+    else if (ch === "\x0c"){ term.write("\x1b[2J\x1b[H"); term.write(PROMPT + line); }  // Ctrl-L clear
+    else if (ch >= " "){ line += ch; term.write(ch); }
+  }
+});
+
+// clickable examples: fill the line, echo it, run it
+for (const btn of document.querySelectorAll("#bar button")){
+  btn.addEventListener("click", () => {
+    if (running) return;
+    const cmd = btn.getAttribute("data-cmd");
+    term.write(cmd + "\r\n"); line = "";
+    runLine(cmd); term.focus();
+  });
+}
+
+say("\x1b[38;5;250mbusybox ash — fork-free command substitution, pipes & subshell isolation.\x1b[0m\r\n");
+say("\x1b[38;5;244mType a command, or click an example above. (builtins only — no exec)\x1b[0m\r\n");
+prompt();
+term.focus();
+</script>
+</body>
+</html>

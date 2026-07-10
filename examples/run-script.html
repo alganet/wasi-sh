@@ -1,0 +1,53 @@
+<!doctype html>
+<!-- wasi-sh use case A: run a shell script, get its output. No terminal, no
+     SharedArrayBuffer, no COOP/COEP headers — this page works on any static
+     host as-is. -->
+<meta charset="utf-8">
+<title>wasi-sh — run a script</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 11rem; font: 13px/1.45 ui-monospace, monospace; }
+  pre { background: #0b0e14; color: #d8dee9; padding: 1rem; min-height: 6rem; white-space: pre-wrap; }
+  pre .err { color: #ff8c8c; }
+  button { font-size: 15px; padding: .35rem 1.2rem; }
+</style>
+
+<h1>wasi-sh: run a script</h1>
+<p>A pure-shell script running on busybox ash compiled to wasm — command
+substitution, pipes of builtins, arithmetic — with the output collected like
+a CI job. Nothing here needs cross-origin isolation.</p>
+
+<textarea id="src">greet() { echo "hello, $1"; }
+for who in browser wasm shell; do
+  greet "$who"
+done
+total=$(for i in 1 2 3 4 5; do echo $i; done | while read n; do echo $((n*n)); done | {
+  sum=0; while read sq; do sum=$((sum+sq)); done; echo $sum
+})
+echo "sum of squares: $total"</textarea>
+<p><button id="go">Run</button> <span id="status"></span></p>
+<pre id="out"></pre>
+
+<script type="module">
+  import { run } from '../src/index.mjs';
+
+  const out = document.getElementById('out');
+  const status = document.getElementById('status');
+  document.getElementById('go').onclick = async () => {
+    out.textContent = '';
+    status.textContent = 'running…';
+    const t0 = performance.now();
+    const dec = new TextDecoder();
+    const result = await run({
+      script: document.getElementById('src').value,
+      // Streaming (optional): paint chunks as they arrive.
+      onOutput: (bytes, channel) => {
+        const span = document.createElement('span');
+        if (channel === 'stderr') span.className = 'err';
+        span.textContent = dec.decode(bytes);
+        out.appendChild(span);
+      },
+    });
+    status.textContent = `exit ${result.exitCode} in ${(performance.now() - t0).toFixed(0)}ms`;
+  };
+</script>
