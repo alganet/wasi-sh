@@ -1,0 +1,58 @@
+{
+  "name": "wasi-sh",
+  "version": "0.1.0",
+  "description": "Run pure shell scripts in the browser — busybox ash compiled to wasm32-wasi, fork-free",
+  "license": "ISC",
+  "author": "Alexandre Gomes Gaigalas <alganet@gmail.com>",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./run": "./src/run.mjs",
+    "./spawn": "./src/spawn.mjs",
+    "./shim": "./src/shim.mjs",
+    "./worker": "./src/worker.mjs",
+    "./ring": "./src/ring.mjs",
+    "./files": "./src/files.mjs",
+    "./node": "./src/node.mjs",
+    "./xterm": "./src/xterm.mjs",
+    "./busybox.wasm": "./dist/busybox.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dist",
+    "build",
+    "examples",
+    "scripts"
+  ],
+  "sideEffects": [
+    "./src/worker.mjs"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "serve": "node scripts/serve.mjs",
+    "build:wasm": "build/build.sh"
+  },
+  "peerDependencies": {
+    "@xterm/xterm": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "@xterm/xterm": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "wasm",
+    "wasi",
+    "shell",
+    "sh",
+    "ash",
+    "busybox",
+    "browser",
+    "terminal",
+    "webassembly"
+  ]
+}

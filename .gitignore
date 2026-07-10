@@ -1,0 +1,9 @@
+# build workspace (tarball, extracted tree, objects)
+/build/work/
+
+# node
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store

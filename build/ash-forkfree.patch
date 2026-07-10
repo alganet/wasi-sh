@@ -1,0 +1,281 @@
+--- /sessions/modest-affectionate-ramanujan/mnt/wasix/busybox-1.38.0/shell/ash.c	2026-07-01 07:38:56.281610294 -0300
++++ /tmp/bb/shell/ash.c	2026-07-07 09:15:03.747017693 -0300
+@@ -6859,6 +6859,11 @@
+ 	/* NOTREACHED */
+ }
+ 
++/* fork-free subshell state isolation (defined near mklocal, below) */
++static void subsh_begin(void);
++static void subsh_end(void);
++static int eval_subshell_body(union node *n, int flags);
++
+ static void FAST_FUNC
+ evalbackcmd(union node *n, struct backcmd *result
+ 				IF_BASH_PROCESS_SUBST(, int ctl))
+@@ -6885,6 +6890,33 @@
+ 
+ 	if (pipe(pip) < 0)
+ 		ash_msg_and_raise_perror("can't create pipe");
++	/* ---- fork-free command substitution (POC, no OS fork) --------------
++	 * A real shell forks a child that runs the command with stdout on the
++	 * pipe. With fork() stubbed to ENOSYS we instead redirect OUR stdout into
++	 * the pipe, run the command IN-PROCESS (evaltree returns, unlike the
++	 * child's evaltreenr+_exit), flush, and restore. The in-memory __host_pipe
++	 * buffer holds all output, so expbackq reads it back unchanged.
++	 * Caveat: not subshell-isolated (assignments/cd/set leak); fine for pure
++	 * captures like $(printf ...) with builtins only. */
++	if (ctl == CTLBACKQ) {
++		int save1, subsh_exc;
++		flush_stdout_stderr();
++		save1 = fcntl(1, F_DUPFD, 10);
++		subsh_begin();                  /* isolate var/option writes */
++		eflag = 0;                      /* set -e must not abort parent (restored) */
++		dup2(pip[1], 1);
++		close(pip[1]);
++		subsh_exc = eval_subshell_body(n, 0);  /* contains exit/errexit/errors */
++		flush_stdout_stderr();
++		subsh_end();                    /* revert assignments; restore options */
++		if (save1 >= 0) { dup2(save1, 1); close(save1); }
++		if (subsh_exc == EXINT)
++			raise_exception(EXINT);     /* only Ctrl-C escapes a subshell */
++		back_exitstatus = exitstatus;   /* $? of $(...) = inner status */
++		result->fd = pip[0];
++		result->jp = NULL;
++		goto out;
++	}
+ 	/* process substitution uses NULL job, like openhere() */
+ 	jp = (ctl == CTLBACKQ) ? makejob(1) : NULL;
+ 	if (forkshell(jp, n, FORK_NOJOB) == 0) {
+@@ -6956,6 +6988,12 @@
+ 	pushstackmark(&smark, startloc);
+ 	evalbackcmd(cmd, &in IF_BASH_PROCESS_SUBST(, ctl));
+ 	popstackmark(&smark);
++	/* fork-free cmdsubst runs evaltree in-process, which mutates the global
++	 * expdest and reallocs the string stack; the forked path never did.
++	 * Restore expdest from the saved offset so the outer arg keeps building
++	 * at the right spot. (No-op for the real-fork path: expdest is already
++	 * stackblock()+startloc there.) */
++	expdest = (char *)stackblock() + startloc;
+ 
+ 	if (ctl != CTLBACKQ) {
+ 		sprintf(buf, DEV_FD_PREFIX"%d", in.fd);
+@@ -6982,7 +7020,8 @@
+ 	free(in.buf);
+ 	if (in.fd >= 0) {
+ 		close(in.fd);
+-		back_exitstatus = waitforjob(in.jp);
++		if (in.jp)                      /* fork-free path sets jp=NULL + back_exitstatus itself */
++			back_exitstatus = waitforjob(in.jp);
+ 	}
+  done:
+ 	INTON;
+@@ -10067,64 +10106,58 @@
+ static int
+ evalpipe(union node *n, int flags)
+ {
+-	struct job *jp;
+ 	struct nodelist *lp;
+-	int pipelen;
+ 	int prevfd;
+ 	int pip[2];
+ 	int status = 0;
++	int save0, save1;
+ 
+ 	TRACE(("evalpipe(0x%lx) called\n", (long)n));
+-	pipelen = 0;
+-	for (lp = n->npipe.cmdlist; lp; lp = lp->next)
+-		pipelen++;
+-	flags |= EV_EXIT;
++	/* ---- fork-free pipeline (POC, no OS fork) --------------------------
++	 * A real shell forks every stage and runs them concurrently, connected
++	 * by pipes. With fork() stubbed out we run each stage to completion IN
++	 * SEQUENCE, wiring them with in-memory __host_pipe buffers: stage k's
++	 * stdout is captured into a buffer that becomes stage k+1's stdin; the
++	 * last stage writes to the real stdout. evaltree runs in-process
++	 * (returns) instead of the child's evaltreenr+_exit.
++	 * Limitations vs real pipes: no concurrency (a stage must finish and
++	 * fully buffer its output before the next runs, so an unbounded producer
++	 * like `yes | head` will not stream), no SIGPIPE/backpressure, and stages
++	 * are NOT subshell-isolated (a stage's assignments leak, like bash's
++	 * lastpipe). Fine for finite builtin pipelines. */
+ 	INTOFF;
+-	if (n->npipe.pipe_backgnd == 0)
+-		get_tty_state();
+-	jp = makejob(pipelen);
+ 	prevfd = -1;
+ 	for (lp = n->npipe.cmdlist; lp; lp = lp->next) {
+ 		prehash(lp->n);
+ 		pip[1] = -1;
+ 		if (lp->next) {
+ 			if (pipe(pip) < 0) {
+-				close(prevfd);
++				if (prevfd >= 0) close(prevfd);
+ 				ash_msg_and_raise_perror("can't create pipe");
+ 			}
+ 		}
+-		if (forkshell(jp, lp->n, n->npipe.pipe_backgnd) == 0) {
+-			/* child */
+-			reset_exception_handler();
+-			INTON;
+-			if (pip[1] >= 0) {
+-				close(pip[0]);
+-			}
+-			if (prevfd > 0) {
+-				dup2(prevfd, 0);
+-				close(prevfd);
+-			}
+-			if (pip[1] > 1) {
+-				dup2(pip[1], 1);
+-				close(pip[1]);
+-			}
+-			evaltreenr(lp->n, flags);
+-			/* never returns */
++		save0 = fcntl(0, F_DUPFD, 10);
++		save1 = fcntl(1, F_DUPFD, 10);
++		subsh_begin();                  /* each stage is a subshell */
++		if (prevfd >= 0)
++			dup2(prevfd, 0);
++		if (pip[1] >= 0) {
++			dup2(pip[1], 1);
++			close(pip[1]);
+ 		}
+-		/* parent */
++		eval_subshell_body(lp->n, flags & ~EV_EXIT);
++		flush_stdout_stderr();
++		subsh_end();
++		if (save0 >= 0) { dup2(save0, 0); close(save0); }
++		if (save1 >= 0) { dup2(save1, 1); close(save1); }
+ 		if (prevfd >= 0)
+ 			close(prevfd);
+-		prevfd = pip[0];
+-		/* Don't want to trigger debugging */
+-		if (pip[1] != -1)
+-			close(pip[1]);
+-	}
+-	if (n->npipe.pipe_backgnd == 0) {
+-		status = waitforjob(jp);
+-		TRACE(("evalpipe:  job done exit status %d\n", status));
++		prevfd = (pip[1] >= 0) ? pip[0] : -1;
+ 	}
++	if (prevfd >= 0)
++		close(prevfd);
++	status = exitstatus;
+ 	INTON;
+-
+ 	return status;
+ }
+ 
+@@ -10434,6 +10467,113 @@
+ 	INTON;
+ }
+ 
++/* ---- POC: in-process subshell state isolation --------------------------
++ * A real fork gives a subshell a private copy of the shell's memory; the
++ * fork-free path approximates it with ash's own localvar machinery.
++ * subsh_begin(): open a localvar scope, save $- (all shell options) and every
++ * currently-set, non-readonly variable into it, so any WRITE is reverted on
++ * pop while READS still see the inherited value. subsh_end(): unset any
++ * variable CREATED during the eval (found by pointer identity against the
++ * scope), then poplocalvars() restores the rest and the options. $? is left
++ * alone so it propagates out (as $(...) / subshells require). Not yet handled:
++ * traps, cwd (cd is a no-op in this wasm), positional params, function defs. */
++static void
++subsh_begin(void)
++{
++	struct var **vpp, *vp;
++	char **texts;
++	int tn = 0, tcap = 32, i;
++
++	INTOFF;
++	pushlocalvars(1);
++	mklocal((char *)"-", 0);            /* snapshot all shell options ($-) */
++	texts = ckmalloc(tcap * sizeof(texts[0]));
++	for (vpp = vartab; vpp < vartab + VTABSIZE; vpp++) {
++		for (vp = *vpp; vp; vp = vp->next) {
++			if (vp->flags & (VUNSET | VREADONLY))
++				continue;
++			if (tn >= tcap) {
++				tcap *= 2;
++				texts = ckrealloc(texts, tcap * sizeof(texts[0]));
++			}
++			texts[tn++] = ckstrdup(vp->var_text);
++		}
++	}
++	for (i = 0; i < tn; i++) {
++		mklocal(texts[i], 0);           /* setvareq copies it -> free our copy */
++		free(texts[i]);
++	}
++	free(texts);
++	INTON;
++}
++
++static void
++subsh_end(void)
++{
++	struct var **vpp, *vp;
++	struct localvar *lvp;
++	char **leaked;
++	int ln = 0, lcap = 16, i;
++
++	INTOFF;
++	leaked = ckmalloc(lcap * sizeof(leaked[0]));
++	for (vpp = vartab; vpp < vartab + VTABSIZE; vpp++) {
++		for (vp = *vpp; vp; vp = vp->next) {
++			int tracked = 0;
++			if (vp->flags & VUNSET)
++				continue;
++			for (lvp = localvar_stack->lv; lvp; lvp = lvp->next) {
++				if (lvp->vp == vp) { tracked = 1; break; }
++			}
++			if (!tracked) {
++				if (ln >= lcap) {
++					lcap *= 2;
++					leaked = ckrealloc(leaked, lcap * sizeof(leaked[0]));
++				}
++				leaked[ln++] = ckstrdup(vp->var_text);
++			}
++		}
++	}
++	for (i = 0; i < ln; i++) {
++		char *eq = strchr(leaked[i], '=');
++		if (eq) *eq = '\0';
++		unsetvar(leaked[i]);
++		free(leaked[i]);
++	}
++	free(leaked);
++	poplocalvars(0);                    /* restore saved vars + options */
++	INTON;
++}
++
++/* Run evaltree() in-process as a subshell body, CONTAINING exit/errexit/errors
++ * inside it (a real forked child would just _exit). Mirrors redirectsafe()'s
++ * setjmp dance. Returns -1 on normal completion, else the exception_type so the
++ * caller can re-raise SIGINT (EXINT) which must not be swallowed by a subshell.
++ * exitstatus already holds the subshell's status in all cases. */
++static int
++eval_subshell_body(union node *n, int flags)
++{
++	struct jmploc *volatile savehandler = exception_handler;
++	struct jmploc jmploc;
++	volatile int saveint;
++	int e;
++
++	SAVE_INT(saveint);
++	e = setjmp(jmploc.loc);
++	if (!e) {
++		exception_handler = &jmploc;
++		evaltree(n, flags);
++	}
++	exception_handler = savehandler;
++	RESTORE_INT(saveint);
++	/* mirror the top-level EXEXIT handler: `exit N` stashes N in savestatus */
++	if (e == 0)
++		return -1;
++	if (exception_type == EXEXIT && savestatus >= 0)
++		exitstatus = savestatus;
++	return exception_type;
++}
++
+ static int FAST_FUNC
+ localcmd(int argc UNUSED_PARAM, char **argv)
+ {
