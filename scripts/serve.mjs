@@ -4,7 +4,7 @@
 //   node scripts/serve.mjs [--port 8000] [--root <dir>]
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { extname, join, normalize } from 'node:path';
+import { extname, join, normalize, resolve } from 'node:path';
 
 const args = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -12,7 +12,9 @@ const opt = (name, dflt) => {
   return i >= 0 ? args[i + 1] : dflt;
 };
 const PORT = Number(opt('port', 8000));
-const ROOT = normalize(opt('root', join(import.meta.dirname, '..')));
+// resolve(): a RELATIVE --root (e.g. ".") must become absolute or the
+// traversal guard below rejects every request.
+const ROOT = resolve(opt('root', join(import.meta.dirname, '..')));
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
