@@ -169,8 +169,14 @@ Interactive semantics are testable headless too — drive a
 
 `dist/busybox.wasm` is busybox 1.38.0 `ash`, built by `build/build.sh`
 (pinned tarball + SHA-256, the fork-free ash patch, an ash-only config, and
-a `wasm32-wasi` toolchain — see the script for the details). `npm run
-build:wasm` reproduces it.
+a `wasm32-wasi` toolchain — zig or wasi-sdk; see the script for the flag
+rationale). `npm run build:wasm` rebuilds it and refuses to install a binary
+that fails its smoke test.
+
+The currently shipped binary is the one proven end-to-end by the original
+research port (this package's test suite runs against it); a from-source
+rebuild should additionally pass `npm test` and the downstream consumer
+checks before being trusted.
 
 ## Licensing
 
