@@ -1,0 +1,350 @@
+// Pins WasiShim behavior at the import-function level: hand-laid-out buffers
+// in a bare WebAssembly.Memory, no wasm module involved. Written against the
+// verbatim POC port BEFORE cleanups, so cleanups diff against green.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { WasiShim, WasiExit } from '../src/shim.mjs';
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// A shim bound to a bare 1-page memory, plus scratch helpers.
+function makeShim(opts = {}) {
+  const shim = new WasiShim(opts);
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  shim.bindMemory(memory);
+  const imports = shim.imports();
+  const p1 = imports.wasi_snapshot_preview1;
+  const env = imports.env;
+  const view = () => new DataView(memory.buffer);
+  const bytes = () => new Uint8Array(memory.buffer);
+  return { shim, p1, env, view, bytes };
+}
+
+// Lay out one iovec [ptr,len] pair at `iovsAt`, buffer at `bufAt`.
+function iovec(view, iovsAt, bufAt, len) {
+  view().setUint32(iovsAt, bufAt, true);
+  view().setUint32(iovsAt + 4, len, true);
+}
+
+// Write a path string into memory, return [ptr, len].
+function putStr(bytes, at, s) {
+  const b = enc.encode(s);
+  bytes().set(b, at);
+  return [at, b.length];
+}
+
+// path_open against preopen fd 3 ('/'); returns the opened fd.
+function openPath(t, path, expectErrno = 0) {
+  const [p, len] = putStr(t.bytes, 0x100, path);
+  const errno = t.p1.path_open(3, 0, p, len, 0, 0n, 0n, 0, 0x200);
+  assert.equal(errno, expectErrno, `path_open(${path}) errno`);
+  return expectErrno === 0 ? t.view().getUint32(0x200, true) : -1;
+}
+
+// fd_read into a 256-byte buffer; returns {errno, data}.
+function readFd(t, fd, max = 256) {
+  iovec(t.view, 0x300, 0x400, max);
+  const errno = t.p1.fd_read(fd, 0x300, 1, 0x308);
+  const n = t.view().getUint32(0x308, true);
+  return { errno, n, data: t.bytes().slice(0x400, 0x400 + n) };
+}
+
+// fd_write from a byte string; returns {errno, n}.
+function writeFd(t, fd, s) {
+  const b = enc.encode(s);
+  t.bytes().set(b, 0x500);
+  iovec(t.view, 0x600, 0x500, b.length);
+  const errno = t.p1.fd_write(fd, 0x600, 1, 0x608);
+  return { errno, n: t.view().getUint32(0x608, true) };
+}
+
+// ─── args / env marshalling ──────────────────────────────────────────────────
+
+test('args/environ size and content marshalling', () => {
+  const t = makeShim({ args: ['busybox', 'sh'], env: { A: '1', LONG: 'x y' } });
+  t.p1.args_sizes_get(0x10, 0x14);
+  assert.equal(t.view().getUint32(0x10, true), 2);
+  assert.equal(t.view().getUint32(0x14, true), 'busybox\0sh\0'.length);
+  t.p1.args_get(0x20, 0x40);
+  assert.equal(dec.decode(t.bytes().slice(0x40, 0x40 + 11)), 'busybox\0sh\0');
+
+  t.p1.environ_sizes_get(0x10, 0x14);
+  assert.equal(t.view().getUint32(0x10, true), 2);
+  t.p1.environ_get(0x20, 0x80);
+  const envBlob = dec.decode(t.bytes().slice(0x80, 0x80 + 13));
+  assert.equal(envBlob, 'A=1\0LONG=x y\0');
+});
+
+test('proc_exit throws WasiExit with the code', () => {
+  const t = makeShim();
+  assert.throws(() => t.p1.proc_exit(7), (e) => e instanceof WasiExit && e.code === 7);
+});
+
+// ─── FS: buildFs normalization + path ops ────────────────────────────────────
+
+test('buildFs: relative and unnormalized paths mount at normalized absolutes', () => {
+  const t = makeShim({ files: { 'rel.txt': 'r', '/a/./b/../c.txt': 'c' } });
+  assert.ok(t.shim.lookup('/rel.txt'), 'relative path mounts at /rel.txt');
+  assert.ok(t.shim.lookup('/a/c.txt'), '. and .. collapse');
+  assert.equal(t.shim.lookup('/a').type, 'dir', 'parent dirs synthesized');
+});
+
+test('resolve: relative paths resolve against the fd directory; .. clamps at root', () => {
+  const t = makeShim({ files: { '/d/f.txt': 'x' } });
+  assert.equal(t.shim.resolve(3, 'd/f.txt'), '/d/f.txt');
+  assert.equal(t.shim.resolve(3, '/../../etc'), '/etc', '.. above root clamps');
+});
+
+test('path_open + fd_read on a mounted file; fd_seek repositions', () => {
+  const t = makeShim({ files: { '/f.txt': 'hello world' } });
+  const fd = openPath(t, '/f.txt');
+  assert.equal(dec.decode(readFd(t, fd).data), 'hello world');
+  // seek back to 6 (whence 0 = SET), read the tail
+  t.p1.fd_seek(fd, 6n, 0, 0x700);
+  assert.equal(t.view().getBigUint64(0x700, true), 6n);
+  assert.equal(dec.decode(readFd(t, fd).data), 'world');
+});
+
+test('path_open on a missing path: NOENT unless under /tmp/ or /dev/null', () => {
+  const t = makeShim();
+  openPath(t, '/nope.txt', 44 /* NOENT */);
+  const tmp = openPath(t, '/tmp/scratch');
+  assert.ok(tmp > 0, '/tmp/ creation allowed');
+  const devnull = openPath(t, '/dev/null');
+  assert.ok(devnull > 0);
+});
+
+test('/dev/null reads EOF and discards writes', () => {
+  const t = makeShim();
+  const fd = openPath(t, '/dev/null');
+  const r = readFd(t, fd);
+  assert.equal(r.errno, 0);
+  assert.equal(r.n, 0, 'EOF');
+  const w = writeFd(t, fd, 'discarded');
+  assert.equal(w.errno, 0);
+  assert.equal(w.n, 9, 'write claims success');
+});
+
+test('fd_readdir walks children with cookies and d_type', () => {
+  const t = makeShim({ files: { '/dir/a.txt': 'a', '/dir/b.txt': 'b' } });
+  const fd = openPath(t, '/dir');
+  const errno = t.p1.fd_readdir(fd, 0x800, 256, 0n, 0x900);
+  assert.equal(errno, 0);
+  const written = t.view().getUint32(0x900, true);
+  assert.ok(written > 0);
+  // First dirent: d_next=1, namelen, name
+  assert.equal(t.view().getBigUint64(0x800, true), 1n);
+  const nlen = t.view().getUint32(0x800 + 16, true);
+  assert.equal(dec.decode(t.bytes().slice(0x800 + 24, 0x800 + 24 + nlen)), 'a.txt');
+  // Resume from cookie 1 → next entry is b.txt
+  t.p1.fd_readdir(fd, 0x800, 256, 1n, 0x900);
+  const nlen2 = t.view().getUint32(0x800 + 16, true);
+  assert.equal(dec.decode(t.bytes().slice(0x800 + 24, 0x800 + 24 + nlen2)), 'b.txt');
+});
+
+test('fd_filestat_get reports size for regular files', () => {
+  const t = makeShim({ files: { '/f.txt': '12345' } });
+  const fd = openPath(t, '/f.txt');
+  t.p1.fd_filestat_get(fd, 0xa00);
+  assert.equal(t.view().getUint8(0xa00 + 16), 4, 'filetype REG');
+  assert.equal(t.view().getBigUint64(0xa00 + 32, true), 5n, 'size');
+});
+
+// ─── stdout/stderr callbacks ─────────────────────────────────────────────────
+
+test('fd_write routes 1→stdout and 2→stderr callbacks', () => {
+  let out = '', err = '';
+  const t = makeShim({
+    stdout: (b) => { out += dec.decode(b); },
+    stderr: (b) => { err += dec.decode(b); },
+  });
+  writeFd(t, 1, 'to-out');
+  writeFd(t, 2, 'to-err');
+  assert.equal(out, 'to-out');
+  assert.equal(err, 'to-err');
+});
+
+// ─── host pipe / dup hooks ───────────────────────────────────────────────────
+
+test('__host_pipe allocates a read/write fd pair; write then read roundtrips', () => {
+  const t = makeShim();
+  t.env.__host_pipe(0x10);
+  const rfd = t.view().getUint32(0x10, true);
+  const wfd = t.view().getUint32(0x14, true);
+  assert.notEqual(rfd, wfd);
+  writeFd(t, wfd, 'through the pipe');
+  assert.equal(dec.decode(readFd(t, rfd).data), 'through the pipe');
+  // Drained: next read returns 0 bytes
+  assert.equal(readFd(t, rfd).n, 0);
+});
+
+test('__host_dup: lowest free fd >= minfd, sharing the backing', () => {
+  const t = makeShim();
+  t.env.__host_pipe(0x10);
+  const rfd = t.view().getUint32(0x10, true);
+  const wfd = t.view().getUint32(0x14, true);
+  const d = t.env.__host_dup(rfd, 10);
+  assert.ok(d >= 10, `dup fd ${d} >= minfd 10`);
+  writeFd(t, wfd, 'x');
+  assert.equal(dec.decode(readFd(t, d).data), 'x', 'dup shares pipe backing');
+  assert.equal(t.env.__host_dup(999, 4), -1, 'dup of a bad fd fails');
+});
+
+test('__host_dup2 replaces the target fd', () => {
+  const t = makeShim({ files: { '/f.txt': 'abc' } });
+  const fd = openPath(t, '/f.txt');
+  const r = t.env.__host_dup2(fd, 9);
+  assert.equal(r, 9);
+  assert.equal(dec.decode(readFd(t, 9).data), 'abc');
+  assert.equal(t.env.__host_dup2(999, 9), -1);
+});
+
+// ─── stdin semantics: EAGAIN vs blocking vs EOF ──────────────────────────────
+
+function queueInput(chunks, { closed = false } = {}) {
+  const q = chunks.map((c) => (typeof c === 'string' ? enc.encode(c) : c));
+  return {
+    calls: { readBlocking: 0, wait: 0 },
+    pollReadable(_ms) { return q.length > 0; },
+    read(max) {
+      if (!q.length) return new Uint8Array(0);
+      const head = q[0];
+      const take = head.subarray(0, max);
+      if (take.length === head.length) q.shift(); else q[0] = head.subarray(max);
+      return take;
+    },
+    readBlocking(max) { this.calls.readBlocking++; return this.read(max); },
+    wait(_ms) { this.calls.wait++; },
+    closed: () => closed && q.length === 0,
+    _q: q,
+  };
+}
+
+test('stdin fd_read: data present → delivered', () => {
+  const t = makeShim({ input: queueInput(['key']) });
+  const r = readFd(t, 0);
+  assert.equal(r.errno, 0);
+  assert.equal(dec.decode(r.data), 'key');
+});
+
+test('stdin fd_read: blocking with no data falls into readBlocking', () => {
+  const input = queueInput([]);
+  const t = makeShim({ input });
+  const r = readFd(t, 0);
+  assert.equal(input.calls.readBlocking, 1, 'blocking read parked');
+  assert.equal(r.errno, 6 /* EAGAIN — nothing arrived */);
+});
+
+test('stdin fd_read: O_NONBLOCK (fdstat_set_flags bit 4) skips readBlocking → EAGAIN', () => {
+  const input = queueInput([]);
+  const t = makeShim({ input });
+  t.p1.fd_fdstat_set_flags(0, 4);
+  const r = readFd(t, 0);
+  assert.equal(input.calls.readBlocking, 0, 'nonblock must not park');
+  assert.equal(r.errno, 6);
+  assert.equal(r.n, 0);
+});
+
+test('stdin fd_read: closed input → 0 bytes with SUCCESS (true EOF)', () => {
+  const input = queueInput([], { closed: true });
+  const t = makeShim({ input });
+  const r = readFd(t, 0);
+  assert.equal(r.errno, 0, 'EOF is success, not EAGAIN');
+  assert.equal(r.n, 0);
+});
+
+test('stdin fd_read: buffered data drains before EOF applies', () => {
+  const input = queueInput(['last'], { closed: true });
+  const t = makeShim({ input });
+  assert.equal(dec.decode(readFd(t, 0).data), 'last');
+  const r = readFd(t, 0);
+  assert.equal(r.errno, 0);
+  assert.equal(r.n, 0);
+});
+
+// ─── poll_oneoff: the POC-bug-#1 regression pins ─────────────────────────────
+
+// Lay out a subscription at `at`: userdata, tag, and payload.
+function subClock(view, at, ud, timeoutNs) {
+  view().setBigUint64(at, ud, true);
+  view().setUint8(at + 8, 0); // tag: clock
+  view().setBigUint64(at + 24, timeoutNs, true);
+}
+function subFdRead(view, at, ud, fd) {
+  view().setBigUint64(at, ud, true);
+  view().setUint8(at + 8, 1); // tag: fd_read
+  view().setUint32(at + 16, fd, true);
+}
+
+test('poll_oneoff: clock-only subscription waits, then fires the clock event', () => {
+  const input = queueInput([]);
+  const t = makeShim({ input });
+  subClock(t.view, 0x100, 42n, 5_000_000n /* 5ms */);
+  const errno = t.p1.poll_oneoff(0x100, 0x300, 1, 0x400);
+  assert.equal(errno, 0);
+  assert.equal(t.view().getUint32(0x400, true), 1, 'one event');
+  assert.equal(t.view().getBigUint64(0x300, true), 42n, 'userdata echoed');
+  assert.equal(t.view().getUint8(0x300 + 10), 0, 'eventtype clock');
+  assert.equal(input.calls.wait, 1, 'input.wait consulted for the timeout');
+});
+
+test('poll_oneoff: stdin readable → fd_read event, clock does NOT fire', () => {
+  const t = makeShim({ input: queueInput(['x']) });
+  subClock(t.view, 0x100, 1n, 1_000_000_000n);
+  subFdRead(t.view, 0x130, 2n, 0);
+  t.p1.poll_oneoff(0x100, 0x300, 2, 0x400);
+  assert.equal(t.view().getUint32(0x400, true), 1);
+  assert.equal(t.view().getBigUint64(0x300, true), 2n, 'stdin userdata echoed');
+  assert.equal(t.view().getUint8(0x300 + 10), 1, 'eventtype fd_read');
+});
+
+test('poll_oneoff: stdin idle + clock → waits then clock event (read -t times out)', () => {
+  const input = queueInput([]);
+  const t = makeShim({ input });
+  subClock(t.view, 0x100, 7n, 10_000_000n /* 10ms */);
+  subFdRead(t.view, 0x130, 8n, 0);
+  t.p1.poll_oneoff(0x100, 0x300, 2, 0x400);
+  assert.equal(t.view().getUint32(0x400, true), 1);
+  assert.equal(t.view().getBigUint64(0x300, true), 7n, 'clock userdata echoed');
+  assert.equal(t.view().getUint8(0x300 + 10), 0, 'eventtype clock');
+});
+
+test('poll_oneoff: stdin blocking with no clock reports readable (caller then reads)', () => {
+  const input = queueInput([]);
+  const t = makeShim({ input });
+  subFdRead(t.view, 0x100, 9n, 0);
+  t.p1.poll_oneoff(0x100, 0x300, 1, 0x400);
+  assert.equal(t.view().getUint32(0x400, true), 1);
+  assert.equal(t.view().getUint8(0x300 + 10), 1, 'fd_read event');
+});
+
+test('poll_oneoff: closed stdin is READABLE (EOF wakes poll, not the timeout)', () => {
+  const input = queueInput([], { closed: true });
+  const t = makeShim({ input });
+  subClock(t.view, 0x100, 7n, 1_000_000_000n);
+  subFdRead(t.view, 0x130, 8n, 0);
+  t.p1.poll_oneoff(0x100, 0x300, 2, 0x400);
+  assert.equal(t.view().getUint32(0x400, true), 1);
+  assert.equal(t.view().getBigUint64(0x300, true), 8n, 'stdin userdata echoed');
+  assert.equal(t.view().getUint8(0x300 + 10), 1, 'eventtype fd_read');
+});
+
+test('poll_oneoff: non-stdin fds are always readable', () => {
+  const t = makeShim({ files: { '/f.txt': 'x' } });
+  const fd = openPath(t, '/f.txt');
+  subFdRead(t.view, 0x100, 5n, fd);
+  t.p1.poll_oneoff(0x100, 0x300, 1, 0x400);
+  assert.equal(t.view().getUint32(0x400, true), 1);
+  assert.equal(t.view().getBigUint64(0x300, true), 5n);
+});
+
+// ─── memory growth ───────────────────────────────────────────────────────────
+
+test('views refresh after memory.grow', () => {
+  const t = makeShim({ args: ['a'] });
+  t.shim.mem.grow(1);
+  // Any import touching memory must not throw on the detached old buffer.
+  t.p1.args_sizes_get(0x10, 0x14);
+  assert.equal(t.view().getUint32(0x10, true), 1);
+});

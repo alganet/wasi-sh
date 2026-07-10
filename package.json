@@ -14,7 +14,6 @@
     "./ring": "./src/ring.mjs",
     "./files": "./src/files.mjs",
     "./node": "./src/node.mjs",
-    "./xterm": "./src/xterm.mjs",
     "./busybox.wasm": "./dist/busybox.wasm",
     "./package.json": "./package.json"
   },
@@ -29,17 +28,9 @@
     "./src/worker.mjs"
   ],
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "serve": "node scripts/serve.mjs",
     "build:wasm": "build/build.sh"
-  },
-  "peerDependencies": {
-    "@xterm/xterm": ">=5"
-  },
-  "peerDependenciesMeta": {
-    "@xterm/xterm": {
-      "optional": true
-    }
   },
   "engines": {
     "node": ">=20"
