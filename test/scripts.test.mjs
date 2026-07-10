@@ -84,6 +84,38 @@ test('mounted files are readable', async () => {
   assert.equal(r.stdout, 'file says: hi from the fs\n');
 });
 
+// ─── writable in-memory FS ────────────────────────────────────────────────────
+
+test('redirect to /tmp: written then read back', async () => {
+  const r = await sh('echo hello > /tmp/f; read x < /tmp/f; echo "x=[$x]"');
+  assert.equal(r.stdout, 'x=[hello]\n');
+});
+
+test('>> appends across redirects', async () => {
+  const r = await sh('echo a > /tmp/log; echo b >> /tmp/log; while read -r l; do echo "L:$l"; done < /tmp/log');
+  assert.equal(r.stdout, 'L:a\nL:b\n');
+});
+
+test('overwriting a mounted file works in-sandbox, caller buffer untouched', async () => {
+  const mounted = new TextEncoder().encode('original\n');
+  const r = await sh('echo clobber > /data/in.txt; read x < /data/in.txt; echo "x=[$x]"', {
+    files: { '/data/in.txt': mounted },
+  });
+  assert.equal(r.stdout, 'x=[clobber]\n');
+  assert.equal(new TextDecoder().decode(mounted), 'original\n', 'CoW protects the caller');
+});
+
+test('redirect into a missing directory still fails loudly', async () => {
+  const r = await sh('echo x > /nope/f.txt; echo "rc=$?"');
+  assert.equal(r.stdout, 'rc=1\n');
+  assert.match(r.stderr, /can't create/);
+});
+
+test('reading a missing /tmp path is an error, not silent EOF', async () => {
+  const r = await sh('read x < /tmp/missing; echo "rc=$?"');
+  assert.match(r.stderr + r.stdout, /can't open|rc=[1-9]/);
+});
+
 // ─── fork-free command substitution (from test-cmdsubst.mjs) ─────────────────
 
 test('cmdsubst: printf and echo', async () => {

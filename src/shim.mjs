@@ -1,9 +1,12 @@
 // Minimal WASI preview1 shim for the busybox ash wasm module: the imports
 // busybox uses plus the env.__host_pipe/__host_dup/__host_dup2 hooks that back
-// its fork-free pipes and fd juggling (see build/shim/wasistubs.c). Read-only
-// in-memory FS for mounted files, plus /dev/null and in-memory pipes. Stdin is
-// pluggable (`input`) so the same shim serves scripted runs (fixed queue) and
-// interactive sessions (SAB ring + Atomics.wait) in any JS environment.
+// its fork-free pipes and fd juggling (see build/shim/wasistubs.c). Writable
+// in-memory FS: mounted `files` plus anything the guest creates (O_CREAT needs
+// an existing parent dir). Writes are copy-on-write — the caller's mounted
+// buffers are never mutated — and all state vanishes with the run. /dev/null
+// and in-memory pipes included. Stdin is pluggable (`input`) so the same shim
+// serves scripted runs (fixed queue) and interactive sessions (SAB ring +
+// Atomics.wait) in any JS environment.
 //
 // The `input` contract:
 //   pollReadable(ms) -> bool     data available (waiting up to ms for some)
@@ -57,14 +60,16 @@ export class WasiShim {
       args_get:(av,buf)=>{ let p=buf; for(const a of w.args.map(strBytes)){ w.dv().setUint32(av,p,true); av+=4; w.bytes().set(a,p); p+=a.length; w.bytes()[p++]=0; } return 0; },
       environ_sizes_get:(cnt,sz)=>{ const b=w.env.map(strBytes); w.dv().setUint32(cnt,b.length,true); w.dv().setUint32(sz,b.reduce((a,x)=>a+x.length+1,0),true); return 0; },
       environ_get:(ev,buf)=>{ let p=buf; for(const a of w.env.map(strBytes)){ w.dv().setUint32(ev,p,true); ev+=4; w.bytes().set(a,p); p+=a.length; w.bytes()[p++]=0; } return 0; },
-      clock_time_get:(id,prec,out)=>{ const ns=BigInt(Math.round((id===2?performance.now():Date.now())*1e6)); w.dv().setBigUint64(out,ns,true); return 0; },
+      // Clock 0 is REALTIME (wall clock); 1/2/3 (monotonic, cputimes) must
+      // never step backwards, which Date.now() can — use performance.now().
+      clock_time_get:(id,prec,out)=>{ const ns=BigInt(Math.round((id===0?Date.now():performance.now())*1e6)); w.dv().setBigUint64(out,ns,true); return 0; },
       proc_exit:(code)=>{ throw new WasiExit(code); },
       sched_yield:()=>0,
       random_get:(buf,len)=>{ const a=w.bytes().subarray(buf,buf+len);
         if(globalThis.crypto&&globalThis.crypto.getRandomValues){ for(let o=0;o<len;o+=65536) globalThis.crypto.getRandomValues(a.subarray(o,Math.min(o+65536,len))); }
         else { for(let i=0;i<len;i++)a[i]=(Math.random()*256)|0; }
         return 0; },
-      fd_close:(fd)=>{ w.fds.delete(fd); return 0; },
+      fd_close:(fd)=>{ const f=w.fds.get(fd); w.fds.delete(fd); if(f&&f.type==='pipe') w.gcPipe(f.pipe); return 0; },
       fd_fdstat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const ft=f.type==='dir'?FT.DIR:(f.type==='file'?FT.REG:FT.CHAR); w.dv().setUint8(out,ft); w.dv().setUint16(out+2,0,true); w.dv().setBigUint64(out+8,~0n,true); w.dv().setBigUint64(out+16,~0n,true); return 0; },
       fd_fdstat_set_flags:(fd,flags)=>{ const f=w.fds.get(fd); if(f) f.nonblock=(flags&4)!==0; return 0; },
       fd_prestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f||!f.preopen) return E.BADF; w.dv().setUint8(out,0); w.dv().setUint32(out+4,strBytes(f.path).length,true); return 0; },
@@ -72,11 +77,17 @@ export class WasiShim {
       fd_filestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const node=f.node||{type:f.type==='dir'?'dir':'char'}; w.writeFilestat(out,node); return 0; },
       path_filestat_get:(fd,flags,pathp,plen,out)=>{ const path=w.resolve(fd,w.str(pathp,plen)); const node=w.lookup(path); if(!node) return E.NOENT; w.writeFilestat(out,node); return 0; },
       path_open:(fd,dflags,pathp,plen,oflags,rb,ri,fdflags,out)=>{
-        const path=w.resolve(fd,w.str(pathp,plen)); const node=w.lookup(path);
-        if(!node){ if(path.startsWith('/tmp/')||path==='/dev/null'){ /*allow*/ } else return E.NOENT; }
+        // oflags: 1=CREAT 2=DIRECTORY 4=EXCL 8=TRUNC; fdflags: 1=APPEND
+        const path=w.resolve(fd,w.str(pathp,plen)); let node=w.lookup(path);
+        if(!node){
+          if(!(oflags&1)) return E.NOENT;
+          node=w.createFile(path);
+          if(!node) return E.NOENT; // parent dir missing
+        } else if((oflags&1)&&(oflags&4)) return E.EXIST;
+        if(node.type==='reg'&&(oflags&8)){ node.data=new Uint8Array(0); node.mutable=true; }
         const nfd=w.nextFd++;
-        if(node&&node.type==='dir') w.fds.set(nfd,{type:'dir',path,node});
-        else w.fds.set(nfd,{type:'file',path,node:node||{type:'char'},off:0});
+        if(node.type==='dir') w.fds.set(nfd,{type:'dir',path,node});
+        else w.fds.set(nfd,{type:'file',path,node,off:0,append:(fdflags&1)!==0});
         w.dv().setUint32(out,nfd,true); return 0;
       },
       fd_read:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF;
@@ -98,7 +109,12 @@ export class WasiShim {
           let o=0; for(const b of bufs){ const take=Math.min(b.length,data.length-o); b.set(data.subarray(o,o+take)); o+=take; total+=take; if(o>=data.length)break; }
         }
         else if(f.node&&f.node.type==='char'){ total=0; /* /dev/null EOF */ }
-        else if(f.type==='pipe'){ const pi=w.pipes[f.pipe]; for(const b of bufs){ const take=Math.min(b.length,pi.buf.length-pi.roff); if(take<=0)break; b.set(pi.buf.subarray(pi.roff,pi.roff+take)); pi.roff+=take; total+=take; } }
+        else if(f.type==='pipe'){ const pi=w.pipes[f.pipe];
+          for(const b of bufs){ let got=0;
+            while(pi&&got<b.length&&pi.chunks.length){ const c=pi.chunks[0]; const take=Math.min(b.length-got,c.length-pi.off);
+              b.set(c.subarray(pi.off,pi.off+take),got); pi.off+=take; got+=take;
+              if(pi.off===c.length){ pi.chunks.shift(); pi.off=0; } }
+            total+=got; if(!pi||got<b.length)break; } }
         else if(f.node&&f.node.data){ if(f.off===undefined)f.off=0; const d=f.node.data; for(const b of bufs){ const take=Math.min(b.length,d.length-f.off); if(take<=0)break; b.set(d.subarray(f.off,f.off+take)); f.off+=take; total+=take; } }
         w.dv().setUint32(out,total,true); return 0; },
       fd_write:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const bufs=w.iovecs(iovs,n); let total=0;
@@ -106,7 +122,14 @@ export class WasiShim {
           if(f.type==='stdout') w.stdout(b.slice());
           else if(f.type==='stderr') w.stderr(b.slice());
           else if(f.node&&f.node.type==='char'){ /* /dev/null: discard */ }
-          else if(f.type==='pipe'){ const pi=w.pipes[f.pipe]; const merged=new Uint8Array(pi.buf.length+b.length); merged.set(pi.buf); merged.set(b,pi.buf.length); pi.buf=merged; }
+          else if(f.type==='pipe'){ const pi=w.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
+          else if(f.node&&f.node.type==='reg'){ const node=f.node;
+            // Copy-on-write: never mutate a caller-mounted buffer.
+            if(!node.mutable){ node.data=node.data?node.data.slice():new Uint8Array(0); node.mutable=true; }
+            const start=f.append?node.data.length:(f.off||0); const end=start+b.length;
+            if(end>node.data.length){ const nd=new Uint8Array(end); nd.set(node.data); node.data=nd; }
+            node.data.set(b,start); f.off=end;
+          }
         }
         w.dv().setUint32(out,total,true); return 0; },
       fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const sz=f.node&&f.node.data?f.node.data.length:0; off=Number(off); f.off=whence===0?off:whence===1?(f.off||0)+off:sz+off; w.dv().setBigUint64(out,BigInt(f.off||0),true); return 0; },
@@ -130,9 +153,11 @@ export class WasiShim {
           // A closed stdin is READABLE (POSIX: EOF wakes poll) — the caller
           // then reads and gets EOF instead of timing out forever.
           const closed = () => w.input && w.input.closed && w.input.closed();
+          // pollReadable(ms) does the timed wait; when it comes back empty the
+          // timeout has fully elapsed — report the clock, do NOT wait again.
           const ready = w.input && (w.input.pollReadable(timeoutMs==null?0:timeoutMs) || closed());
           if(ready) emitRead(stdinUD);
-          else if(timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
+          else if(timeoutMs!=null) emitClock(clockUD);
           else emitRead(stdinUD); // blocking, no clock: report readable so caller reads (may EOF)
         } else if(otherRead===null && timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
         w.dv().setUint32(out,nev,true); return 0; },
@@ -140,15 +165,32 @@ export class WasiShim {
     return {
       wasi_snapshot_preview1: p1,
       env: {
-        __host_pipe:(fdptr)=>{ const idx=w.pipes.length; w.pipes.push({buf:new Uint8Array(0),roff:0}); const r=w.nextFd++, wr=w.nextFd++; w.fds.set(r,{type:'pipe',pipe:idx}); w.fds.set(wr,{type:'pipe',pipe:idx}); w.dv().setUint32(fdptr,r,true); w.dv().setUint32(fdptr+4,wr,true); return 0; },
+        __host_pipe:(fdptr)=>{ const idx=w.pipes.length; w.pipes.push({chunks:[],off:0}); const r=w.nextFd++, wr=w.nextFd++; w.fds.set(r,{type:'pipe',pipe:idx}); w.fds.set(wr,{type:'pipe',pipe:idx}); w.dv().setUint32(fdptr,r,true); w.dv().setUint32(fdptr+4,wr,true); return 0; },
         // F_DUPFD: lowest free fd >= minfd, sharing the source's backing.
         __host_dup:(fd,minfd)=>{ const src=w.fds.get(fd); if(!src) return -1; let n=Math.max(minfd,4); while(w.fds.has(n)) n++; if(n>=w.nextFd) w.nextFd=n+1; w.fds.set(n,{...src,preopen:false}); return n; },
-        __host_dup2:(oldfd,newfd)=>{ const src=w.fds.get(oldfd); if(!src) return -1; if(newfd>=w.nextFd) w.nextFd=newfd+1; w.fds.set(newfd,{...src,preopen:false}); return newfd; },
+        __host_dup2:(oldfd,newfd)=>{ const src=w.fds.get(oldfd); if(!src) return -1; const prev=w.fds.get(newfd); if(newfd>=w.nextFd) w.nextFd=newfd+1; w.fds.set(newfd,{...src,preopen:false}); if(prev&&prev.type==='pipe') w.gcPipe(prev.pipe); return newfd; },
         __host_trace:()=>{},   // debug hook (present in traced builds; harmless)
       },
     };
   }
   // ---- helpers ----
+  // Create an empty regular file (O_CREAT). Fails (null) unless the parent
+  // directory already exists — matching "can't create" errors from a real sh.
+  createFile(path){
+    const slash=path.lastIndexOf('/'); const parent=slash>0?path.slice(0,slash):'/';
+    const pnode=this.lookup(parent);
+    if(!pnode||pnode.type!=='dir') return null;
+    const node={type:'reg',data:new Uint8Array(0),mutable:true};
+    this.fs[path]=node;
+    if(!pnode.children) pnode.children={};
+    pnode.children[path.slice(slash+1)]={type:'reg'};
+    return node;
+  }
+  // Drop a pipe's buffers once no fd references it (close/dup2 both funnel here).
+  gcPipe(idx){
+    for(const f of this.fds.values()) if(f.type==='pipe'&&f.pipe===idx) return;
+    this.pipes[idx]=null;
+  }
   str(p,len){ return DEC.decode(this.bytes().subarray(p,p+len)); }
   iovecs(iovs,n){ const out=[]; for(let i=0;i<n;i++){ const buf=this.dv().getUint32(iovs+i*8,true); const l=this.dv().getUint32(iovs+i*8+4,true); out.push(this.bytes().subarray(buf,buf+l)); } return out; }
   resolve(fd,path){ if(path.startsWith('/')) return normalize(path); const base=(this.fds.get(fd)||{}).path||'/'; return normalize(base.replace(/\/$/,'')+'/'+path); }

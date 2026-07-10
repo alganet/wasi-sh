@@ -24,7 +24,10 @@ export interface WasiShimOptions {
   /** Full argv; busybox is a multicall binary, argv[0] selects the applet. */
   args?: string[];
   env?: Record<string, string>;
-  /** In-memory read-only FS content, absolute paths. */
+  /**
+   * In-memory FS content, absolute paths. Writable inside the sandbox
+   * (copy-on-write; your buffers are never mutated, state dies with the run).
+   */
   files?: Files;
   stdout?: (bytes: Uint8Array) => void;
   stderr?: (bytes: Uint8Array) => void;

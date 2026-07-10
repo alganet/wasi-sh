@@ -35,9 +35,10 @@ function putStr(bytes, at, s) {
 }
 
 // path_open against preopen fd 3 ('/'); returns the opened fd.
-function openPath(t, path, expectErrno = 0) {
+// oflags: 1=CREAT 4=EXCL 8=TRUNC; fdflags: 1=APPEND
+function openPath(t, path, expectErrno = 0, oflags = 0, fdflags = 0) {
   const [p, len] = putStr(t.bytes, 0x100, path);
-  const errno = t.p1.path_open(3, 0, p, len, 0, 0n, 0n, 0, 0x200);
+  const errno = t.p1.path_open(3, 0, p, len, oflags, 0n, 0n, fdflags, 0x200);
   assert.equal(errno, expectErrno, `path_open(${path}) errno`);
   return expectErrno === 0 ? t.view().getUint32(0x200, true) : -1;
 }
@@ -106,13 +107,60 @@ test('path_open + fd_read on a mounted file; fd_seek repositions', () => {
   assert.equal(dec.decode(readFd(t, fd).data), 'world');
 });
 
-test('path_open on a missing path: NOENT unless under /tmp/ or /dev/null', () => {
+test('path_open on a missing path: NOENT without O_CREAT; O_CREAT creates', () => {
   const t = makeShim();
   openPath(t, '/nope.txt', 44 /* NOENT */);
-  const tmp = openPath(t, '/tmp/scratch');
-  assert.ok(tmp > 0, '/tmp/ creation allowed');
+  openPath(t, '/tmp/scratch', 44, 0, 0); // no O_CREAT: missing is missing
+  const tmp = openPath(t, '/tmp/scratch', 0, 1 /* CREAT */);
+  assert.ok(tmp > 0, 'O_CREAT creates under an existing dir');
+  openPath(t, '/nodir/f.txt', 44, 1, 0); // parent dir missing: NOENT even with O_CREAT
   const devnull = openPath(t, '/dev/null');
   assert.ok(devnull > 0);
+});
+
+// ─── writable FS: create / truncate / append / CoW ───────────────────────────
+
+test('created file: write then reopen and read back', () => {
+  const t = makeShim();
+  const wfd = openPath(t, '/tmp/out.txt', 0, 1 /* CREAT */);
+  assert.equal(writeFd(t, wfd, 'first').errno, 0);
+  const rfd = openPath(t, '/tmp/out.txt');
+  assert.equal(dec.decode(readFd(t, rfd).data), 'first');
+});
+
+test('O_TRUNC clears an existing file; O_EXCL on an existing file is EEXIST', () => {
+  const t = makeShim({ files: { '/f.txt': 'old content' } });
+  openPath(t, '/f.txt', 20 /* EEXIST */, 1 | 4 /* CREAT|EXCL */);
+  const wfd = openPath(t, '/f.txt', 0, 8 /* TRUNC */);
+  writeFd(t, wfd, 'new');
+  const rfd = openPath(t, '/f.txt');
+  assert.equal(dec.decode(readFd(t, rfd).data), 'new');
+});
+
+test('O_APPEND writes land at the end regardless of offset', () => {
+  const t = makeShim({ files: { '/log.txt': 'a\n' } });
+  const fd = openPath(t, '/log.txt', 0, 0, 1 /* APPEND */);
+  writeFd(t, fd, 'b\n');
+  const rfd = openPath(t, '/log.txt');
+  assert.equal(dec.decode(readFd(t, rfd).data), 'a\nb\n');
+});
+
+test('copy-on-write: guest writes never mutate the caller-mounted buffer', () => {
+  const mounted = enc.encode('pristine');
+  const t = makeShim({ files: { '/m.bin': mounted } });
+  const fd = openPath(t, '/m.bin', 0, 8 /* TRUNC */);
+  writeFd(t, fd, 'scribbled');
+  assert.equal(dec.decode(mounted), 'pristine', 'caller buffer untouched');
+  const rfd = openPath(t, '/m.bin');
+  assert.equal(dec.decode(readFd(t, rfd).data), 'scribbled', 'guest sees its write');
+});
+
+test('fd_filestat_get tracks a written file size', () => {
+  const t = makeShim();
+  const fd = openPath(t, '/tmp/s.txt', 0, 1);
+  writeFd(t, fd, '1234567');
+  t.p1.fd_filestat_get(fd, 0xa00);
+  assert.equal(t.view().getBigUint64(0xa00 + 32, true), 7n);
 });
 
 test('/dev/null reads EOF and discards writes', () => {
@@ -189,6 +237,31 @@ test('__host_dup: lowest free fd >= minfd, sharing the backing', () => {
   writeFd(t, wfd, 'x');
   assert.equal(dec.decode(readFd(t, d).data), 'x', 'dup shares pipe backing');
   assert.equal(t.env.__host_dup(999, 4), -1, 'dup of a bad fd fails');
+});
+
+test('pipe buffers are released once no fd references the pipe', () => {
+  const t = makeShim();
+  t.env.__host_pipe(0x10);
+  const rfd = t.view().getUint32(0x10, true);
+  const wfd = t.view().getUint32(0x14, true);
+  writeFd(t, wfd, 'data');
+  t.p1.fd_close(wfd);
+  assert.ok(t.shim.pipes[0], 'pipe survives while the read end is open');
+  assert.equal(dec.decode(readFd(t, rfd).data), 'data', 'still readable after writer close');
+  t.p1.fd_close(rfd);
+  assert.equal(t.shim.pipes[0], null, 'pipe dropped when the last fd closes');
+});
+
+test('pipe reads drain consumed chunks (no unbounded retention)', () => {
+  const t = makeShim();
+  t.env.__host_pipe(0x10);
+  const rfd = t.view().getUint32(0x10, true);
+  const wfd = t.view().getUint32(0x14, true);
+  for (let i = 0; i < 10; i++) {
+    writeFd(t, wfd, `chunk${i};`);
+    readFd(t, rfd);
+  }
+  assert.equal(t.shim.pipes[0].chunks.length, 0, 'consumed chunks are freed');
 });
 
 test('__host_dup2 replaces the target fd', () => {
@@ -308,6 +381,22 @@ test('poll_oneoff: stdin idle + clock → waits then clock event (read -t times 
   assert.equal(t.view().getUint32(0x400, true), 1);
   assert.equal(t.view().getBigUint64(0x300, true), 7n, 'clock userdata echoed');
   assert.equal(t.view().getUint8(0x300 + 10), 0, 'eventtype clock');
+  // pollReadable(ms) IS the timed wait — a second input.wait would double
+  // every read -t timeout (the 2× bug).
+  assert.equal(input.calls.wait, 0, 'timeout must not be waited twice');
+});
+
+test('poll_oneoff: stdin + clock over a real ring waits ~timeout, not 2x', async () => {
+  const { createStdinRing, RingReader } = await import('../src/ring.mjs');
+  const t = makeShim({ input: new RingReader(createStdinRing(64)).toInput() });
+  subClock(t.view, 0x100, 7n, 120_000_000n /* 120ms */);
+  subFdRead(t.view, 0x130, 8n, 0);
+  const t0 = Date.now();
+  t.p1.poll_oneoff(0x100, 0x300, 2, 0x400);
+  const elapsed = Date.now() - t0;
+  assert.equal(t.view().getUint8(0x300 + 10), 0, 'eventtype clock');
+  assert.ok(elapsed >= 100, `waited the timeout (${elapsed}ms)`);
+  assert.ok(elapsed < 220, `did not wait twice (${elapsed}ms)`);
 });
 
 test('poll_oneoff: stdin blocking with no clock reports readable (caller then reads)', () => {
