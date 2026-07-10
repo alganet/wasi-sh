@@ -1,0 +1,179 @@
+// End-to-end script execution through run() against the shipped wasm.
+// Cases ported from the POC's forkfree-poc/test-*.mjs, whose expectations
+// lived in comments — here they are real assertions.
+import { test, before } from 'node:test';
+import assert from 'node:assert/strict';
+import { compileWasm, runScript } from '../src/node.mjs';
+
+let wasm;
+before(async () => { wasm = await compileWasm(); });
+
+// Run with the POC harness env (LC_ALL=C, PATH=/) for byte-identical behavior.
+const sh = (script, opts = {}) => runScript(script, { wasm, env: { LC_ALL: 'C' }, ...opts });
+
+// ─── basics ──────────────────────────────────────────────────────────────────
+
+test('echo + quoting', async () => {
+  const r = await sh('echo "hello world"');
+  assert.equal(r.stdout, 'hello world\n');
+  assert.equal(r.exitCode, 0);
+});
+
+test('variables and parameter expansion', async () => {
+  const r = await sh('x=abc; echo "${x}def" "${#x}" "${x#a}"');
+  assert.equal(r.stdout, 'abcdef 3 bc\n');
+});
+
+test('arithmetic including base-N (the MATH_BASE regression)', async () => {
+  const r = await sh('echo $((6*7)) $((10#09)) $((0x1F)) $((2#101))');
+  assert.equal(r.stdout, '42 9 31 5\n');
+});
+
+test('heredoc', async () => {
+  const r = await sh('while read -r l; do echo "L:$l"; done <<EOF\none\ntwo\nEOF');
+  assert.equal(r.stdout, 'L:one\nL:two\n');
+});
+
+test('read from stdin option', async () => {
+  const r = await sh('read -r a; read -r b; echo "got $a then $b"', { stdin: 'first\nsecond\n' });
+  assert.equal(r.stdout, 'got first then second\n');
+});
+
+test('stdin EOF terminates while read', async () => {
+  const r = await sh('n=0; while read -r _; do n=$((n+1)); done; echo "lines=$n"', { stdin: 'a\nb\nc\n' });
+  assert.equal(r.stdout, 'lines=3\n');
+});
+
+test('positional parameters via args', async () => {
+  const r = await runScript('', {
+    wasm,
+    args: ['busybox', 'sh', '-c', 'echo "$1-$2"', 'sh', 'one', 'two'],
+  });
+  assert.equal(r.stdout, 'one-two\n');
+});
+
+test('command option (sh -c sugar)', async () => {
+  const { run } = await import('../src/node.mjs');
+  const r = await run({ wasm, command: 'echo via-command', inline: true });
+  assert.equal(r.stdout, 'via-command\n');
+});
+
+test('exit code propagates', async () => {
+  const r = await sh('exit 3');
+  assert.equal(r.exitCode, 3);
+});
+
+test('stderr is captured separately', async () => {
+  const r = await sh('echo out; echo err 1>&2');
+  assert.equal(r.stdout, 'out\n');
+  assert.equal(r.stderr, 'err\n');
+});
+
+test('onOutput streams bytes with channel', async () => {
+  const seen = [];
+  await sh('echo a; echo b 1>&2', {
+    onOutput: (bytes, channel) => seen.push([channel, new TextDecoder().decode(bytes)]),
+  });
+  assert.deepEqual(seen, [['stdout', 'a\n'], ['stderr', 'b\n']]);
+});
+
+test('mounted files are readable', async () => {
+  const r = await sh('read -r l < /data/greeting.txt; echo "file says: $l"', {
+    files: { '/data/greeting.txt': 'hi from the fs\n' },
+  });
+  assert.equal(r.stdout, 'file says: hi from the fs\n');
+});
+
+// ─── fork-free command substitution (from test-cmdsubst.mjs) ─────────────────
+
+test('cmdsubst: printf and echo', async () => {
+  const r = await sh('x=$(printf "hello"); echo "got=[$x]"; echo "[$(echo world)]"');
+  assert.equal(r.stdout, 'got=[hello]\n[world]\n');
+});
+
+test('cmdsubst: nested', async () => {
+  const r = await sh('echo "[$(echo a$(echo B)c)]"');
+  assert.equal(r.stdout, '[aBc]\n');
+});
+
+test('cmdsubst: multiline capture from a for loop', async () => {
+  const r = await sh('out=$(for i in 1 2 3; do echo "line$i"; done); echo "$out"');
+  assert.equal(r.stdout, 'line1\nline2\nline3\n');
+});
+
+test('cmdsubst: backticks', async () => {
+  const r = await sh('echo "[`printf ABC`]"');
+  assert.equal(r.stdout, '[ABC]\n');
+});
+
+test('cmdsubst: exit status in $?', async () => {
+  const r = await sh('v=$(false); echo "rc=$?"; w=$(true); echo "rc2=$?"');
+  assert.equal(r.stdout, 'rc=1\nrc2=0\n');
+});
+
+test('cmdsubst: octal printf table entry (ord.sh pattern)', async () => {
+  // Shell must see printf "\\101" so printf receives \101 → 'A'.
+  const r = await sh('_i=65;_d1=$((_i/64));_d2=$(((_i/8)%8));_d3=$((_i%8)); c=$(printf "\\\\${_d1}${_d2}${_d3}"); echo "c=[$c]"');
+  assert.equal(r.stdout, 'c=[A]\n');
+});
+
+test('cmdsubst: exit N inside $() propagates to $?, shell lives on', async () => {
+  const r = await sh('x=$(echo pre; exit 7; echo post); echo "x=[$x] rc=$?"; echo alive');
+  assert.equal(r.stdout, 'x=[pre] rc=7\nalive\n');
+});
+
+// ─── fork-free builtin pipes (from test-pipes.mjs) ───────────────────────────
+
+test('pipe: printf | while read', async () => {
+  const r = await sh('printf "a\\nb\\nc\\n" | while read line; do echo "L:$line"; done');
+  assert.equal(r.stdout, 'L:a\nL:b\nL:c\n');
+});
+
+test('pipe: three stages', async () => {
+  const r = await sh('printf "1\\n2\\n3\\n4\\n" | while read n; do echo $((n*n)); done | while read sq; do echo "sq=$sq"; done');
+  assert.equal(r.stdout, 'sq=1\nsq=4\nsq=9\nsq=16\n');
+});
+
+test('pipe: exit status is the last stage', async () => {
+  const r = await sh('true | false; echo "rc=$?"; false | true; echo "rc2=$?"');
+  assert.equal(r.stdout, 'rc=1\nrc2=0\n');
+});
+
+test('pipe inside cmdsubst', async () => {
+  const r = await sh('r=$(printf "a\\nb\\nc\\n" | while read x; do printf "%s-" "$x"; done); echo "r=[$r]"');
+  assert.equal(r.stdout, 'r=[a-b-c-]\n');
+});
+
+// ─── subshell isolation (from test-isolation.mjs) ────────────────────────────
+
+test('isolation: vars set inside $() do not leak', async () => {
+  const r = await sh('x=$(y=5; echo hi); echo "x=[$x] y=[$y]"');
+  assert.equal(r.stdout, 'x=[hi] y=[]\n');
+});
+
+test('isolation: modified vars revert', async () => {
+  const r = await sh('a=1; b=$(a=2; echo "$a"); echo "b=[$b] a=[$a]"');
+  assert.equal(r.stdout, 'b=[2] a=[1]\n');
+});
+
+test('isolation: parent vars are readable inside', async () => {
+  const r = await sh('v=42; r=$(echo "v is $v"); echo "$r"');
+  assert.equal(r.stdout, 'v is 42\n');
+});
+
+test('isolation: nesting levels each revert', async () => {
+  // $() preserves interior newlines (only trailing ones strip), so the
+  // captured value is "3\n2" and each nesting level's p reverts.
+  const r = await sh('p=1; echo "$(p=2; echo $(p=3; echo $p);echo $p)"; echo "p=$p"');
+  assert.equal(r.stdout, '3\n2\np=1\n');
+});
+
+test('isolation: set -e inside $() does not escape', async () => {
+  const r = await sh('set +e; z=$(set -e; false; echo after); echo "z=[$z]"; false; echo "still=$?"');
+  assert.equal(r.stdout, 'z=[]\nstill=1\n');
+});
+
+test('isolation: pipe stages are subshells (POSIX ash)', async () => {
+  const r = await sh('echo hi | read foo; echo "foo=[$foo]"');
+  assert.equal(r.stdout, 'foo=[]\n');
+});
