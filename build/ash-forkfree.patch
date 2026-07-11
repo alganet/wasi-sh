@@ -1,5 +1,5 @@
---- /sessions/modest-affectionate-ramanujan/mnt/wasix/busybox-1.38.0/shell/ash.c	2026-07-01 07:38:56.281610294 -0300
-+++ /tmp/bb/shell/ash.c	2026-07-07 09:15:03.747017693 -0300
+--- a/shell/ash.c	2026-07-01 07:38:56.281610294 -0300
++++ b/shell/ash.c	2026-07-07 09:15:03.747017693 -0300
 @@ -6859,6 +6859,11 @@
  	/* NOTREACHED */
  }

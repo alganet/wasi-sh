@@ -107,6 +107,12 @@ fi
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null
 
+# libbb's socket helpers don't compile against wasi-libc (no getsockname, no
+# sockaddr_un.sun_path) and the ash-only config never links them — drop them
+# from the object list instead of letting them abort the libbb build.
+# (Kbuild.src, not Kbuild: make regenerates the latter from the former.)
+sed -i.orig '/lib-y += xconnect\.o/d' "$BB/libbb/Kbuild.src"
+
 # --- compiler wrappers ----------------------------------------------------------
 SHIM="$here/shim"
 CFLAGS_WASM="-mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
@@ -142,9 +148,13 @@ export PATH="$work:$PATH"
 # --- compile --------------------------------------------------------------------
 cores=$( (nproc || sysctl -n hw.ncpu || echo 4) 2>/dev/null | head -1 )
 # The make-driven FINAL link fails on a zig-cc EH-tag quirk; every object still
-# builds, and we do the final link by hand below.
+# builds, and we do the final link by hand below. Output lands in make.log and
+# the guard below refuses to link from a half-built tree.
 make -C "$BB" -j"$cores" CC=zcc LD=zld HOSTCC=cc AR="$AR_CMD" \
-     SKIP_STRIP=y >/dev/null 2>&1 || true
+     SKIP_STRIP=y > "$work/make.log" 2>&1 || true
+for need in "$BB/libbb/lib.a" "$BB/shell/lib.a" "$BB/libbb/appletlib.o" "$BB/applets/applets.o"; do
+	[ -f "$need" ] || { echo "compile failed: missing $need — see $work/make.log" >&2; exit 1; }
+done
 
 # --- shim objects + setjmp runtime ---------------------------------------------
 zcc -O2 -c "$SHIM/wasistubs.c" -o "$work/wasistubs.o"
@@ -153,7 +163,14 @@ if [ "$TOOLCHAIN" = ziglang ]; then
 	ZLROOT=$(python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))")
 	RT_SRC="$ZLROOT/lib/libc/wasi/libc-top-half/musl/src/setjmp/wasm32/rt.c"
 elif [ "$TOOLCHAIN" = zig ]; then
-	ZLROOT=$(zig env 2>/dev/null | sed -n 's/.*"lib_dir": *"\([^"]*\)".*/\1/p' | head -1)
+	# `zig env` prints JSON (<=0.13: "lib_dir": "...") or ZON (0.14+:
+	# .lib_dir = "..."); match either.
+	ZLROOT=$(zig env 2>/dev/null \
+	  | sed -n -e 's/.*"lib_dir": *"\([^"]*\)".*/\1/p' \
+	           -e 's/.*\.lib_dir = "\([^"]*\)".*/\1/p' | head -1)
+	if [ -z "$ZLROOT" ] || [ ! -d "$ZLROOT" ]; then
+		echo "could not locate zig's lib dir via 'zig env'" >&2; exit 1
+	fi
 	RT_SRC="$ZLROOT/libc/wasi/libc-top-half/musl/src/setjmp/wasm32/rt.c"
 else
 	# wasi-sdk: rt.c is not shipped; fetch the matching wasi-libc source once.
@@ -170,11 +187,17 @@ if [ "$TOOLCHAIN" = wasi-sdk ]; then
 	RTLIB=$(ls "$WASI_SDK_PATH"/lib/clang/*/lib/wasi/libclang_rt.builtins-wasm32.a 2>/dev/null | head -1)
 	EXTRA_LIBS="$LIBC $RTLIB"
 else
-	# zig generates crt/libc/compiler_rt on demand; capture their cache paths.
-	probe(){ $ZIG cc --target=wasm32-wasi "$work/rt.o" -o /dev/null -### 2>&1 \
-	         | tr ' ' '\n' | grep "$1" | head -1; }
+	# zig generates crt/libc/compiler_rt on demand; capture their cache paths
+	# from a verbose throwaway link (zig 0.16 dropped -### output).
+	echo 'int main(void){return 0;}' > "$work/zprobe.c"
+	$ZIG cc --target=wasm32-wasi "$work/zprobe.c" -o "$work/zprobe.wasm" -v \
+	  > "$work/zprobe.log" 2>&1 || { cat "$work/zprobe.log" >&2; exit 1; }
+	probe(){ tr ' "' '\n\n' < "$work/zprobe.log" | grep "$1" | head -1; }
 	CRT=$(probe crt1-command.o); LIBC=$(probe '/libc.a')
 	ZIGC=$(probe libzigc.a); RTLIB=$(probe libcompiler_rt.a)
+	if [ -z "$CRT" ] || [ -z "$LIBC" ]; then
+		echo "failed to locate zig's wasm32-wasi crt/libc (see $work/zprobe.log)" >&2; exit 1
+	fi
 	EXTRA_LIBS="$LIBC $ZIGC $RTLIB"
 fi
 

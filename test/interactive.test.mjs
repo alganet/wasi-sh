@@ -69,6 +69,20 @@ test('read -t honors its timeout (the ppoll/poll_oneoff chain end-to-end)', asyn
   assert.ok(elapsed < 1500, `did not hang (${elapsed}ms)`);
 });
 
+test('read -t honors timeouts over one second (whole seconds must not drop)', async () => {
+  // Regression for two compounding bugs: the guest once truncated the
+  // timeout to (ms % 1000) — `read -t 2` timed out instantly — and the host
+  // shim waited the remaining timeout twice. 1.2s catches both: seconds
+  // dropped → ~0.4s (too fast), double-wait → ~2.4s (too slow).
+  const t0 = Date.now();
+  const { exited } = spawnTwin('read -t 1.2 x; echo "to rc=$?"');
+  const m = await exited;
+  const elapsed = Date.now() - t0;
+  assert.match(m.out, /to rc=/, 'read -t returned');
+  assert.ok(elapsed >= 1150, `waited the full 1.2s (${elapsed}ms)`);
+  assert.ok(elapsed < 2200, `did not wait the timeout twice (${elapsed}ms)`);
+});
+
 test('blocking read parks and wakes promptly on write', async () => {
   const { writer, exited } = spawnTwin('read -r x; echo "got=[$x]"');
   // Let the guest reach the blocking read, then feed a line.

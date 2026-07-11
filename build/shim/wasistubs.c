@@ -1,10 +1,17 @@
 #include <errno.h>
 int sigaction(int s, const struct sigaction *a, struct sigaction *o){ (void)s;(void)a;(void)o; return 0; }
-int sigemptyset(unsigned long *m){ if(m)*m=0; return 0; }
-int sigfillset(unsigned long *m){ if(m)*m=~0UL; return 0; }
-int sigaddset(unsigned long *m,int n){ if(m)*m|=1UL<<n; return 0; }
-int sigdelset(unsigned long *m,int n){ if(m)*m&=~(1UL<<n); return 0; }
-int sigprocmask(int h,const unsigned long *s,unsigned long *o){ (void)h;(void)s; if(o)*o=0; return 0; }
+/* Signal-mask stubs must NEVER write through their pointers: wasi-libc's
+ * sigset_t is `typedef unsigned char` (a 1-byte placeholder), so callers
+ * allocate 1 byte for a mask. A 4-byte store here smashes whatever the
+ * compiler placed next to it — in busybox's check_got_signal_and_poll that
+ * is the ppoll timespec, which silently zeroed the whole-seconds part of
+ * every `read -t` timeout. Nothing ever reads a mask (no signals exist),
+ * so pure no-ops are correct. */
+int sigemptyset(unsigned long *m){ (void)m; return 0; }
+int sigfillset(unsigned long *m){ (void)m; return 0; }
+int sigaddset(unsigned long *m,int n){ (void)m;(void)n; return 0; }
+int sigdelset(unsigned long *m,int n){ (void)m;(void)n; return 0; }
+int sigprocmask(int h,const unsigned long *s,unsigned long *o){ (void)h;(void)s;(void)o; return 0; }
 int sigsuspend(const unsigned long *m){ (void)m; errno=EINTR; return -1; }
 int kill(int p,int s){ (void)p;(void)s; return 0; }
 int killpg(int p,int s){ (void)p;(void)s; return 0; }
