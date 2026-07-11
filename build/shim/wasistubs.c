@@ -60,9 +60,10 @@ void *setmntent(const char*f,const char*m){ (void)f;(void)m; return 0; }
 int endmntent(void*f){ (void)f; return 1; }
 int getlogin_r(char*b,unsigned n){ if(n){b[0]=0;} return 0; }
 char *mktemp(char*t){ return t; }
-int mkstemp(char*t){ (void)t; errno=ENOSYS; return -1; }
 char *mkdtemp(char*t){ (void)t; return 0; }
-int mknod(const char*p,unsigned m,unsigned d){ (void)p;(void)m;(void)d; errno=ENOSYS; return -1; }
+/* dev_t is u64 on wasm32-wasi; a narrower stub is a wasm signature mismatch
+ * that traps at the call site (cp's special-file branch references this). */
+int mknod(const char*p,unsigned m,unsigned long long d){ (void)p;(void)m;(void)d; errno=ENOSYS; return -1; }
 int setresgid(unsigned a,unsigned b,unsigned c){ (void)a;(void)b;(void)c; return 0; }
 int setresuid(unsigned a,unsigned b,unsigned c){ (void)a;(void)b;(void)c; return 0; }
 int tcgetattr(int fd,void*t){ (void)fd;(void)t; return 0; }
@@ -86,3 +87,59 @@ int __wrap_fcntl(int fd,int cmd,...){
   if(cmd==2/*F_SETFD*/||cmd==4/*F_SETFL*/) return 0;
   return __real_fcntl(fd,cmd,(int)arg);
 }
+
+/* ---- in-process applet support (see ARCHITECTURE.md) ---- */
+#include <string.h>
+#include <fcntl.h>
+#include <wasi/api.h>
+/* Raw exit() inside an in-process applet must not kill the whole shell:
+ * run_nofork_applet() installs die_func (a longjmp back to the shell); route
+ * exit() through it, exactly like xfunc_die() does. Outside an applet
+ * die_func is NULL and the real exit proceeds (ash's own `exit`). Linked
+ * with --wrap exit. */
+extern void (*die_func)(void);
+extern unsigned char xfunc_error_retval; /* uint8_t in libbb — a wider store clobbers neighbors */
+extern void __real_exit(int);
+void __wrap_exit(int code){
+  if (die_func) { xfunc_error_retval = (unsigned char)code; die_func(); }
+  __real_exit(code);
+}
+/* sed -i and mktemp need mkstemp; emulate with O_CREAT|O_EXCL retries
+ * (the shim's path_open enforces EXCL). */
+int mkstemp(char *t){
+  static unsigned counter;
+  size_t l = strlen(t);
+  int tries;
+  if (l < 6) { errno = EINVAL; return -1; }
+  for (tries = 0; tries < 100; tries++){
+    unsigned v = counter++ + tries * 7777u; int i, fd;
+    for (i = 0; i < 6; i++){ t[l-6+i] = 'a' + (v % 26); v /= 26; }
+    fd = open(t, O_RDWR|O_CREAT|O_EXCL, 0600);
+    if (fd >= 0) return fd;
+  }
+  errno = EEXIST; return -1;
+}
+/* Syscall-surface reduction: defining these libc entry points here keeps
+ * wasi-libc's implementations (and the fd_tell / fd_renumber /
+ * fd_filestat_set_size WASI imports they reference) out of the module. */
+long long __wasilibc_tell(int fd){ /* lseek(fd, 0, SEEK_CUR) fast path */
+  __wasi_filesize_t pos;
+  __wasi_errno_t e = __wasi_fd_seek(fd, 0, __WASI_WHENCE_CUR, &pos);
+  if (e) { errno = e; return -1; }
+  return (long long)pos;
+}
+int __wasilibc_fd_renumber(int fd,int newfd){ /* freopen's fd move (awk file args) */
+  if (dup2(fd,newfd) < 0) return -1;
+  if (fd != newfd) close(fd);
+  return 0;
+}
+int ftruncate(int fd,long long len){ (void)fd;(void)len; errno=ENOSYS; return -1; }
+int truncate(const char*p,long long len){ (void)p;(void)len; errno=ENOSYS; return -1; }
+/* referenced by enabled applets; without definitions they become unresolvable
+ * env.* imports and the module cannot instantiate */
+int getgrouplist(const char*u,unsigned g,unsigned*gs,int*n){ (void)u;(void)g;(void)gs; if(n)*n=0; return 0; }
+int sync2(void) __asm__("sync");
+int sync2(void){ return 0; }
+int sched_getaffinity(int p,unsigned long s,void*m){ (void)p;(void)s;(void)m; errno=ENOSYS; return -1; }
+void *popen(const char*c,const char*m){ (void)c;(void)m; errno=ENOSYS; return 0; }
+int pclose(void*f){ (void)f; return -1; }

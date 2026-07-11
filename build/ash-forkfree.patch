@@ -1,6 +1,18 @@
---- a/shell/ash.c	2026-07-01 07:38:56.281610294 -0300
-+++ b/shell/ash.c	2026-07-07 09:15:03.747017693 -0300
-@@ -6859,6 +6859,11 @@
+Fork-free busybox for wasm32-wasi (see wasi-sh ARCHITECTURE.md):
+
+- shell/ash.c: run $(...) and builtin pipelines in-process through the
+  __host_pipe-backed in-memory pipes, with subshell isolation built from
+  ash's own local-variable machinery; dispatch EVERY applet (not just
+  NOFORK-marked ones) through run_nofork_applet() — in-process, no fork.
+- libbb/vfork_daemon_rexec.c: before each in-process applet run, zero
+  bb_common_bufsiz1 (applets like grep keep their globals there and assume
+  a freshly-zeroed process) and clearerr() the shared stdio streams (an
+  applet that drained stdin leaves the EOF flag set, which a forked child
+  would never leak back to the parent).
+
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -6857,6 +6857,11 @@
  	/* NOTREACHED */
  }
  
@@ -12,7 +24,7 @@
  static void FAST_FUNC
  evalbackcmd(union node *n, struct backcmd *result
  				IF_BASH_PROCESS_SUBST(, int ctl))
-@@ -6885,6 +6890,33 @@
+@@ -6883,6 +6888,33 @@
  
  	if (pipe(pip) < 0)
  		ash_msg_and_raise_perror("can't create pipe");
@@ -46,7 +58,7 @@
  	/* process substitution uses NULL job, like openhere() */
  	jp = (ctl == CTLBACKQ) ? makejob(1) : NULL;
  	if (forkshell(jp, n, FORK_NOJOB) == 0) {
-@@ -6956,6 +6988,12 @@
+@@ -6954,6 +6986,12 @@
  	pushstackmark(&smark, startloc);
  	evalbackcmd(cmd, &in IF_BASH_PROCESS_SUBST(, ctl));
  	popstackmark(&smark);
@@ -59,7 +71,7 @@
  
  	if (ctl != CTLBACKQ) {
  		sprintf(buf, DEV_FD_PREFIX"%d", in.fd);
-@@ -6982,7 +7020,8 @@
+@@ -6980,7 +7018,8 @@
  	free(in.buf);
  	if (in.fd >= 0) {
  		close(in.fd);
@@ -69,7 +81,7 @@
  	}
   done:
  	INTON;
-@@ -10067,64 +10106,58 @@
+@@ -10065,64 +10104,58 @@
  static int
  evalpipe(union node *n, int flags)
  {
@@ -151,12 +163,12 @@
 -		/* Don't want to trigger debugging */
 -		if (pip[1] != -1)
 -			close(pip[1]);
--	}
++		prevfd = (pip[1] >= 0) ? pip[0] : -1;
+ 	}
 -	if (n->npipe.pipe_backgnd == 0) {
 -		status = waitforjob(jp);
 -		TRACE(("evalpipe:  job done exit status %d\n", status));
-+		prevfd = (pip[1] >= 0) ? pip[0] : -1;
- 	}
+-	}
 +	if (prevfd >= 0)
 +		close(prevfd);
 +	status = exitstatus;
@@ -165,7 +177,7 @@
  	return status;
  }
  
-@@ -10434,6 +10467,113 @@
+@@ -10432,6 +10465,113 @@
  	INTON;
  }
  
@@ -279,3 +291,31 @@
  static int FAST_FUNC
  localcmd(int argc UNUSED_PARAM, char **argv)
  {
+@@ -11120,7 +11260,7 @@
+  */
+ 		/* find_command() encodes applet_no as (-2 - applet_no) */
+ 		int applet_no = (- cmdentry.u.index - 2);
+-		if (applet_no >= 0 && APPLET_IS_NOFORK(applet_no)) {
++		if (applet_no >= 0) {
+ 			char **sv_environ;
+ 
+ 			INTOFF;
+--- a/libbb/vfork_daemon_rexec.c
++++ b/libbb/vfork_daemon_rexec.c
+@@ -15,6 +15,7 @@
+  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
+  */
+ #include "busybox.h" /* uses applet tables */
++#include "common_bufsiz.h"
+ #include "NUM_APPLETS.h"
+ 
+ #define NOFORK_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_NOFORK))
+@@ -117,6 +118,8 @@
+ 	argc = string_array_len(argv);
+ 
+ 	/* If xfunc "dies" in NOFORK applet, die_func longjmp's here instead */
++	memset(bb_common_bufsiz1, 0, COMMON_BUFSIZE);
++	clearerr(stdin); clearerr(stdout); clearerr(stderr);
+ 	die_func = jump;
+ 	rc = setjmp(die_jmp);
+ 	if (!rc) {

@@ -116,6 +116,89 @@ test('reading a missing /tmp path is an error, not silent EOF', async () => {
   assert.match(r.stderr + r.stdout, /can't open|rc=[1-9]/);
 });
 
+// ─── in-process applets (busybox tools as builtins) ──────────────────────────
+
+test('applets resolve before PATH; unknown commands still fail', async () => {
+  // command -v / type know the applet table (busybox `which` does not — it
+  // only scans PATH for real files, so it is deliberately not shipped).
+  const r = await sh('command -v cat && type grep >/dev/null && echo have-tools; nosuchtool 2>/dev/null || echo absent; ln -s a b 2>/dev/null || echo no-ln');
+  assert.equal(r.stdout, 'cat\nhave-tools\nabsent\nno-ln\n');
+});
+
+test('file tools: cat, wc, tail -n (fd_tell elimination path)', async () => {
+  const r = await sh('seq 5 > /tmp/n; cat /tmp/n | wc -l; tail -n 2 /tmp/n | head -n 1');
+  assert.equal(r.stdout, '5\n4\n');
+});
+
+test('mixed applet pipeline with command substitution', async () => {
+  const r = await sh('x=$(seq 20 | awk "\\$1%3==0" | sort -rn | head -n 2 | tr "\\n" ","); echo "x=[$x]"');
+  assert.equal(r.stdout, 'x=[18,15,]\n');
+});
+
+test('grep isolation: 30x alternating match/no-match in one session', async () => {
+  const r = await sh(
+    'i=0; ok=1; while [ $i -lt 30 ]; do echo needle | grep -q needle || ok=0; ' +
+    'echo x | grep -q nomatch && ok=0; i=$((i+1)); done; echo "ok=$ok"'
+  );
+  assert.equal(r.stdout, 'ok=1\n', 'scratch-buffer + stdio-flag isolation held');
+});
+
+test('sed -i edits in place (mkstemp + rename + unlink chain)', async () => {
+  const r = await sh('printf "aaa\\n" > /tmp/f; sed -i "s/a/b/g" /tmp/f; cat /tmp/f');
+  assert.equal(r.stdout, 'bbb\n');
+});
+
+test("applet exit() is contained: awk exit sets $?, shell survives", async () => {
+  const r = await sh('x=$(awk "BEGIN{print 42; exit 3}"); echo "x=$x rc=$?"; echo alive');
+  assert.equal(r.stdout, 'x=42 rc=3\nalive\n');
+});
+
+test("shell's own exit still exits", async () => {
+  const r = await sh('echo before; exit 7; echo never');
+  assert.equal(r.stdout, 'before\n');
+  assert.equal(r.exitCode, 7);
+});
+
+test('mv and cp -r across directories (rename + unique-inode paths)', async () => {
+  const r = await sh(
+    'mkdir -p /tmp/src/sub; echo deep > /tmp/src/sub/f; ' +
+    'cp -r /tmp/src /tmp/copy 2>/dev/null; mv /tmp/src /tmp/moved; ' +
+    'cat /tmp/copy/sub/f /tmp/moved/sub/f; test ! -e /tmp/src && echo gone'
+  );
+  assert.equal(r.stdout, 'deep\ndeep\ngone\n');
+});
+
+test('find descends, filters, and -execs in-process', async () => {
+  const r = await sh(
+    'mkdir /tmp/d; touch /tmp/d/a.sh /tmp/d/b.txt; ' +
+    'find /tmp/d -name "*.sh" -exec echo hit {} \\; ; find /tmp/d -type f | wc -l'
+  );
+  assert.equal(r.stdout, 'hit /tmp/d/a.sh\n2\n');
+});
+
+test('awk over multiple file arguments (freopen / fd_renumber elimination)', async () => {
+  const r = await sh('seq 2 > /tmp/a; seq 3 > /tmp/b; awk "FNR==1{print FILENAME}" /tmp/a /tmp/b; awk "{s+=\\$1} END{print s}" /tmp/a /tmp/b');
+  assert.equal(r.stdout, '/tmp/a\n/tmp/b\n9\n');
+});
+
+test('touch creates and updates; mktemp allocates unique names', async () => {
+  const r = await sh(
+    'touch /tmp/t && test -f /tmp/t && echo created; touch /tmp/t && echo updated; ' +
+    'a=$(mktemp); b=$(mktemp); test "$a" != "$b" && echo distinct'
+  );
+  assert.equal(r.stdout, 'created\nupdated\ndistinct\n');
+});
+
+test('stat -c and SUSv2 head -N forms work (config sub-features)', async () => {
+  const r = await sh('printf 12345 > /tmp/s; stat -c "%s" /tmp/s; seq 5 | head -2 | tail -1');
+  assert.equal(r.stdout, '5\n2\n');
+});
+
+test('hashes are stable', async () => {
+  const r = await sh('printf abc | md5sum | cut -d" " -f1; printf abc | sha256sum | cut -c1-12');
+  assert.equal(r.stdout, '900150983cd24fb0d6963f7d28e17f72\nba7816bf8f01\n');
+});
+
 // ─── fork-free command substitution (from test-cmdsubst.mjs) ─────────────────
 
 test('cmdsubst: printf and echo', async () => {

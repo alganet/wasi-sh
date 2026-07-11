@@ -201,8 +201,11 @@ else
 	EXTRA_LIBS="$LIBC $ZIGC $RTLIB"
 fi
 
+# --wrap exit: raw exit() inside an in-process applet must return to the
+#   shell instead of killing the instance — wasistubs' __wrap_exit routes it
+#   through busybox's die_func (see the applet notes in ARCHITECTURE.md).
 OUT="$work/busybox.wasm"
-$WASM_LD --import-undefined --wrap fcntl \
+$WASM_LD --import-undefined --wrap fcntl --wrap exit \
   "$CRT" "$BB/libbb/appletlib.o" "$BB/applets/applets.o" \
   $(find "$BB" -name built-in.o | sort) $(find "$BB" -name lib.a | sort) \
   "$work/wasistubs.o" "$work/ppoll.o" "$work/rt.o" \
@@ -213,8 +216,8 @@ echo "linked: $OUT ($(wc -c < "$OUT") bytes)"
 # --- smoke test: refuse to install a broken binary ------------------------------
 node --input-type=module -e "
 import { runScript } from '$pkg/src/node.mjs';
-const r = await runScript('echo ok; x=\$(printf hi); echo \$x; echo \$((10#09))', { wasm: '$OUT' });
-if (r.stdout !== 'ok\nhi\n9\n' || r.exitCode !== 0) {
+const r = await runScript('echo ok; x=\$(printf hi); echo \$x; echo \$((10#09)); seq 3 | grep -v 2 | tail -n 1', { wasm: '$OUT' });
+if (r.stdout !== 'ok\nhi\n9\n3\n' || r.exitCode !== 0) {
   console.error('SMOKE TEST FAILED:', JSON.stringify(r));
   process.exit(1);
 }
