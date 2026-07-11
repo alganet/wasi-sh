@@ -100,10 +100,13 @@ test('toInput() implements the shim input contract', () => {
 // ends) after a delay. worker_threads shares SAB/Atomics semantics with Web
 // Workers, so this is the browser-fidelity test.
 
+// The worker announces 'armed' right before parking, so the main thread never
+// races the worker's boot (module load can take longer than any fixed sleep).
 const WORKER_SRC = `
   import { parentPort, workerData } from 'node:worker_threads';
   const { RingReader } = await import(workerData.ringUrl);
   const r = new RingReader(workerData.sab);
+  parentPort.postMessage({ armed: true });
   const t0 = Date.now();
   const bytes = r.readBlocking(64);
   parentPort.postMessage({ bytes, waitedMs: Date.now() - t0, closed: r.closed });
@@ -114,16 +117,23 @@ function spawnReader(sab) {
     eval: true,
     workerData: { sab, ringUrl: new URL('../src/ring.mjs', import.meta.url).href },
   });
-  return new Promise((resolve, reject) => {
-    worker.once('message', (m) => { resolve(m); worker.terminate(); });
+  let armedResolve;
+  const armed = new Promise((res) => { armedResolve = res; });
+  const done = new Promise((resolve, reject) => {
+    worker.on('message', (m) => {
+      if (m.armed) armedResolve();
+      else { resolve(m); worker.terminate(); }
+    });
     worker.once('error', reject);
   });
+  return { armed, done };
 }
 
 test('cross-thread: blocked readBlocking wakes on write', async () => {
   const { sab, w } = pair();
-  const done = spawnReader(sab);
-  await new Promise((res) => setTimeout(res, 80));
+  const { armed, done } = spawnReader(sab);
+  await armed;
+  await new Promise((res) => setTimeout(res, 80)); // let the worker park
   w.write(enc.encode('wake'));
   const m = await done;
   assert.equal(dec.decode(new Uint8Array(m.bytes)), 'wake');
@@ -132,7 +142,8 @@ test('cross-thread: blocked readBlocking wakes on write', async () => {
 
 test('cross-thread: blocked readBlocking wakes on end() with EOF', async () => {
   const { sab, w } = pair();
-  const done = spawnReader(sab);
+  const { armed, done } = spawnReader(sab);
+  await armed;
   await new Promise((res) => setTimeout(res, 80));
   const t0 = Date.now();
   w.end();
