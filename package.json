@@ -21,6 +21,7 @@
     "src",
     "dist",
     "build",
+    "!build/work",
     "examples",
     "scripts"
   ],

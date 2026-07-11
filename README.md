@@ -45,8 +45,8 @@ const session = await spawn({ env: { COLUMNS: '80', LINES: '24' } });
 session.onOutput((bytes, channel) => render(bytes)); // shell → you
 session.write('echo hi\n');                          // you → shell
 session.end();        // stdin EOF
-session.terminate();  // hard kill
-await session.exited; // exit code
+session.terminate();  // hard kill (exited resolves 137, kill -9 style)
+await session.exited; // exit code — always settles, even after terminate()
 ```
 
 `spawn()` parks the shell in a Worker on a `SharedArrayBuffer` stdin ring
@@ -87,8 +87,11 @@ The guest is **busybox `ash` only, builtins only**:
   unbounded buffers (fine for finite pipelines; an infinite producer like
   `yes | head` would not terminate). Subshell isolation covers variables and
   shell options; functions/aliases/traps/cwd isolation is incomplete.
-- **Read-only filesystem.** Mounted `files` are readable; writes go to
-  stdout/stderr/pipes or `/dev/null`. This runs *scripts*, not systems.
+- **In-memory filesystem.** Mounted `files` are readable and writable
+  (copy-on-write — your mounted buffers are never mutated), and scripts can
+  create files where a parent directory exists (`/tmp` is always there).
+  Everything vanishes when the run or session ends. This runs *scripts*,
+  not systems.
 - No job control, no signals, no TTY ioctls.
 
 ## API
@@ -190,10 +193,10 @@ GPL-2.0 terms apply to it.
 
 Three small pieces:
 
-1. **A WASI preview1 shim** (`wasi-sh/shim`, ~160 lines): in-memory FS,
-   in-memory pipes behind busybox's `__host_pipe`/`__host_dup` imports
-   (that's what makes fork-free `$(...)` and pipes possible), and a
-   pluggable stdin.
+1. **A WASI preview1 shim** (`wasi-sh/shim`, ~200 lines): writable in-memory
+   FS (copy-on-write over your mounts), in-memory pipes behind busybox's
+   `__host_pipe`/`__host_dup` imports (that's what makes fork-free `$(...)`
+   and pipes possible), and a pluggable stdin.
 2. **A Worker** that runs the wasm off the main thread. For `spawn()` it
    parks on the stdin ring via `Atomics.wait` — blocking reads cost nothing;
    for `run()` stdin is a fixed buffer and no SAB is involved.
