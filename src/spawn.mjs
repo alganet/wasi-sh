@@ -62,9 +62,9 @@ export class Session {
     this._outputFns = new Set();
     this._exitFns = new Set();
     this._errorFns = new Set();
-    let readyResolve, readyReject, exitResolve;
+    let readyResolve, readyReject;
     this._ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
-    this.exited = new Promise((res) => { exitResolve = res; });
+    this.exited = new Promise((res) => { this._exitResolve = res; });
     // Reject-before-ready surfaces instantiation failures through spawn().
     this._ready.catch(() => {});
     worker.onmessage = (e) => {
@@ -75,9 +75,7 @@ export class Session {
       } else if (m.type === 'ready') {
         readyResolve(this);
       } else if (m.type === 'exit') {
-        exitResolve(m.code);
-        for (const fn of this._exitFns) fn(m.code);
-        this._dispose();
+        this._exit(m.code);
       } else if (m.type === 'error') {
         const err = new Error(m.msg);
         readyReject(err);
@@ -101,13 +99,25 @@ export class Session {
   end() { this._ring.end(); }
 
   // Hard-kill the worker (the guest gets no chance to exit cleanly).
+  // Settles `exited` (and fires onExit) with 137, kill -9 style — a session
+  // must never leave `await session.exited` hanging.
   terminate() {
     if (this.worker) this.worker.terminate();
+    this._exit(137);
   }
 
   onOutput(fn) { this._outputFns.add(fn); return () => this._outputFns.delete(fn); }
   onExit(fn) { this._exitFns.add(fn); return () => this._exitFns.delete(fn); }
   onError(fn) { this._errorFns.add(fn); return () => this._errorFns.delete(fn); }
+
+  // Single exit path (worker exit message OR terminate) — first caller wins.
+  _exit(code) {
+    if (this._exited) return;
+    this._exited = true;
+    this._exitResolve(code);
+    for (const fn of this._exitFns) fn(code);
+    this._dispose();
+  }
 
   _dispose() {
     if (this._ownsWorker && this.worker) this.worker.terminate();

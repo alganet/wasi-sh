@@ -36,13 +36,16 @@ export class Session {
   write(data: string | Uint8Array): void;
   /** Signal stdin EOF. */
   end(): void;
-  /** Hard-kill the worker. */
+  /** Hard-kill the worker. Settles `exited` (and fires onExit) with 137. */
   terminate(): void;
   /** Subscribe to output bytes. Returns an unsubscribe function. */
   onOutput(fn: (bytes: Uint8Array, channel: OutputChannel) => void): () => void;
   onExit(fn: (code: number) => void): () => void;
   onError(fn: (err: Error) => void): () => void;
-  /** Resolves with the guest's exit code. */
+  /**
+   * Resolves with the guest's exit code (137 after terminate()). Always
+   * settles — safe to await unconditionally.
+   */
   readonly exited: Promise<number>;
   /** Escape hatch. */
   readonly worker: Worker;
