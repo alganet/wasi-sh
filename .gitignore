@@ -7,3 +7,6 @@ package-lock.json
 
 # OS
 .DS_Store
+
+# local-only investigation notes (never committed)
+/BUSYBOX_TOOLS.md
