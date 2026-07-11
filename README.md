@@ -68,6 +68,12 @@ term.onData((d) => session.write(d));            // keyboard → shell
 session.onOutput((b) => term.write(b));          // shell → screen
 ```
 
+One knob matters: the guest has no tty line discipline (no ONLCR), so its
+output is LF-only — set `convertEol: true` so the terminal supplies the
+carriage returns. The exception is a raw-drawing TUI that positions with
+explicit `\r` and cursor addressing (tuish does): that wants `convertEol:
+false` so its bytes pass through untouched.
+
 Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`
 and `<input>` with no terminal library at all, and `examples/repl.html` for

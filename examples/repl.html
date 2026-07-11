@@ -47,7 +47,10 @@ import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/+esm";
 import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/+esm";
 import { spawn } from "../src/index.mjs";
 
-const term = new Terminal({ cursorBlink:true, fontSize:14, convertEol:false, theme:{background:"#0b0e14"} });
+// convertEol: the guest has no tty line discipline (no ONLCR), so its output
+// is LF-only — let xterm supply the CR. (A raw-drawing TUI that emits its own
+// \r and cursor addressing, like tuish, would set false instead.)
+const term = new Terminal({ cursorBlink:true, fontSize:14, convertEol:true, theme:{background:"#0b0e14"} });
 const fit = new FitAddon(); term.loadAddon(fit);
 term.open(document.getElementById("term")); fit.fit();
 addEventListener("resize", () => fit.fit());
@@ -61,7 +64,12 @@ let line = "";       // current input line
 let running = false; // a command is executing
 let acc = "";        // output accumulator (to catch the sentinel across chunks)
 const PROMPT = "\x1b[36m$\x1b[0m ";
-const prompt = () => term.write("\r\n" + PROMPT);
+// Break the line only when output left the cursor mid-line (printf without
+// \n); output that already ended in a newline gets the prompt right below it.
+// term.write is async — the empty write's callback runs after everything
+// queued before it has been processed, so cursorX is trustworthy there.
+const prompt = () => term.write("", () =>
+  term.write((term.buffer.active.cursorX > 0 ? "\r\n" : "") + PROMPT));
 
 let session;
 try {
@@ -79,9 +87,11 @@ function runLine(cmd){
   const trimmed = cmd.trim();
   if (!trimmed){ prompt(); return; }
   running = true;
-  // run the line, then emit the exit status wrapped in RS markers
+  // run the line, then emit the exit status wrapped in RS markers — no
+  // trailing newline: the closing marker is the last byte, so nothing is
+  // left over for the parser to flush as a stray blank line.
   session.write(cmd + "\n");
-  session.write('printf "' + RS + '%d' + RS + '\\n" "$?"\n');
+  session.write('printf "' + RS + '%d' + RS + '" "$?"\n');
 }
 
 const dec = new TextDecoder();
