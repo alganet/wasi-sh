@@ -26,7 +26,7 @@ export class WasiExit extends Error { constructor(code){ super('exit '+code); th
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 
-const E = { SUCCESS:0, BADF:8, EXIST:20, INVAL:28, NOENT:44, NOSYS:52, NOTDIR:54, NOTCAPABLE:76, AGAIN:6 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INVAL:28, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, NOTCAPABLE:76, AGAIN:6 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
 export class WasiShim {
@@ -47,6 +47,10 @@ export class WasiShim {
     this.fds.set(3, { type:'dir', path:'/', preopen:true });
     this.nextFd = 4;
     this.pipes = [];
+    // Inodes are handed out lazily per node. They must be UNIQUE: busybox
+    // find/cp -r detect directory recursion by dev:ino pairs, and a constant
+    // ino makes every directory look like a loop.
+    this.nextIno = 2;
   }
   bindMemory(memory){ this.mem = memory; this.refresh(); }
   refresh(){ this.view = new DataView(this.mem.buffer); this.u8 = new Uint8Array(this.mem.buffer); }
@@ -137,6 +141,44 @@ export class WasiShim {
         for(;idx<ents.length;idx++){ const name=ents[idx]; const nb=strBytes(name); const child=node.children[name]; const need=24+nb.length; if(p+need>buf+len)break;
           w.dv().setBigUint64(p,BigInt(idx+1),true); w.dv().setBigUint64(p+8,BigInt(idx+1),true); w.dv().setUint32(p+16,nb.length,true); w.dv().setUint8(p+20,child.type==='dir'?FT.DIR:FT.REG); w.bytes().set(nb,p+24); p+=need; written+=need; }
         w.dv().setUint32(out,written,true); return 0; },
+      // ---- writable-FS ops (rm/mkdir/rmdir/mv and friends) ----
+      path_unlink_file:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),false),
+      path_remove_directory:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),true),
+      path_create_directory:(fd,pathp,plen)=>{
+        const path=w.resolve(fd,w.str(pathp,plen));
+        if(w.lookup(path)) return E.EXIST;
+        const parent=w.lookup(parentOf(path));
+        if(!parent||parent.type!=='dir') return E.NOENT;
+        w.fs[path]={type:'dir',children:{}};
+        if(!parent.children) parent.children={};
+        parent.children[path.slice(path.lastIndexOf('/')+1)]={type:'dir'};
+        return 0;
+      },
+      path_rename:(fd,pathp,plen,nfd,npathp,nplen)=>{
+        const from=w.resolve(fd,w.str(pathp,plen)), to=w.resolve(nfd,w.str(npathp,nplen));
+        const node=w.lookup(from); if(!node) return E.NOENT;
+        const tparent=w.lookup(parentOf(to));
+        if(!tparent||tparent.type!=='dir') return E.NOENT;
+        if(from===to) return 0;
+        w.unlinkEntry(from);
+        w.fs[to]=node;
+        // the FS map is keyed by full path: a directory brings its subtree
+        if(node.type==='dir'){
+          const prefix=from+'/';
+          for(const key of Object.keys(w.fs)){
+            if(key.startsWith(prefix)){ w.fs[to+'/'+key.slice(prefix.length)]=w.fs[key]; delete w.fs[key]; }
+          }
+        }
+        if(!tparent.children) tparent.children={};
+        tparent.children[to.slice(to.lastIndexOf('/')+1)]={type:node.type};
+        return 0;
+      },
+      // touch decides create-vs-update from this errno; times aren't stored.
+      path_filestat_set_times:(fd,flags,pathp,plen)=>w.lookup(w.resolve(fd,w.str(pathp,plen)))?0:E.NOENT,
+      // No symlinks exist in this FS: readlink's EINVAL means "not a symlink".
+      path_readlink:()=>E.INVAL,
+      path_symlink:()=>E.NOSYS,
+      path_link:()=>E.NOSYS,
       poll_oneoff:(subs,events,nsubs,out)=>{
         // Parse subscriptions: a clock (timeout) and/or fd_read events. Events
         // must ECHO the subscription's userdata (WASI matches by it).
@@ -191,14 +233,31 @@ export class WasiShim {
     for(const f of this.fds.values()) if(f.type==='pipe'&&f.pipe===idx) return;
     this.pipes[idx]=null;
   }
+  // Detach a path from the FS map and its parent's child list. Open fds keep
+  // their node reference, so unlink-while-open reads keep working (POSIX-ish).
+  unlinkEntry(path){
+    delete this.fs[path];
+    const parent=this.lookup(parentOf(path));
+    if(parent&&parent.children) delete parent.children[path.slice(path.lastIndexOf('/')+1)];
+  }
+  // path_unlink_file / path_remove_directory: wantDir picks which is legal.
+  removeNode(path,wantDir){
+    const node=this.lookup(path);
+    if(!node) return E.NOENT;
+    if(wantDir!==(node.type==='dir')) return wantDir?E.NOTDIR:E.INVAL;
+    if(wantDir&&node.children&&Object.keys(node.children).length) return E.NOTEMPTY;
+    this.unlinkEntry(path);
+    return 0;
+  }
   str(p,len){ return DEC.decode(this.bytes().subarray(p,p+len)); }
   iovecs(iovs,n){ const out=[]; for(let i=0;i<n;i++){ const buf=this.dv().getUint32(iovs+i*8,true); const l=this.dv().getUint32(iovs+i*8+4,true); out.push(this.bytes().subarray(buf,buf+l)); } return out; }
   resolve(fd,path){ if(path.startsWith('/')) return normalize(path); const base=(this.fds.get(fd)||{}).path||'/'; return normalize(base.replace(/\/$/,'')+'/'+path); }
   lookup(path){ return this.fs[normalize(path)]||null; }
-  writeFilestat(out,node){ const d=this.dv(); d.setBigUint64(out,1n,true); d.setBigUint64(out+8,1n,true); d.setUint8(out+16,node.type==='dir'?FT.DIR:(node.type==='char'?FT.CHAR:FT.REG)); d.setBigUint64(out+24,1n,true); d.setBigUint64(out+32,BigInt(node.data?node.data.length:0),true); for(const o of [40,48,56]) d.setBigUint64(out+o,0n,true); }
+  writeFilestat(out,node){ const d=this.dv(); if(!node.ino) node.ino=this.nextIno++; d.setBigUint64(out,1n,true); d.setBigUint64(out+8,BigInt(node.ino),true); d.setUint8(out+16,node.type==='dir'?FT.DIR:(node.type==='char'?FT.CHAR:FT.REG)); d.setBigUint64(out+24,1n,true); d.setBigUint64(out+32,BigInt(node.data?node.data.length:0),true); for(const o of [40,48,56]) d.setBigUint64(out+o,0n,true); }
 }
 
 function strBytes(s){ return ENC.encode(s); }
+function parentOf(p){ const s=p.lastIndexOf('/'); return s>0?p.slice(0,s):'/'; }
 function normalize(p){ const parts=p.split('/').filter(x=>x&&x!=='.'); const st=[]; for(const x of parts){ if(x==='..')st.pop(); else st.push(x); } return '/'+st.join('/'); }
 function buildFs(files){
   const fs={ '/':{type:'dir',children:{}}, '/dev':{type:'dir',children:{}}, '/dev/null':{type:'char'}, '/tmp':{type:'dir',children:{}} };

@@ -199,6 +199,76 @@ test('fd_filestat_get reports size for regular files', () => {
   assert.equal(t.view().getBigUint64(0xa00 + 32, true), 5n, 'size');
 });
 
+// ─── writable-FS path ops (rm/mkdir/rmdir/mv syscall surface) ────────────────
+
+// Call a path_* syscall with a string path against preopen fd 3.
+function pathOp(t, op, path, ...rest) {
+  const [p, len] = putStr(t.bytes, 0x100, path);
+  return t.p1[op](3, p, len, ...rest);
+}
+
+test('path_create_directory / path_remove_directory lifecycle', () => {
+  const t = makeShim();
+  assert.equal(pathOp(t, 'path_create_directory', '/tmp/d'), 0);
+  assert.equal(t.shim.lookup('/tmp/d').type, 'dir');
+  assert.equal(pathOp(t, 'path_create_directory', '/tmp/d'), 20, 'EEXIST on repeat');
+  assert.equal(pathOp(t, 'path_create_directory', '/no/parent'), 44, 'NOENT without parent');
+  assert.equal(pathOp(t, 'path_remove_directory', '/tmp/d'), 0);
+  assert.equal(t.shim.lookup('/tmp/d'), null);
+});
+
+test('path_unlink_file removes files, refuses dirs; rmdir refuses non-empty', () => {
+  const t = makeShim({ files: { '/dir/f.txt': 'x' } });
+  assert.equal(pathOp(t, 'path_unlink_file', '/dir'), 28, 'EINVAL: unlink of a dir');
+  assert.equal(pathOp(t, 'path_remove_directory', '/dir'), 55, 'ENOTEMPTY');
+  assert.equal(pathOp(t, 'path_unlink_file', '/dir/f.txt'), 0);
+  assert.equal(pathOp(t, 'path_unlink_file', '/dir/f.txt'), 44, 'NOENT on repeat');
+  assert.equal(pathOp(t, 'path_remove_directory', '/dir'), 0, 'empty now');
+});
+
+test('path_rename moves files and directories, dropping the old name', () => {
+  const t = makeShim({ files: { '/a/f.txt': 'payload' } });
+  // rename the file
+  const [p1v, l1] = putStr(t.bytes, 0x100, '/a/f.txt');
+  const [p2v, l2] = putStr(t.bytes, 0x180, '/a/g.txt');
+  assert.equal(t.p1.path_rename(3, p1v, l1, 3, p2v, l2), 0);
+  assert.equal(t.shim.lookup('/a/f.txt'), null);
+  assert.equal(dec.decode(t.shim.lookup('/a/g.txt').data), 'payload');
+  // rename the directory
+  const [p3v, l3] = putStr(t.bytes, 0x100, '/a');
+  const [p4v, l4] = putStr(t.bytes, 0x180, '/b');
+  assert.equal(t.p1.path_rename(3, p3v, l3, 3, p4v, l4), 0);
+  assert.equal(dec.decode(t.shim.lookup('/b/g.txt')?.data ?? new Uint8Array()), 'payload', 'children move with the dir');
+});
+
+test('path_filestat_set_times: exists → 0, missing → NOENT (touch branches on this)', () => {
+  // NB: unlike the other path_* ops, lookupflags precede the path here.
+  const t = makeShim({ files: { '/f.txt': 'x' } });
+  const [p1v, l1] = putStr(t.bytes, 0x100, '/f.txt');
+  assert.equal(t.p1.path_filestat_set_times(3, 0, p1v, l1, 0n, 0n, 0), 0);
+  const [p2v, l2] = putStr(t.bytes, 0x100, '/missing');
+  assert.equal(t.p1.path_filestat_set_times(3, 0, p2v, l2, 0n, 0n, 0), 44);
+});
+
+test('symlink surface: readlink EINVAL, symlink/link NOSYS', () => {
+  const t = makeShim();
+  assert.equal(t.p1.path_readlink(), 28);
+  assert.equal(t.p1.path_symlink(), 52);
+  assert.equal(t.p1.path_link(), 52);
+});
+
+test('filestat hands out unique stable inodes (find/cp -r loop detection)', () => {
+  const t = makeShim({ files: { '/a.txt': 'a', '/b.txt': 'b' } });
+  const ino = (path) => {
+    const fd = openPath(t, path);
+    t.p1.fd_filestat_get(fd, 0xa00);
+    return t.view().getBigUint64(0xa00 + 8, true);
+  };
+  const a1 = ino('/a.txt'), b = ino('/b.txt'), a2 = ino('/a.txt');
+  assert.notEqual(a1, b, 'distinct nodes get distinct inos');
+  assert.equal(a1, a2, 'same node keeps its ino');
+});
+
 // ─── stdout/stderr callbacks ─────────────────────────────────────────────────
 
 test('fd_write routes 1→stdout and 2→stderr callbacks', () => {
