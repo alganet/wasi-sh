@@ -1,17 +1,17 @@
 # wasi-sh
 
-Run **pure shell scripts in the browser** (and node) — busybox `ash` compiled
-to plain `wasm32-wasi`, fork-free. Command substitution, pipes of builtins,
-subshell isolation, heredocs, `read -t` timing: a real POSIX-flavored shell,
-in-process, no server.
+Run **shell scripts in the browser** (and node) — busybox `ash` plus a set of
+coreutils, compiled to plain `wasm32-wasi`, fork-free. Pipes, command
+substitution, `grep`/`sed`/`awk`/`find`, `read -t` timing: a real
+POSIX-flavored shell with a real toolbox, in-process, no server.
 
 ```js
 import { run } from 'wasi-sh';
 
 const { stdout, exitCode } = await run({
-  command: 'for i in 1 2 3; do echo "line $i"; done',
+  command: 'seq 20 | awk "$1 % 3 == 0" | sort -rn | head -n 2',
 });
-// stdout === 'line 1\nline 2\nline 3\n'
+// stdout === '18\n15\n'
 ```
 
 That works on **any static host with no special headers** — non-interactive
@@ -54,6 +54,50 @@ await session.exited; // exit code — always settles, even after terminate()
 like a real terminal's. That is the one thing that **requires cross-origin
 isolation** — see [Deployment](#deployment-cross-origin-isolation).
 
+## The toolbox
+
+Everything runs **in-process** — commands are dispatched as function calls
+into the busybox applets compiled into the wasm, never as processes:
+
+- **Files**: `cat ls stat touch mkdir rmdir rm cp mv find du mktemp`
+- **Text**: `grep sed awk sort uniq cut tr head tail wc seq paste fold tac
+  expr hexdump xxd`
+- **Hashes**: `md5sum sha1sum sha256sum cksum crc32`
+- **Misc**: `date env printenv basename dirname realpath test printf getopt
+  uname nproc` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
+  globs, functions)
+
+`command -v NAME` / `type NAME` tell you what exists. `find -exec` and
+`xargs` work for simple children like `echo`. The filesystem you mount via
+`files:` is **writable inside the sandbox** (copy-on-write — your buffers are
+never touched; everything vanishes when the run ends), so
+`grep -r`, `sed -i`, redirects, and `/tmp` scratch files all behave normally.
+
+## Scope and drawbacks — read before depending on it
+
+- **No processes, ever.** There is no fork/exec: no external programs, no
+  backgrounding (`&`), no job control, and no exec-wrappers — `env CMD`,
+  `nohup`, `nice`, `time`, `timeout` cannot work. Networking (`wget`, `nc`),
+  `/proc` tools (`ps`, `top`), and interactive full-screen tools (`vi`,
+  `less`) are out of scope.
+- **Pipelines run sequentially**, each stage buffering fully before the next
+  starts. Finite pipelines are fine; an infinite producer (`yes | head`)
+  never terminates, and there's no backpressure.
+- **Memory grows with use.** The coreutils were written to run in throwaway
+  processes and leak a little per invocation (~2 KiB average). A `run()`
+  one-shot doesn't care; a REPL session that executes tools continuously
+  grows slowly and wasm memory is never returned — plan to
+  `session.terminate()` and respawn long-lived sessions eventually.
+- **A busy command can't be interrupted.** There is no ^C delivery into a
+  running tool; a long `awk` holds the worker until it finishes
+  (`terminate()` still kills the session from outside).
+- **No symlinks, permissions, or timestamps** in the sandbox FS (`ln` is
+  deliberately absent; `ls -l` shows placeholders).
+- A tool that fails or even calls `exit` only sets `$?` — the shell and
+  session survive.
+
+Deeper technical detail on all of this: [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Terminals: bring your own
 
 wasi-sh has **no terminal dependency** and never will. A `Session` is a byte
@@ -78,27 +122,6 @@ Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`
 and `<input>` with no terminal library at all, and `examples/repl.html` for
 an xterm-based REPL (xterm from a CDN; not a dependency).
-
-## Scope — what this is and is not
-
-The guest is **busybox `ash` only, builtins only**:
-
-- **No external programs.** There is no `exec`, no processes, no other
-  applets — `ls`, `cat`, `stty` etc. are "not found". Shell builtins
-  (`echo`, `printf`, `read`, `test`, `[`, arithmetic, globs, functions)
-  are the toolbox.
-- **Fork-free `$(...)` and pipes.** `fork()` is stubbed to `ENOSYS`; a small
-  ash patch runs command substitution and builtin pipelines in-process
-  through host-backed in-memory pipes. Pipe stages run sequentially through
-  unbounded buffers (fine for finite pipelines; an infinite producer like
-  `yes | head` would not terminate). Subshell isolation covers variables and
-  shell options; functions/aliases/traps/cwd isolation is incomplete.
-- **In-memory filesystem.** Mounted `files` are readable and writable
-  (copy-on-write — your mounted buffers are never mutated), and scripts can
-  create files where a parent directory exists (`/tmp` is always there).
-  Everything vanishes when the run or session ends. This runs *scripts*,
-  not systems.
-- No job control, no signals, no TTY ioctls.
 
 ## API
 
@@ -148,11 +171,12 @@ Cross-Origin-Embedder-Policy: require-corp
 
 - Local dev: `npm run serve` sends the headers.
 - Hosts where you control headers (Netlify, Vercel, nginx…): add the two
-  headers.
+  headers. **This is the reliable path.**
 - Hosts where you can't (e.g. GitHub Pages): a service-worker shim such as
-  [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) can
-  enable isolation client-side. Whether to adopt one is your deployment
-  choice — wasi-sh doesn't bundle it.
+  [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) exists,
+  but in our testing it is **unreliable in current Chrome** (isolation
+  sometimes never engages after the shim's reload). Treat it as best-effort;
+  prefer a host that lets you set headers.
 - `run()`-only pages need none of this.
 
 `spawn()` fails fast with a descriptive error when isolation is missing.
@@ -176,35 +200,18 @@ Interactive semantics are testable headless too — drive a
 
 ## Building the wasm from source
 
-`dist/busybox.wasm` is busybox 1.38.0 `ash`, built by `build/build.sh`
-(pinned tarball + SHA-256, the fork-free ash patch, an ash-only config, and
-a `wasm32-wasi` toolchain — zig or wasi-sdk; see the script for the flag
-rationale). `npm run build:wasm` rebuilds it and refuses to install a binary
-that fails its smoke test.
-
-The currently shipped binary is the one proven end-to-end by the original
-research port (this package's test suite runs against it); a from-source
-rebuild should additionally pass `npm test` and the downstream consumer
-checks before being trusted.
+`dist/busybox.wasm` is busybox 1.38.0 (`ash` + the applet set above), built
+by `build/build.sh` — pinned tarball + SHA-256, the fork-free patch, an
+ash-plus-applets config, and a `wasm32-wasi` toolchain (zig or wasi-sdk; see
+the script and [ARCHITECTURE.md](ARCHITECTURE.md) for the flag rationale).
+`npm run build:wasm` rebuilds it and refuses to install a binary that fails
+its smoke test. After a rebuild, run `npm test` and the downstream consumer
+checks before trusting it.
 
 ## Licensing
 
 The JavaScript in this package is **ISC**. `dist/busybox.wasm` is compiled
 from [BusyBox](https://busybox.net), which is **GPL-2.0** — the binary
-remains GPL-2.0, and `build/` contains the complete corresponding source
-recipe (config, patches, build script). If you redistribute the wasm,
-GPL-2.0 terms apply to it.
-
-## How it works
-
-Three small pieces:
-
-1. **A WASI preview1 shim** (`wasi-sh/shim`, ~200 lines): writable in-memory
-   FS (copy-on-write over your mounts), in-memory pipes behind busybox's
-   `__host_pipe`/`__host_dup` imports (that's what makes fork-free `$(...)`
-   and pipes possible), and a pluggable stdin.
-2. **A Worker** that runs the wasm off the main thread. For `spawn()` it
-   parks on the stdin ring via `Atomics.wait` — blocking reads cost nothing;
-   for `run()` stdin is a fixed buffer and no SAB is involved.
-3. **A SAB ring** (`wasi-sh/ring`): monotonic head/tail counters, an EOF
-   flag, overflow detection, and sequence-word wakeups.
+remains GPL-2.0; `build/` contains the complete corresponding source recipe
+(config, patch, build script) and `build/COPYING` is the license text. If you
+redistribute the wasm, GPL-2.0 terms apply to it.
