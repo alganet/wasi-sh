@@ -185,7 +185,17 @@ export class WasiShim {
         let timeoutMs=null, clockUD=null, stdinUD=null, otherRead=null;
         for(let i=0;i<nsubs;i++){ const s=subs+i*48; const ud=w.dv().getBigUint64(s,true); const tag=w.dv().getUint8(s+8);
           if(tag===0){ const t=w.dv().getBigUint64(s+24,true); timeoutMs=Number(t)/1e6; clockUD=ud; }
-          else if(tag===1){ const fd=w.dv().getUint32(s+16,true); if(fd===0) stdinUD=ud; else otherRead=ud; } }
+          else if(tag===1){ const fd=w.dv().getUint32(s+16,true);
+            // Route by the fd's TABLE TYPE, not its number. Only a real
+            // ring-backed stdin consults w.input; a fd 0 that was dup2'd onto a
+            // pipe/file (a redirection or `cmd | while read`) is an ordinary
+            // readable fd. Keying on `fd===0` made poll wait on the empty ring
+            // while the data sat in the pipe now on fd 0, so `read -t` timed out
+            // instead of reading — and tuish's sub-second timer probe
+            // (`echo 1 | read -t 0.01`) mis-detected, forcing a 1s escape
+            // timeout in the browser. Matches fd_read, which keys on type too.
+            const f=w.fds.get(fd);
+            if(f && f.type==='stdin') stdinUD=ud; else otherRead=ud; } }
         let nev=0;
         const emitRead=(ud)=>{ const ev=events+nev*32; w.dv().setBigUint64(ev,ud,true); w.dv().setUint16(ev+8,0,true); w.dv().setUint8(ev+10,1); w.dv().setBigUint64(ev+16,64n,true); w.dv().setUint16(ev+24,0,true); nev++; };
         const emitClock=(ud)=>{ const ev=events+nev*32; w.dv().setBigUint64(ev,ud,true); w.dv().setUint16(ev+8,0,true); w.dv().setUint8(ev+10,0); nev++; };

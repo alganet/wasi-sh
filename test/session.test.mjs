@@ -65,3 +65,27 @@ test('error before ready rejects spawn readiness and fires onError', async () =>
   await assert.rejects(() => s._ready, /instantiation failed/);
   assert.deepEqual(errs, ['instantiation failed']);
 });
+
+test('error message settles exited (134) — a guest trap must not hang awaiters', async () => {
+  // Regression: the error path fired onError but never settled `exited`, so a
+  // guest that trapped mid-session left `await session.exited` pending forever,
+  // violating the documented "always settles" contract.
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  s._ready.catch(() => {});
+  w.emit({ type: 'ready' });
+  w.emit({ type: 'error', msg: 'guest trapped' });
+  assert.equal(await s.exited, 134);
+  assert.ok(w.terminated >= 1, 'owned worker disposed after an error');
+});
+
+test('worker.onerror settles exited (134) too', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  s._ready.catch(() => {});
+  const errs = [];
+  s.onError((e) => errs.push(e.message));
+  w.onerror({ message: 'worker blew up' });
+  assert.equal(await s.exited, 134);
+  assert.deepEqual(errs, ['worker blew up']);
+});

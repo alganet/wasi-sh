@@ -81,7 +81,18 @@ fork:
 - **Subshell isolation** (`subsh_begin`/`subsh_end`): built from ash's own
   localvar machinery — a scope snapshotting `$-` and every set variable, so
   writes revert on pop while reads see inherited values. Variables and shell
-  options are isolated; functions, aliases, traps, and cwd are not.
+  options are isolated; **functions, aliases, traps, cwd, and positional
+  parameters are not** — a `cd`, `set --`, or function definition inside `$(...)`
+  leaks to the parent. This is silent (no error); scripts that depend on a
+  forking shell's full subshell isolation of those will diverge.
+
+Why plain WASI rather than [WASIX](https://wasix.org/) (which offers real
+`fork`/`exec`/threads and would erase all of the above): we prototyped on WASIX
+and found it too slow and heavy to start for this use case, with a narrower
+runtime story. tuish — the reason this project exists — never forks and barely
+pipes, so the fork-free model costs it nothing while keeping the artifact small
+and fast. Workloads that genuinely need process semantics belong on a WASIX
+runtime, not here; wasi-sh will not grow them.
 
 ## Busybox applets as builtins
 

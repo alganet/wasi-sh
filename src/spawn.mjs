@@ -80,13 +80,18 @@ export class Session {
         const err = new Error(m.msg);
         readyReject(err);
         for (const fn of this._errorFns) fn(err);
-        this._dispose();
+        // Settle `exited` too (134 = abnormal, SIGABRT-style): the contract is
+        // "exited always settles", and a guest that traps mid-session must not
+        // leave `await session.exited` hanging. onError conveys the detail;
+        // _exit (idempotent) resolves exited, fires onExit, and disposes.
+        this._exit(134);
       }
     };
     worker.onerror = (e) => {
       const err = e.error || new Error(e.message || 'worker error');
       readyReject(err);
       for (const fn of this._errorFns) fn(err);
+      this._exit(134);   // as above: never leave `exited` pending on a worker error
     };
   }
 

@@ -43,7 +43,8 @@ export class Session {
   onExit(fn: (code: number) => void): () => void;
   onError(fn: (err: Error) => void): () => void;
   /**
-   * Resolves with the guest's exit code (137 after terminate()). Always
+   * Resolves with the guest's exit code (137 after terminate(), 134 if the
+   * worker errored or the guest trapped — onError carries the detail). Always
    * settles — safe to await unconditionally.
    */
   readonly exited: Promise<number>;

@@ -95,6 +95,27 @@ never touched; everything vanishes when the run ends), so
   deliberately absent; `ls -l` shows placeholders).
 - A tool that fails or even calls `exit` only sets `$?` — the shell and
   session survive.
+- **`$(...)` leaks `cd`, positional parameters, function definitions, aliases and
+  traps** into the parent (variables and shell options *are* reverted).
+  `x=$(cd /tmp)` leaves you in `/tmp`; `set -- a b` inside `$()` changes `$@`
+  outside. These are silent — no error — so a script that relies on a forking
+  shell's subshell isolation of any of them behaves differently here.
+
+### Why plain WASI (and when to reach for WASIX instead)
+
+wasi-sh targets **plain `wasm32-wasi`** on purpose. The alternative,
+[WASIX](https://wasix.org/), extends WASI with real `fork`/`exec`, threads, and
+sockets — so it runs an *unmodified* shell with genuine concurrent pipelines,
+backgrounding, and networking, none of which the constraints above would limit.
+We prototyped on WASIX first and moved off it: for this use case it was too slow
+and heavy to start, and the runtime story is narrower. tuish — the TUI framework
+this exists to host — barely uses pipes and never forks, so the fork-free model
+costs it nothing while keeping startup and footprint small.
+
+The rule of thumb: if your scripts live within the constraints above (no `&`, no
+subshell/process substitution, no external programs, sequential pipelines), use
+wasi-sh — it is smaller and faster. If you need real process semantics, use a
+WASIX runtime instead; wasi-sh will not grow them.
 
 Deeper technical detail on all of this: [ARCHITECTURE.md](ARCHITECTURE.md).
 

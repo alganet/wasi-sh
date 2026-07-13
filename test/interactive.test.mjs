@@ -83,6 +83,34 @@ test('read -t honors timeouts over one second (whole seconds must not drop)', as
   assert.ok(elapsed < 2200, `did not wait the timeout twice (${elapsed}ms)`);
 });
 
+test('read -t on a PIPED fd 0 reads the pipe, not the ring (poll routes by fd type)', async () => {
+  // Regression for the poll_oneoff fd-routing bug: `printf x | read -t` dup2's a
+  // pipe onto fd 0, but poll keyed on `fd===0` and waited on the empty stdin ring
+  // instead of the pipe — so read -t timed out (rc=142, empty) with the data
+  // stranded in the pipe. Only reproduces over a LIVE ring (here); under run()'s
+  // fixedInput, closed() short-circuits poll and hides it. `printf x` has no
+  // newline, so read legitimately returns 1 at EOF — the bug is the empty value
+  // and the full-timeout wait, not the exit code.
+  const t0 = Date.now();
+  const { exited } = spawnTwin('printf x | { read -t 1 v; echo "v=[$v]"; }');
+  const m = await exited;
+  const elapsed = Date.now() - t0;
+  assert.match(m.out, /v=\[x\]/, 'the piped byte was read, not lost to a ring wait');
+  assert.ok(elapsed < 600, `did not wait out the 1s timeout (${elapsed}ms)`);
+});
+
+test('tuish sub-second timer probe detects "sub" over the ring (not a 1s escape timeout)', async () => {
+  // The exact probe from tuish tui.sh:_tuish_init_timing. When poll misrouted the
+  // piped fd 0 it timed out → the probe reported "second" → tuish ran with a 1s
+  // escape-key timeout in the browser. It must report sub-second.
+  const probe = `if { echo 1 | read -r -t'0.01' -n 1 2>/dev/null ;} || `
+    + `{ echo 1 | read -r -t'0.01' -k1 -u0 2>/dev/null ;}; `
+    + `then echo TIMING=sub; else echo TIMING=second; fi`;
+  const { exited } = spawnTwin(probe);
+  const m = await exited;
+  assert.match(m.out, /TIMING=sub/, 'read -t honors sub-second timeouts on a piped probe');
+});
+
 test('blocking read parks and wakes promptly on write', async () => {
   const { writer, exited } = spawnTwin('read -r x; echo "got=[$x]"');
   // Let the guest reach the blocking read, then feed a line.
