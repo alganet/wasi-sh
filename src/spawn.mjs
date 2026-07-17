@@ -38,15 +38,28 @@ export async function spawn(options = {}) {
     || (options.workerUrl
       ? new Worker(options.workerUrl, { type: 'module' })
       : new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' }));
-  const session = new Session(worker, new RingWriter(sab), options.worker == null);
+  const ringWriter = new RingWriter(sab);
+  const session = new Session(worker, ringWriter, options.worker == null);
   if (options.onOutput) session.onOutput(options.onOutput);
   if (options.onExit) session.onExit(options.onExit);
   if (options.onError) session.onError(options.onError);
+  const env = mergeEnv(options.env);
+  // Geometry for an interactive session travels through the winsize ioctl (live,
+  // resizable via session.resize()), NOT the environment. Seed the ring from the
+  // caller's initial COLUMNS/LINES so the guest's first `stty size` /
+  // ioctl(TIOCGWINSZ) is right, then DROP them from the guest env: busybox's
+  // `stty size` / get_terminal_width_height prefer COLUMNS/LINES when present and
+  // would return that frozen value forever, so a resize would never be seen.
+  // (run() keeps them — it has no winsize ioctl and never resizes.)
+  const cols0 = parseInt(env.COLUMNS, 10), rows0 = parseInt(env.LINES, 10);
+  if (cols0 > 0 && rows0 > 0) ringWriter.seedWinsize(cols0, rows0);
+  delete env.COLUMNS;
+  delete env.LINES;
   const msg = {
     ...wasm, // { module } or { wasmBytes }
     files: { ...extraFiles, ...(options.files || {}) },
     args: argv,
-    env: mergeEnv(options.env),
+    env,
     sab,
   };
   worker.postMessage(msg, msg.wasmBytes ? [msg.wasmBytes.buffer] : []);
@@ -102,6 +115,15 @@ export class Session {
 
   // Signal stdin EOF: the guest drains buffered input, then reads EOF.
   end() { this._ring.end(); }
+
+  // Report a terminal resize (cols × rows). Stores the live geometry and
+  // synthesizes a SIGWINCH in the guest: a shell with `trap ... WINCH` runs
+  // its handler, and `stty size` / ioctl(TIOCGWINSZ) then return the new size.
+  // wasm has no signals and env is frozen at spawn, so this shared-memory path
+  // is how geometry reaches a RUNNING guest — call it from the terminal's own
+  // resize handler (e.g. xterm's term.onResize). No-op if the guest doesn't
+  // trap WINCH; the fresh size is still there for the next `stty size`.
+  resize(cols, rows) { this._ring.resize(cols, rows); }
 
   // Hard-kill the worker (the guest gets no chance to exit cleanly).
   // Settles `exited` (and fires onExit) with 137, kill -9 style — a session

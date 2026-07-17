@@ -36,6 +36,13 @@ export class Session {
   write(data: string | Uint8Array): void;
   /** Signal stdin EOF. */
   end(): void;
+  /**
+   * Report a terminal resize (cols × rows). Stores live geometry and
+   * synthesizes SIGWINCH in the guest, so a `trap ... WINCH` handler runs and
+   * `stty size` / ioctl(TIOCGWINSZ) return the new size. Call from the
+   * terminal's resize handler (e.g. xterm's term.onResize).
+   */
+  resize(cols: number, rows: number): void;
   /** Hard-kill the worker. Settles `exited` (and fires onExit) with 137. */
   terminate(): void;
   /** Subscribe to output bytes. Returns an unsubscribe function. */

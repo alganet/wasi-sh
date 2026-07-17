@@ -25,8 +25,10 @@ Two stdin transports plug into the same shim `input` contract:
 
 ## The WASI shim (`src/shim.mjs`)
 
-A minimal preview1 implementation (27 imports total) plus four `env.*` hooks
-that back busybox's fork-free machinery.
+A minimal preview1 implementation (27 imports total) plus `env.*` hooks: four
+that back busybox's fork-free machinery (`__host_pipe`/`__host_dup`/`__host_dup2`
+/`__host_trace`) and two for terminal geometry (`__host_winsize`/`__host_winch`,
+see "Terminal resize" below).
 
 **Filesystem.** A flat map of absolute path → node (`{type, data?, children?}`).
 Writable: `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` honored, file creation
@@ -56,14 +58,60 @@ caller reads EOF, terminating `while read` loops.
 
 ## The stdin ring (`src/ring.mjs`)
 
-`Int32[head, tail, flags, seq]` header + data bytes in one SharedArrayBuffer.
-`head` and `tail` are monotonic byte counters (only the data index is reduced
-modulo capacity), so `head - tail` is always the unread count. `seq` is a
-wakeup sequence word bumped on every producer event — consumers load it,
-re-check their condition, then `Atomics.wait` on it, so an event landing
-between check and wait returns immediately instead of being lost. `end()`
-sets an EOF flag and bumps `seq` (EOF changes no counter, so waiting on `head`
-alone would miss it).
+`Int32[head, tail, flags, seq, winRows, winCols, winch]` header + data bytes in
+one SharedArrayBuffer. `head` and `tail` are monotonic byte counters (only the
+data index is reduced modulo capacity), so `head - tail` is always the unread
+count. `seq` is a wakeup sequence word bumped on every producer event —
+consumers load it, re-check their condition, then `Atomics.wait` on it, so an
+event landing between check and wait returns immediately instead of being lost.
+`end()` sets an EOF flag and bumps `seq` (EOF changes no counter, so waiting on
+`head` alone would miss it). The last three words carry terminal geometry —
+their story is below.
+
+## Terminal resize: a synthesized SIGWINCH (`Session.resize`)
+
+The env that carries `COLUMNS`/`LINES` is frozen at spawn, wasm preview1 has no
+signal delivery, and there is no PTY between the terminal and the guest — so a
+*running* shell cannot learn the terminal resized. tuish's entire resize path is
+built on `trap ... WINCH` + `stty size`, both of which are dead in the browser
+otherwise. `Session.resize(cols, rows)` revives them over the ring, without a
+general signal layer — just one pending bit:
+
+- **Live size.** `resize()` stores `cols`/`rows` in the ring header. The shim
+  exposes them via `env.__host_winsize`, and `wasistubs.c`'s `__wrap_ioctl`
+  answers `TIOCGWINSZ` from it (`--wrap ioctl`, so it never collides with
+  wasi-libc's own `ioctl`; `CONFIG_STTY=y` is enabled so `stty size` exists).
+  Every `stty size` / `get_terminal_width_height` now returns the current
+  geometry. **Crucially, `spawn()` seeds the ring from the initial `COLUMNS`/
+  `LINES` and then DROPS them from the guest env** — busybox's
+  `get_terminal_width_height` prefers those env vars over the `ioctl` when they
+  are present, so leaving them set would freeze the size and no resize would ever
+  be seen. Geometry for an interactive session is the `ioctl`, not the
+  environment. (`run()` keeps the env vars: it has no winsize ioctl and never
+  resizes.)
+- **The signal.** `resize()` also raises a `winch` flag and bumps `seq`, waking
+  the guest's parked `poll_oneoff`. The chokepoint is `poll()`: tuish's `read
+  -t` waits there (and `ppoll.c` delegates to it), so `--wrap poll` routes every
+  timed wait through `wasistubs.c`'s `__wrap_poll`, which calls `winch_dispatch`
+  on return. `env.__host_winch` reports-and-clears the flag; when set,
+  `winch_dispatch` calls the SIGWINCH handler that ash registered — captured
+  from the `sigaction` stub, which is the only place ash's catcher is installed.
+  That handler sets `pending_sig = SIGWINCH` exactly as a real signal would, and
+  ash runs the trapped action at its next `dotrap` checkpoint (between the
+  commands of the event loop). No ash source patch is needed; the mechanism
+  lives entirely in the shim, `wasistubs.c`, and the two `--wrap` flags.
+- **Clearing `bb_got_signal`.** ash's handler also sets libbb's `bb_got_signal`,
+  which `check_got_signal_and_poll` (the `read -t` wait) treats as "a signal
+  arrived" and short-circuits to `EINTR` *without polling*. ash only clears it on
+  the interactive line-editor path, never for the `read` builtin — so a single
+  synthesized WINCH would make every later `read -t` spin. `winch_dispatch`
+  therefore clears `bb_got_signal` right after delivery (it's a linkable global,
+  and no real signals exist here to race it), keeping `gotsig`/`pending_sig` so
+  the trap still fires. Without this, only the first resize is ever seen.
+
+A burst of resizes coalesces: `winch` is one bit and the dims are last-write-wins,
+so the guest services one WINCH at the newest size. A guest that never traps
+WINCH simply drops the flag; the fresh size is still there for `stty size`.
 
 ## Fork-free ash (`build/ash-forkfree.patch`)
 

@@ -44,6 +44,7 @@ import { spawn } from 'wasi-sh';
 const session = await spawn({ env: { COLUMNS: '80', LINES: '24' } });
 session.onOutput((bytes, channel) => render(bytes)); // shell → you
 session.write('echo hi\n');                          // you → shell
+session.resize(100, 40);  // terminal resized: live size + a synthesized SIGWINCH
 session.end();        // stdin EOF
 session.terminate();  // hard kill (exited resolves 137, kill -9 style)
 await session.exited; // exit code — always settles, even after terminate()
@@ -64,7 +65,7 @@ into the busybox applets compiled into the wasm, never as processes:
   expr hexdump xxd`
 - **Hashes**: `md5sum sha1sum sha256sum cksum crc32`
 - **Misc**: `date env printenv basename dirname realpath test printf getopt
-  uname nproc` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
+  uname nproc stty` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
   globs, functions)
 
 `command -v NAME` / `type NAME` tell you what exists. `find -exec` and
@@ -138,6 +139,24 @@ output is LF-only — set `convertEol: true` so the terminal supplies the
 carriage returns. The exception is a raw-drawing TUI that positions with
 explicit `\r` and cursor addressing (tuish does): that wants `convertEol:
 false` so its bytes pass through untouched.
+
+**Resize** is a third line. wasm has no SIGWINCH and no PTY, so a *running* guest
+can't otherwise learn the terminal changed. `session.resize()` bridges that over
+the stdin ring: it stores the live size (readable via `stty size` /
+`TIOCGWINSZ`) and synthesizes a **SIGWINCH**, so a shell with `trap ... WINCH`
+(tuish's whole resize path) relayouts in place — no re-spawn.
+
+```js
+term.onResize(({ cols, rows }) => session.resize(cols, rows));   // resize → shell
+```
+
+For an interactive session, geometry lives in that ioctl, not the environment:
+`spawn()` uses the initial `COLUMNS`/`LINES` to seed the size and then does **not**
+export them to the guest (busybox `stty size` would prefer the frozen env vars
+over the live ioctl). So pass the starting size as `env: { COLUMNS, LINES }` as
+usual — it becomes the first `stty size` — and drive changes with
+`session.resize()`. A guest that doesn't trap WINCH just ignores the signal; the
+fresh size is still there for the next `stty size`.
 
 Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`

@@ -222,6 +222,15 @@ export class WasiShim {
         __host_dup:(fd,minfd)=>{ const src=w.fds.get(fd); if(!src) return -1; let n=Math.max(minfd,4); while(w.fds.has(n)) n++; if(n>=w.nextFd) w.nextFd=n+1; w.fds.set(n,{...src,preopen:false}); return n; },
         __host_dup2:(oldfd,newfd)=>{ const src=w.fds.get(oldfd); if(!src) return -1; const prev=w.fds.get(newfd); if(newfd>=w.nextFd) w.nextFd=newfd+1; w.fds.set(newfd,{...src,preopen:false}); if(prev&&prev.type==='pipe') w.gcPipe(prev.pipe); return newfd; },
         __host_trace:()=>{},   // debug hook (present in traced builds; harmless)
+        // Terminal geometry for a RUNNING guest. env is frozen at spawn and
+        // there are no signals, so size and resize travel through the stdin
+        // ring's winsize slots (see ring.mjs) and surface here:
+        //   __host_winsize -> ioctl(TIOCGWINSZ) reads the live rows/cols
+        //   __host_winch   -> the guest's poll point turns a pending resize
+        //                     into a synthesized SIGWINCH (fires `trap WINCH`)
+        // Both degrade to "no info" when input has no winsize (run() mode).
+        __host_winsize:(rowsPtr,colsPtr)=>{ const ws=(w.input&&w.input.winsize)?w.input.winsize():{rows:0,cols:0}; w.dv().setUint32(rowsPtr,ws.rows>>>0,true); w.dv().setUint32(colsPtr,ws.cols>>>0,true); },
+        __host_winch:()=> (w.input&&w.input.takeWinch&&w.input.takeWinch())?1:0,
       },
     };
   }

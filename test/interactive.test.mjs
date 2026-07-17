@@ -162,3 +162,42 @@ test('interactive loop: guest echoes multiple inputs then quits on command', asy
   assert.match(m.out, /bye/);
   assert.equal(m.code, 5, 'exit code propagates');
 });
+
+// Only meaningful on a binary built with the winsize/winch C support (compiled
+// at `npm run build:wasm`); probe the module's imports so these stay green on an
+// older dist/busybox.wasm instead of hanging.
+const WINCH_READY = () => WebAssembly.Module.imports(wasm)
+  .some((i) => i.module === 'env' && i.name === '__host_winch');
+
+test('session.resize() synthesizes SIGWINCH and stty size reports live dims', async (t) => {
+  if (!WINCH_READY()) { t.skip('dist/busybox.wasm predates the winsize/winch build — run npm run build:wasm'); return; }
+  // The guest traps WINCH, prints the freshly-queried size, and exits. It idles
+  // in `read -t` (a poll wait — the winch chokepoint) until the resize lands.
+  const script =
+    'trap \'echo "WINCH $(stty size)"; exit 0\' WINCH; '
+    + 'i=0; while [ $i -lt 40 ]; do read -t 0.1 _ 2>/dev/null; i=$((i+1)); done; '
+    + 'echo NOWINCH';
+  const { writer, exited } = spawnTwin(script);
+  await new Promise((res) => setTimeout(res, 250)); // let it reach the read loop
+  writer.resize(100, 40);                            // cols=100, rows=40
+  const m = await exited;
+  assert.match(m.out, /WINCH 40 100/, 'trap fired and `stty size` returned the live rows cols');
+});
+
+test('repeated resizes each fire (bb_got_signal is cleared, no read -t spin)', async (t) => {
+  if (!WINCH_READY()) { t.skip('needs the winsize/winch build — run npm run build:wasm'); return; }
+  // The first synthesized WINCH set libbb's bb_got_signal; if it isn't cleared,
+  // every later `read -t` short-circuits to EINTR and the loop busy-spins — so
+  // only the first resize would ever be seen. This asserts all three land, live.
+  const { writer, exited } = spawnTwin(
+    'n=0; trap \'n=$((n+1)); echo "R$n=$(stty size)"; [ $n -ge 3 ] && exit 0\' WINCH; '
+    + 'i=0; while [ $i -lt 100 ]; do read -t 0.1 _ 2>/dev/null; i=$((i+1)); done; echo TIMEOUT'
+  );
+  await new Promise((res) => setTimeout(res, 200));
+  writer.resize(100, 40); await new Promise((res) => setTimeout(res, 200));
+  writer.resize(70, 20);  await new Promise((res) => setTimeout(res, 200));
+  writer.resize(120, 50); const m = await exited;
+  assert.match(m.out, /R1=40 100/, 'first resize');
+  assert.match(m.out, /R2=20 70/,  'second resize (would be lost to the spin without the fix)');
+  assert.match(m.out, /R3=50 120/, 'third resize');
+});

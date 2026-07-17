@@ -40,6 +40,10 @@
   <button data-cmd='echo hi | read foo; echo "foo=[$foo]  (pipe stage is a subshell)"'>pipe subshell</button>
   <button data-cmd='w=$(printf "a b c" | while read p q r; do echo "$r$q$p"; done); echo "[$w]"'>nested pipe in $()</button>
   <button data-cmd='r=$(exit 7); echo "rc=$?  (exit status propagates)"; echo still-alive'>exit status</button>
+  <br>Browser bridges:
+  <button data-cmd='printf "\033]0;busybox @ wasi-sh\007"; echo "title set — look at the browser tab"'>set tab title</button>
+  <button data-cmd='printf "\033]52;c;aGVsbG8gZnJvbSB3YXNpLXNoIPCfk4s=\007"; echo "copied \"hello from wasi-sh\" — paste it anywhere"'>copy to clipboard</button>
+  <button data-cmd='printf "\033]52;c;?\007"; read -t 1 -r r; r=${r#*;c;}; r=${r%??}; [ -n "$r" ] && printf "clipboard (base64, this build has no base64 -d): %s\n" "$r" || echo "no reply — the browser blocked the read (needs a recent click + permission)"'>read clipboard</button>
 </div>
 <div id="term"></div>
 <script type="module">
@@ -76,12 +80,58 @@ try {
   say("Loading busybox.wasm…\r\n");
   session = await spawn({
     args: ["busybox", "sh"],
-    env: { PS1: "", LC_ALL: "C" },
+    // COLUMNS/LINES seed the guest's initial size (fit.fit() ran above, so
+    // term.cols/rows are the real geometry). A later resize is delivered live
+    // via session.resize() below — see the term.onResize wiring.
+    env: { PS1: "", LC_ALL: "C", COLUMNS: String(term.cols), LINES: String(term.rows) },
   });
 } catch (e) {
   say("\r\n\x1b[31m" + (e?.message || e) + "\x1b[0m\r\n");
   throw e;
 }
+
+// ── Resize bridge: window resize → xterm reflow → live geometry to the guest ──
+// The window listener (above) calls fit.fit(), which re-lays xterm's grid and
+// fires onResize with the new cols/rows. session.resize() stores that geometry
+// and synthesizes a SIGWINCH in the guest — so `stty size` reports the new size
+// and a shell with `trap ... WINCH` (e.g. tuish) relayouts. No re-spawn.
+term.onResize(({ cols, rows }) => session.resize(cols, rows));
+
+// ── Two browser↔shell bridges, both on the terminal wire (no wasi-sh change) ──
+// The shell speaks to the browser in plain escape bytes on stdout; the browser
+// answers (when it answers) as bytes on stdin. Same code path as a real
+// terminal over ssh — these are the host's half of the contract.
+
+// Title: the guest emits OSC 0/2 (`ESC ] 0 ; text BEL`); xterm decodes it and
+// fires onTitleChange. One line marries it to the tab.
+term.onTitleChange((t) => { document.title = t || document.title; });
+
+// Clipboard, BOTH directions, over OSC 52. UTF-8-safe base64 (btoa is byte-wise,
+// so encode/decode through Text{Encoder,Decoder}, not raw charCodes).
+const b64FromText = (s) => { const u = new TextEncoder().encode(s); let bin = "";
+  for (const b of u) bin += String.fromCharCode(b); return btoa(bin); };
+const textFromB64 = (b) => new TextDecoder().decode(
+  Uint8Array.from(atob(b), (c) => c.charCodeAt(0)));
+
+term.parser.registerOscHandler(52, (data) => {
+  const payload = data.slice(data.indexOf(";") + 1);   // strip the "c;" selection
+  if (payload === "?") {
+    // READ (`ESC ] 52 ; c ; ? ST`): the browser gates readText() on permission
+    // and a recent user gesture — that check is exactly why letting the shell
+    // read the clipboard is safe here (in a bare terminal it would not be). The
+    // answer goes back as an OSC 52 on stdin; the app reads it (see the demo).
+    navigator.clipboard?.readText()
+      .then((text) => session?.write("\x1b]52;c;" + b64FromText(text) + "\x1b\\"))
+      .catch((e) => console.warn("[clipboard] read refused:", e.message));
+    return true;
+  }
+  // WRITE (`ESC ] 52 ; c ; <base64> ST`): put the payload on the system clipboard.
+  try {
+    navigator.clipboard?.writeText(textFromB64(payload))
+      .catch((e) => console.warn("[clipboard] write refused:", e.message));
+  } catch (e) { console.warn("[clipboard] bad OSC 52 payload:", e.message); }
+  return true;
+});
 
 function runLine(cmd){
   const trimmed = cmd.trim();
@@ -137,6 +187,7 @@ for (const btn of document.querySelectorAll("#bar button")){
 
 say("\x1b[38;5;250mbusybox ash — fork-free command substitution, pipes & subshell isolation.\x1b[0m\r\n");
 say("\x1b[38;5;244mType a command, or click an example above. (builtins only — no exec)\x1b[0m\r\n");
+say("\x1b[38;5;244mThe 'Browser bridges' row talks to the tab title and the system clipboard, both ways.\x1b[0m\r\n");
 prompt();
 term.focus();
 </script>

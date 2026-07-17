@@ -6,6 +6,11 @@ export class RingOverflowError extends Error {
   constructor(requested: number, free: number);
 }
 
+export interface Winsize {
+  rows: number;
+  cols: number;
+}
+
 export class RingWriter {
   constructor(sab: SharedArrayBuffer);
   readonly capacity: number;
@@ -15,6 +20,8 @@ export class RingWriter {
   write(bytes: Uint8Array): number;
   /** Signal stdin EOF: the consumer drains, then reads EOF. */
   end(): void;
+  /** Post a terminal resize: store geometry, raise pending-winch, and wake. */
+  resize(cols: number, rows: number): void;
 }
 
 /** The WasiShim `input` contract (see shim.d.mts). */
@@ -24,6 +31,10 @@ export interface RingInput {
   readBlocking(max: number): Uint8Array;
   wait(ms: number): void;
   closed(): boolean;
+  /** Current terminal geometry (0 = unknown). */
+  winsize(): Winsize;
+  /** Consume the pending-winch flag (true once per resize burst). */
+  takeWinch(): boolean;
 }
 
 export class RingReader {
@@ -35,5 +46,7 @@ export class RingReader {
   read(max: number): Uint8Array;
   readBlocking(max: number): Uint8Array;
   wait(ms: number): void;
+  winsize(): Winsize;
+  takeWinch(): boolean;
   toInput(): RingInput;
 }

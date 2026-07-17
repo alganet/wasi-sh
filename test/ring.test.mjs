@@ -152,3 +152,53 @@ test('cross-thread: blocked readBlocking wakes on end() with EOF', async () => {
   assert.equal(m.closed, true);
   assert.ok(Date.now() - t0 < 5000, 'woke promptly, not via the 30s re-check');
 });
+
+// ---- terminal geometry: winsize slots + synthesized-winch flag -------------
+
+test('resize() stores geometry the reader reads back', () => {
+  const { w, r } = pair();
+  assert.deepEqual(r.winsize(), { rows: 0, cols: 0 }); // unknown before any resize
+  w.resize(100, 40);
+  assert.deepEqual(r.winsize(), { rows: 40, cols: 100 });
+  w.resize(80, 24); // last-write-wins
+  assert.deepEqual(r.winsize(), { rows: 24, cols: 80 });
+});
+
+test('resize() raises winch; takeWinch() consumes it exactly once', () => {
+  const { w, r } = pair();
+  assert.equal(r.takeWinch(), false); // nothing pending initially
+  w.resize(120, 30);
+  assert.equal(r.takeWinch(), true);  // one resize -> one winch
+  assert.equal(r.takeWinch(), false); // ...consumed
+  w.resize(120, 31);
+  w.resize(120, 32); // a burst coalesces to a single pending flag
+  assert.equal(r.takeWinch(), true);
+  assert.equal(r.takeWinch(), false);
+  assert.deepEqual(r.winsize(), { rows: 32, cols: 120 }); // ...at the newest size
+});
+
+test('seedWinsize() sets geometry WITHOUT raising winch (startup path)', () => {
+  const { w, r } = pair();
+  w.seedWinsize(90, 25);
+  assert.deepEqual(r.winsize(), { rows: 25, cols: 90 });
+  assert.equal(r.takeWinch(), false); // no signal at seed time
+});
+
+test('resize() bumps seq so a parked poll wakes', () => {
+  const { sab, w, r } = pair();
+  const ctrl = new Int32Array(sab, 0, 7);
+  const seq0 = Atomics.load(ctrl, 3);            // IDX_SEQ
+  w.resize(100, 40);
+  assert.ok(Atomics.load(ctrl, 3) > seq0, 'seq advanced (would wake Atomics.wait)');
+  // pollReadable still reports no DATA — a winch is not stdin input
+  assert.equal(r.readable, false);
+});
+
+test('toInput() exposes winsize()/takeWinch() for the shim', () => {
+  const { w, r } = pair();
+  const input = r.toInput();
+  w.resize(77, 21);
+  assert.deepEqual(input.winsize(), { rows: 21, cols: 77 });
+  assert.equal(input.takeWinch(), true);
+  assert.equal(input.takeWinch(), false);
+});

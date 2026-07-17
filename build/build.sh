@@ -204,8 +204,17 @@ fi
 # --wrap exit: raw exit() inside an in-process applet must return to the
 #   shell instead of killing the instance — wasistubs' __wrap_exit routes it
 #   through busybox's die_func (see the applet notes in ARCHITECTURE.md).
+# --wrap ioctl: TIOCGWINSZ (stty size / get_terminal_width_height) reads the
+#   live terminal geometry from the host winsize slot; wasistubs' __wrap_ioctl
+#   answers it and returns ENOTTY for any other request (busybox needs no other
+#   ioctl once size works — modes go through tcgetattr/tcsetattr). --wrap avoids
+#   colliding with wasi-libc's own ioctl symbol.
+# --wrap poll: the chokepoint for a synthesized SIGWINCH. tuish's `read -t`
+#   waits in poll(); __wrap_poll runs winch_dispatch() after every poll so a
+#   host-posted resize fires ash's captured WINCH handler. Covers ppoll.c too
+#   (its poll() call is wrapped as well).
 OUT="$work/busybox.wasm"
-$WASM_LD --import-undefined --wrap fcntl --wrap exit \
+$WASM_LD --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
   "$CRT" "$BB/libbb/appletlib.o" "$BB/applets/applets.o" \
   $(find "$BB" -name built-in.o | sort) $(find "$BB" -name lib.a | sort) \
   "$work/wasistubs.o" "$work/ppoll.o" "$work/rt.o" \

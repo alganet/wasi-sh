@@ -1,5 +1,20 @@
 #include <errno.h>
-int sigaction(int s, const struct sigaction *a, struct sigaction *o){ (void)s;(void)a;(void)o; return 0; }
+#ifndef SIGWINCH
+#define SIGWINCH 28
+#endif
+/* ash installs its signal catcher through sigaction(). We deliver no real
+ * signals, but for SIGWINCH we CAPTURE the handler ash registers (its own
+ * static signal_handler) so the poll wrapper below can invoke it when the host
+ * posts a resize — a synthesized SIGWINCH with no signal layer. SIG_DFL(0) and
+ * SIG_IGN(1) mean "no live trap"; store only a real function. */
+static void (*winch_handler)(int);
+int sigaction(int s, const struct sigaction *a, struct sigaction *o){
+  if (s == SIGWINCH && a) {
+    void (*h)(int) = a->sa_handler;
+    winch_handler = (h == (void(*)(int))0 || h == (void(*)(int))1) ? 0 : h;
+  }
+  (void)o; return 0;
+}
 /* Signal-mask stubs must NEVER write through their pointers: wasi-libc's
  * sigset_t is `typedef unsigned char` (a 1-byte placeholder), so callers
  * allocate 1 byte for a mask. A 4-byte store here smashes whatever the
@@ -54,6 +69,11 @@ int tcgetpgrp(int fd){ (void)fd; return 0; }
 #include <errno.h>
 int cfsetispeed(void*t,unsigned s){ (void)t;(void)s; return 0; }
 int cfsetospeed(void*t,unsigned s){ (void)t;(void)s; return 0; }
+/* stty (CONFIG_STTY) reads line speed; no tty here, so report B0. Without these
+ * the applet leaves cfget*speed as unresolved env imports and the module can't
+ * instantiate. */
+unsigned cfgetispeed(const void*t){ (void)t; return 0; }
+unsigned cfgetospeed(const void*t){ (void)t; return 0; }
 int clock_settime(int c,const void*t){ (void)c;(void)t; return 0; }
 void *getmntent(void*f){ (void)f; return 0; }
 void *setmntent(const char*f,const char*m){ (void)f;(void)m; return 0; }
@@ -86,6 +106,63 @@ int __wrap_fcntl(int fd,int cmd,...){
   if(cmd==1/*F_GETFD*/||cmd==3/*F_GETFL*/) return 0;
   if(cmd==2/*F_SETFD*/||cmd==4/*F_SETFL*/) return 0;
   return __real_fcntl(fd,cmd,(int)arg);
+}
+
+/* Terminal geometry for a RUNNING guest. wasm has no signals and there is no
+ * PTY, so size travels through the host winsize slot (see ring.mjs/shim.mjs):
+ * __host_winsize() fills the live rows/cols. `stty size` and busybox's
+ * get_terminal_width_height() call ioctl(TIOCGWINSZ); --wrap ioctl routes them
+ * here. Any other request is ENOTTY — busybox needs no other ioctl once size
+ * works (line modes go through the tcgetattr/tcsetattr stubs above), and not
+ * touching __real_ioctl means we don't depend on wasi-libc providing one. */
+extern void __host_winsize(int *rows, int *cols);
+int __wrap_ioctl(int fd, unsigned long req, ...){
+  (void)fd;
+  if (req == TIOCGWINSZ){
+    va_list ap; va_start(ap, req); struct winsize *ws = va_arg(ap, struct winsize *); va_end(ap);
+    int r = 0, c = 0; __host_winsize(&r, &c);
+    if (r <= 0 || c <= 0){ errno = ENOTTY; return -1; }  /* unknown: caller falls back to $LINES/$COLUMNS */
+    ws->ws_row = (unsigned short)r; ws->ws_col = (unsigned short)c;
+    ws->ws_xpixel = ws->ws_ypixel = 0;
+    return 0;
+  }
+  errno = ENOTTY; return -1;
+}
+
+/* Synthesized SIGWINCH. The host raises a pending-winch flag on resize (and
+ * wakes the parked poll_oneoff by bumping the ring seq). __host_winch() reports
+ * and clears that flag; when set we call ash's captured handler, which just
+ * records pending_sig=SIGWINCH — exactly what a real signal would do. ash then
+ * runs the trapped WINCH action at its next dotrap checkpoint (between the
+ * commands of tuish's event loop), and `stty size` returns the fresh dims.
+ *
+ * The chokepoint is poll(): tuish's `read -t` waits there (busybox safe_poll),
+ * and --wrap poll routes every poll — including the one inside our ppoll.c — to
+ * this wrapper, so the dispatch fires no matter which timed-wait path is used.
+ * ash's handler only sets flags (no longjmp for non-INT signals), so invoking
+ * it synchronously at poll return is safe. */
+#include <poll.h>
+extern int __host_winch(void);
+/* ash's signal_handler (what we captured) sets THREE things: gotsig[]/pending_sig
+ * — which make dotrap run the WINCH trap, exactly what we want — and libbb's
+ * bb_got_signal, a flag read by check_got_signal_and_poll (the `read -t` wait).
+ * bb_got_signal is only ever cleared on the interactive line-editing path, never
+ * for the `read` builtin, so once set it makes every subsequent `read -t` return
+ * EINTR without polling — an infinite busy-spin. Since no real signals exist
+ * here, bb_got_signal is ours to manage: clear it right after delivery, keeping
+ * gotsig/pending_sig so the trap still fires at ash's next dotrap. */
+extern signed char bb_got_signal;   /* libbb `smallint` = signed char */
+static void winch_dispatch(void){
+  if (__host_winch() && winch_handler) {
+    winch_handler(SIGWINCH);
+    bb_got_signal = 0;
+  }
+}
+extern int __real_poll(struct pollfd *f, nfds_t n, int timeout);
+int __wrap_poll(struct pollfd *f, nfds_t n, int timeout){
+  int r = __real_poll(f, n, timeout);
+  winch_dispatch();
+  return r;
 }
 
 /* ---- in-process applet support (see ARCHITECTURE.md) ---- */

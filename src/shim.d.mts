@@ -16,6 +16,10 @@ export interface ShimInput {
   wait?(ms: number): void;
   /** True when no more data will ever arrive (stdin EOF). */
   closed?(): boolean;
+  /** Current terminal geometry (0 = unknown); backs ioctl(TIOCGWINSZ). */
+  winsize?(): { rows: number; cols: number };
+  /** Consume a pending resize; backs the guest's synthesized SIGWINCH. */
+  takeWinch?(): boolean;
 }
 
 export type Files = Record<string, string | Uint8Array>;

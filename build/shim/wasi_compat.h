@@ -25,6 +25,16 @@
 #define TIOCEXCL   0x540C
 #endif
 
+/* busybox reads TIOCGWINSZ into this (stty size, get_terminal_width_height).
+ * Some wasi-libc versions declare struct winsize in <bits/alltypes.h> (guarded
+ * by __DEFINED_struct_winsize) and some don't. Reuse musl's guard so we define
+ * it only when the libc doesn't — and, since this header is force-included
+ * first, claiming the guard also stops a later alltypes.h from redefining it. */
+#ifndef __DEFINED_struct_winsize
+struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
+#define __DEFINED_struct_winsize
+#endif
+
 #ifndef __wasi_sigaction_shim
 #define __wasi_sigaction_shim
 typedef struct { int si_signo, si_errno, si_code, si_pid, si_uid, si_status; void *si_addr; } siginfo_t;

@@ -507,3 +507,30 @@ test('views refresh after memory.grow', () => {
   t.p1.args_sizes_get(0x10, 0x14);
   assert.equal(t.view().getUint32(0x10, true), 1);
 });
+
+// ---- terminal geometry host imports (winsize + synthesized winch) ----------
+
+test('__host_winsize writes the input winsize as two u32s', () => {
+  const t = makeShim({ input: { winsize: () => ({ rows: 40, cols: 100 }), takeWinch: () => false } });
+  t.env.__host_winsize(0x100, 0x104);          // rowsPtr, colsPtr
+  assert.equal(t.view().getUint32(0x100, true), 40);
+  assert.equal(t.view().getUint32(0x104, true), 100);
+});
+
+test('__host_winsize reports 0/0 when input has no winsize (run() mode)', () => {
+  const t = makeShim({ input: { pollReadable: () => false, read: () => new Uint8Array(0) } });
+  t.view().setUint32(0x100, 0xdead, true);
+  t.view().setUint32(0x104, 0xbeef, true);
+  t.env.__host_winsize(0x100, 0x104);
+  assert.equal(t.view().getUint32(0x100, true), 0);   // ioctl(TIOCGWINSZ) then returns ENOTTY
+  assert.equal(t.view().getUint32(0x104, true), 0);
+});
+
+test('__host_winch returns 1 once per pending resize, then 0', () => {
+  let pending = false;
+  const t = makeShim({ input: { winsize: () => ({ rows: 0, cols: 0 }), takeWinch: () => { const p = pending; pending = false; return p; } } });
+  assert.equal(t.env.__host_winch(), 0);
+  pending = true;
+  assert.equal(t.env.__host_winch(), 1);   // consumes it
+  assert.equal(t.env.__host_winch(), 0);
+});
