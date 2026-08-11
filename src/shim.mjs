@@ -15,8 +15,17 @@
 //   wait?(ms)                    sleep for a poll timeout
 //   closed?()        -> bool     no more data will ever arrive (stdin EOF)
 //
+// Host builtins are pluggable the same way (`builtins`), extending the shell's
+// command namespace with JS-backed names — in-process, argv in, status out,
+// exactly like a busybox applet and just as much NOT a process:
+//   lookup(name) -> bool         is this a host builtin? (must not run it —
+//                                find_command, `type` and `command -v` ask)
+//   run(ctx)     -> status       execute it, SYNCHRONOUSLY
+// ctx is { argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs }.
+// Absent, the shell behaves byte-for-byte as it did before.
+//
 // Usage:
-//   const shim = new WasiShim({ args, env, files, stdout, stderr, input });
+//   const shim = new WasiShim({ args, env, files, stdout, stderr, input, builtins });
 //   const { instance } = await WebAssembly.instantiate(module, shim.imports());
 //   shim.bindMemory(instance.exports.memory);
 //   try { instance.exports._start(); } catch (e) { if (!(e instanceof WasiExit)) throw e; }
@@ -25,17 +34,19 @@ export class WasiExit extends Error { constructor(code){ super('exit '+code); th
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
+const EMPTY = new Uint8Array(0);
 
 const E = { SUCCESS:0, BADF:8, EXIST:20, INVAL:28, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, NOTCAPABLE:76, AGAIN:6 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, stdout, stderr, input }) {
+  constructor({ args=['busybox'], env={}, files={}, stdout, stderr, input, builtins }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
     this.stderr = stderr || this.stdout;
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
+    this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
     this.mem = null; this.view = null; this.u8 = null;
     // Build the FS: map of absolute path -> {type, data?, children?}
     this.fs = buildFs(files);
@@ -96,47 +107,16 @@ export class WasiShim {
         else w.fds.set(nfd,{type:'file',path,node,pos:{v:0},append:(fdflags&1)!==0});
         w.dv().setUint32(out,nfd,true); return 0;
       },
+      // fd_read/fd_write are the iovec scatter/gather around readFd/writeFd —
+      // the per-fd-type routing lives there so host builtins can reach it too
+      // (see the __host_builtin_run hook and the readFd/writeFd comments).
       fd_read:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF;
-        const bufs=w.iovecs(iovs,n); let total=0;
-        if(f.type==='stdin'){
-          let want=bufs.reduce((a,b)=>a+b.length,0);
-          let data=w.input?w.input.read(want):new Uint8Array(0);
-          if(data.length===0){
-            // No data. A BLOCKING read must wait for input — else `while read`
-            // sees failure and the app exits. A NON-blocking read gets EAGAIN
-            // so `read -t` timeout logic runs. A CLOSED stdin reads 0 bytes
-            // with SUCCESS — true EOF, so `while read` loops terminate.
-            if(!f.nonblock && w.input && w.input.readBlocking){ data=w.input.readBlocking(want); }
-            if(data.length===0){
-              w.dv().setUint32(out,0,true);
-              return (w.input && w.input.closed && w.input.closed()) ? 0 : E.AGAIN;
-            }
-          }
-          let o=0; for(const b of bufs){ const take=Math.min(b.length,data.length-o); b.set(data.subarray(o,o+take)); o+=take; total+=take; if(o>=data.length)break; }
-        }
-        else if(f.node&&f.node.type==='char'){ total=0; /* /dev/null EOF */ }
-        else if(f.type==='pipe'){ const pi=w.pipes[f.pipe];
-          for(const b of bufs){ let got=0;
-            while(pi&&got<b.length&&pi.chunks.length){ const c=pi.chunks[0]; const take=Math.min(b.length-got,c.length-pi.off);
-              b.set(c.subarray(pi.off,pi.off+take),got); pi.off+=take; got+=take;
-              if(pi.off===c.length){ pi.chunks.shift(); pi.off=0; } }
-            total+=got; if(!pi||got<b.length)break; } }
-        else if(f.node&&f.node.data){ const p=w.pos(f); const d=f.node.data; for(const b of bufs){ const take=Math.min(b.length,d.length-p.v); if(take<=0)break; b.set(d.subarray(p.v,p.v+take)); p.v+=take; total+=take; } }
-        w.dv().setUint32(out,total,true); return 0; },
-      fd_write:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const bufs=w.iovecs(iovs,n); let total=0;
-        for(const b of bufs){ total+=b.length;
-          if(f.type==='stdout') w.stdout(b.slice());
-          else if(f.type==='stderr') w.stderr(b.slice());
-          else if(f.node&&f.node.type==='char'){ /* /dev/null: discard */ }
-          else if(f.type==='pipe'){ const pi=w.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
-          else if(f.node&&f.node.type==='reg'){ const node=f.node; const p=w.pos(f);
-            // Copy-on-write: never mutate a caller-mounted buffer.
-            if(!node.mutable){ node.data=node.data?node.data.slice():new Uint8Array(0); node.mutable=true; }
-            const start=f.append?node.data.length:p.v; const end=start+b.length;
-            if(end>node.data.length){ const nd=new Uint8Array(end); nd.set(node.data); node.data=nd; }
-            node.data.set(b,start); p.v=end;
-          }
-        }
+        const bufs=w.iovecs(iovs,n);
+        const { data, errno } = w.readFd(fd, bufs.reduce((a,b)=>a+b.length,0), f.nonblock);
+        let o=0; for(const b of bufs){ const take=Math.min(b.length,data.length-o); b.set(data.subarray(o,o+take)); o+=take; if(o>=data.length)break; }
+        w.dv().setUint32(out,o,true); return errno; },
+      fd_write:(fd,iovs,n,out)=>{ if(!w.fds.get(fd)) return E.BADF; const bufs=w.iovecs(iovs,n); let total=0;
+        for(const b of bufs){ total+=b.length; w.writeFd(fd,b); }
         w.dv().setUint32(out,total,true); return 0; },
       fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const p=w.pos(f); const sz=f.node&&f.node.data?f.node.data.length:0; off=Number(off); p.v=whence===0?off:whence===1?p.v+off:sz+off; w.dv().setBigUint64(out,BigInt(p.v),true); return 0; },
       fd_readdir:(fd,buf,len,cookie,out)=>{ const f=w.fds.get(fd); if(!f||f.type!=='dir') return E.BADF; const node=w.lookup(f.path); const ents=node?Object.keys(node.children||{}):[]; let p=buf; let idx=Number(cookie); let written=0;
@@ -146,16 +126,7 @@ export class WasiShim {
       // ---- writable-FS ops (rm/mkdir/rmdir/mv and friends) ----
       path_unlink_file:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),false),
       path_remove_directory:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),true),
-      path_create_directory:(fd,pathp,plen)=>{
-        const path=w.resolve(fd,w.str(pathp,plen));
-        if(w.lookup(path)) return E.EXIST;
-        const parent=w.lookup(parentOf(path));
-        if(!parent||parent.type!=='dir') return E.NOENT;
-        w.fs[path]={type:'dir',children:{}};
-        if(!parent.children) parent.children={};
-        parent.children[path.slice(path.lastIndexOf('/')+1)]={type:'dir'};
-        return 0;
-      },
+      path_create_directory:(fd,pathp,plen)=>w.makeDir(w.resolve(fd,w.str(pathp,plen))),
       path_rename:(fd,pathp,plen,nfd,npathp,nplen)=>{
         const from=w.resolve(fd,w.str(pathp,plen)), to=w.resolve(nfd,w.str(npathp,nplen));
         const node=w.lookup(from); if(!node) return E.NOENT;
@@ -233,6 +204,72 @@ export class WasiShim {
         // Both degrade to "no info" when input has no winsize (run() mode).
         __host_winsize:(rowsPtr,colsPtr)=>{ const ws=(w.input&&w.input.winsize)?w.input.winsize():{rows:0,cols:0}; w.dv().setUint32(rowsPtr,ws.rows>>>0,true); w.dv().setUint32(colsPtr,ws.cols>>>0,true); },
         __host_winch:()=> (w.input&&w.input.takeWinch&&w.input.takeWinch())?1:0,
+        // ---- host builtins: the shell's command namespace, extended in JS ----
+        // ash resolves a name against functions, builtins, then the applet
+        // table; these two hooks sit where the PATH search (which can never
+        // succeed here — the FS has no permission bits) used to lead to "not
+        // found". See build/ash-hostbuiltin.patch and build/shim/wasistubs.c.
+        //   lookup -> a PREDICATE: find_command, `type` and `command -v` all
+        //             need an answer WITHOUT running anything
+        //   run    -> execute; the return value becomes $?
+        // Absent `builtins`, both answer "no such command" and the shell is
+        // byte-for-byte what it was — the same "degrade to no info" contract
+        // __host_winsize follows above.
+        __host_builtin_lookup:(namePtr,len)=>{
+          if(!w.builtins) return 0;
+          // A throwing lookup() must not cost the session a `type foo`.
+          try { return w.builtins.lookup(len>0?w.str(namePtr,len):w.cstr(namePtr))?1:0; } catch { return 0; }
+        },
+        // The handler runs ON THE GUEST'S OWN STACK, mid-import. argv/env/cwd
+        // are copied out of linear memory first; stdio goes through the fd
+        // TABLE, so a pipeline stage, a redirect and a $(...) capture all land
+        // where the shell put them.
+        __host_builtin_run:(cwdPtr,argc,argvPtr,envpPtr)=>{
+          if(!w.builtins) return -1;
+          const argv=w.cstrv(argvPtr,argc>0?argc:4096);
+          const name=argv[0]||'';
+          const cwd=w.cstr(cwdPtr)||'/';
+          const ctx={
+            argv, cwd,
+            // The guest's LIVE environ (exports plus this command's VAR=x
+            // prefixes), not the spawn-time env — this.env is frozen at
+            // construction, which is exactly why the hook passes envp at all.
+            env:envpPtr?envObj(w.cstrv(envpPtr)):envObj(w.env),
+            // Blocking, regardless of any O_NONBLOCK `read -t` left on fd 0.
+            // Empty means EOF. The slice matters: readFd may hand back a view
+            // into a caller-mounted buffer.
+            stdin:(max=65536)=>w.readFd(0,max,false).data.slice(),
+            stdout:(b)=>{ w.writeFd(1,bytesOf(b)); },
+            stderr:(b)=>{ w.writeFd(2,bytesOf(b)); },
+            fs:w.hostFs(cwd),
+          };
+          let status;
+          try { status=w.builtins.run(ctx); }
+          catch(e){
+            // A JS exception thrown out of a wasm import unwinds the ENTIRE
+            // guest stack: the instance is dead and no guest setjmp can catch
+            // it. That is the same hazard --wrap exit/die_func exists for with
+            // applets, and it must be contained the same way — a handler bug
+            // costs one command, not the shell. A nested WasiExit is caught
+            // HERE too: letting it escape would make an inner module's exit(1)
+            // silently become the outer shell's exit code (worker.mjs treats a
+            // WasiExit as a clean shutdown).
+            if(e instanceof WasiExit) return e.code&0xff;
+            w.writeFd(2,strBytes(`${name}: ${(e&&e.message)||e}\n`));
+            return 1;
+          }
+          if(status&&typeof status.then==='function'){
+            // There is nothing to await into — the guest is a synchronous
+            // stack frame below us, and a thenable coerces to i32 0, i.e.
+            // silent success while the real work lands later against whatever
+            // fd 1 has become by then. Fail loudly instead.
+            status.catch(()=>{});   // nobody owns this rejection
+            w.writeFd(2,strBytes(`${name}: handler returned a Promise; host builtins must be synchronous (do async setup once in serve({ async builtins() {...} }))\n`));
+            return 1;
+          }
+          const n=Number(status);
+          return Number.isFinite(n)?(n&0xff):0;   // wait(2) truncation: -1 -> 255, 256 -> 0
+        },
       },
     };
   }
@@ -249,6 +286,75 @@ export class WasiShim {
     pnode.children[path.slice(slash+1)]={type:'reg'};
     return node;
   }
+  // Read up to `max` bytes from one fd, routing on the fd TABLE TYPE — fd_read's
+  // whole body minus the iovec scatter. Returns { data, errno }:
+  //   errno 0, data non-empty -> bytes
+  //   errno 0, data empty     -> true EOF
+  //   errno E.AGAIN           -> nothing yet; the caller must retry
+  // `nonblock` is passed in rather than read off the fd so a host builtin can
+  // take the blocking path even while `read -t` has fd 0 flagged O_NONBLOCK.
+  // `data` may be a view into an FS node or into whatever input.read() returned
+  // — copy it before retaining (ctx.stdin does).
+  readFd(fd,max,nonblock){
+    const f=this.fds.get(fd);
+    if(!f) return { data:EMPTY, errno:E.BADF };
+    if(f.type==='stdin'){
+      let data=this.input?this.input.read(max):EMPTY;
+      if(data.length===0){
+        // No data. A BLOCKING read must wait for input — else `while read`
+        // sees failure and the app exits. A NON-blocking read gets EAGAIN
+        // so `read -t` timeout logic runs. A CLOSED stdin reads 0 bytes
+        // with SUCCESS — true EOF, so `while read` loops terminate.
+        if(!nonblock && this.input && this.input.readBlocking){ data=this.input.readBlocking(max); }
+        if(data.length===0){
+          return { data:EMPTY, errno:(this.input && this.input.closed && this.input.closed()) ? 0 : E.AGAIN };
+        }
+      }
+      return { data, errno:0 };
+    }
+    if(f.node&&f.node.type==='char') return { data:EMPTY, errno:0 };   // /dev/null EOF
+    if(f.type==='pipe'){
+      const pi=this.pipes[f.pipe];
+      if(!pi) return { data:EMPTY, errno:0 };
+      let avail=-pi.off; for(const c of pi.chunks) avail+=c.length;
+      const outb=new Uint8Array(Math.max(0,Math.min(max,avail))); let got=0;
+      while(got<outb.length&&pi.chunks.length){ const c=pi.chunks[0]; const take=Math.min(outb.length-got,c.length-pi.off);
+        outb.set(c.subarray(pi.off,pi.off+take),got); pi.off+=take; got+=take;
+        if(pi.off===c.length){ pi.chunks.shift(); pi.off=0; } }
+      return { data:outb, errno:0 };
+    }
+    if(f.node&&f.node.data){
+      const p=this.pos(f); const d=f.node.data; const take=Math.min(max,d.length-p.v);
+      if(take<=0) return { data:EMPTY, errno:0 };
+      const data=d.subarray(p.v,p.v+take); p.v+=take;
+      return { data, errno:0 };
+    }
+    return { data:EMPTY, errno:0 };
+  }
+  // Write one buffer to one fd, routing on the fd TABLE TYPE — fd_write's whole
+  // body minus the iovec gather. Host builtins go through it so their fd 1/fd 2
+  // land wherever the shell last dup2'd them: a pipeline stage, a `> file`, a
+  // $(...) capture. Calling this.stdout() instead would print `cmd | grep x`
+  // straight to the terminal and hand grep an empty pipe — the same
+  // fd-number-vs-fd-type mistake poll_oneoff already made once (see its
+  // comment). Bytes are always COPIED: worker.mjs posts stdout with a transfer
+  // list, which would detach a handler's reused scratch buffer.
+  writeFd(fd,b){
+    const f=this.fds.get(fd);
+    if(!f) return E.BADF;
+    if(f.type==='stdout') this.stdout(b.slice());
+    else if(f.type==='stderr') this.stderr(b.slice());
+    else if(f.node&&f.node.type==='char'){ /* /dev/null: discard */ }
+    else if(f.type==='pipe'){ const pi=this.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
+    else if(f.node&&f.node.type==='reg'){ const node=f.node; const p=this.pos(f);
+      // Copy-on-write: never mutate a caller-mounted buffer.
+      if(!node.mutable){ node.data=node.data?node.data.slice():new Uint8Array(0); node.mutable=true; }
+      const start=f.append?node.data.length:p.v; const end=start+b.length;
+      if(end>node.data.length){ const nd=new Uint8Array(end); nd.set(node.data); node.data=nd; }
+      node.data.set(b,start); p.v=end;
+    }
+    return 0;
+  }
   // The seek offset of an fd, as a SHARED CELL. POSIX gives dup/dup2 one file
   // offset per open file description, not per fd, and __host_dup/__host_dup2
   // copy the descriptor with {...src} — so a plain `off` number gave every dup
@@ -259,6 +365,38 @@ export class WasiShim {
   // Lazy for non-file fds: pipes keep their offset on the pipe object and
   // stdio has none, but fd_seek must still answer for them.
   pos(f){ return f.pos || (f.pos={v:0}); }
+  // mkdir, shared by path_create_directory and a host builtin's ctx.fs.mkdir.
+  makeDir(path){
+    if(this.lookup(path)) return E.EXIST;
+    const parent=this.lookup(parentOf(path));
+    if(!parent||parent.type!=='dir') return E.NOENT;
+    this.fs[path]={type:'dir',children:{}};
+    if(!parent.children) parent.children={};
+    parent.children[path.slice(path.lastIndexOf('/')+1)]={type:'dir'};
+    return 0;
+  }
+  // The in-memory FS as a small stable surface for host builtins, bound to the
+  // command's cwd. Deliberately NOT `this.fs` itself: the flat path->node map,
+  // the `mutable` copy-on-write flag and the {type} child stubs are internals,
+  // and handing them out would freeze them forever. read() copies for the same
+  // reason writeFd does copy-on-write — a builtin must not be able to scribble
+  // a caller-mounted buffer through the back door.
+  hostFs(cwd){
+    const w=this;
+    const abs=(p)=>{ const s=String(p); return normalize(s.startsWith('/')?s:`${cwd.replace(/\/$/,'')}/${s}`); };
+    return {
+      resolve:abs,
+      read(p){ const n=w.lookup(abs(p)); return n&&n.type==='reg'&&n.data?n.data.slice():null; },
+      write(p,data){ const path=abs(p); const n=w.lookup(path)||w.createFile(path);
+        if(!n||n.type!=='reg') return false;
+        n.data=typeof data==='string'?strBytes(data):new Uint8Array(data); n.mutable=true; return true; },
+      exists(p){ return !!w.lookup(abs(p)); },
+      stat(p){ const n=w.lookup(abs(p)); return n?{ type:n.type==='dir'?'dir':'file', size:n.data?n.data.length:0 }:null; },
+      list(p){ const n=w.lookup(abs(p)); return n&&n.type==='dir'?Object.keys(n.children||{}):null; },
+      mkdir(p){ return w.makeDir(abs(p))===0; },
+      remove(p){ const path=abs(p); const n=w.lookup(path); return n?w.removeNode(path,n.type==='dir')===0:false; },
+    };
+  }
   // Drop a pipe's buffers once no fd references it (close/dup2 both funnel here).
   gcPipe(idx){
     for(const f of this.fds.values()) if(f.type==='pipe'&&f.pipe===idx) return;
@@ -281,6 +419,15 @@ export class WasiShim {
     return 0;
   }
   str(p,len){ return DEC.decode(this.bytes().subarray(p,p+len)); }
+  // NUL-terminated C string. Everything WASI hands us is (ptr,len); the host
+  // builtin hooks are the first imports taking a bare char*, so there is no
+  // length to pair with the pointer. The cap is not decorative: a bad pointer
+  // would otherwise scan the whole linear memory and then spin forever past
+  // the end comparing `undefined !== 0`.
+  cstr(p,cap=4096){ if(!p) return ''; const u=this.bytes(); const lim=Math.min(u.length,p+cap); let e=p; while(e<lim&&u[e]!==0) e++; return DEC.decode(u.subarray(p,e)); }
+  // NULL-terminated char** (argv, envp). Each element re-enters cstr, which
+  // re-fetches the byte view, so a memory.grow mid-walk cannot leave us stale.
+  cstrv(p,cap=4096){ const out=[]; if(!p) return out; for(let q=p;out.length<cap;q+=4){ const s=this.dv().getUint32(q,true); if(!s) break; out.push(this.cstr(s)); } return out; }
   iovecs(iovs,n){ const out=[]; for(let i=0;i<n;i++){ const buf=this.dv().getUint32(iovs+i*8,true); const l=this.dv().getUint32(iovs+i*8+4,true); out.push(this.bytes().subarray(buf,buf+l)); } return out; }
   resolve(fd,path){ if(path.startsWith('/')) return normalize(path); const base=(this.fds.get(fd)||{}).path||'/'; return normalize(base.replace(/\/$/,'')+'/'+path); }
   lookup(path){ return this.fs[normalize(path)]||null; }
@@ -288,6 +435,8 @@ export class WasiShim {
 }
 
 function strBytes(s){ return ENC.encode(s); }
+function bytesOf(b){ return typeof b==='string'?strBytes(b):(b||EMPTY); }
+function envObj(list){ const o={}; for(const kv of list){ const i=kv.indexOf('='); if(i>0) o[kv.slice(0,i)]=kv.slice(i+1); } return o; }
 function parentOf(p){ const s=p.lastIndexOf('/'); return s>0?p.slice(0,s):'/'; }
 function normalize(p){ const parts=p.split('/').filter(x=>x&&x!=='.'); const st=[]; for(const x of parts){ if(x==='..')st.pop(); else st.push(x); } return '/'+st.join('/'); }
 function buildFs(files){
