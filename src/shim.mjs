@@ -91,7 +91,9 @@ export class WasiShim {
         if(node.type==='reg'&&(oflags&8)){ node.data=new Uint8Array(0); node.mutable=true; }
         const nfd=w.nextFd++;
         if(node.type==='dir') w.fds.set(nfd,{type:'dir',path,node});
-        else w.fds.set(nfd,{type:'file',path,node,off:0,append:(fdflags&1)!==0});
+        // pos is a SHARED CELL, not a number: dup/dup2 copy the record with
+        // {...src}, and POSIX says duped fds share one file offset (see pos()).
+        else w.fds.set(nfd,{type:'file',path,node,pos:{v:0},append:(fdflags&1)!==0});
         w.dv().setUint32(out,nfd,true); return 0;
       },
       fd_read:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF;
@@ -119,7 +121,7 @@ export class WasiShim {
               b.set(c.subarray(pi.off,pi.off+take),got); pi.off+=take; got+=take;
               if(pi.off===c.length){ pi.chunks.shift(); pi.off=0; } }
             total+=got; if(!pi||got<b.length)break; } }
-        else if(f.node&&f.node.data){ if(f.off===undefined)f.off=0; const d=f.node.data; for(const b of bufs){ const take=Math.min(b.length,d.length-f.off); if(take<=0)break; b.set(d.subarray(f.off,f.off+take)); f.off+=take; total+=take; } }
+        else if(f.node&&f.node.data){ const p=w.pos(f); const d=f.node.data; for(const b of bufs){ const take=Math.min(b.length,d.length-p.v); if(take<=0)break; b.set(d.subarray(p.v,p.v+take)); p.v+=take; total+=take; } }
         w.dv().setUint32(out,total,true); return 0; },
       fd_write:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const bufs=w.iovecs(iovs,n); let total=0;
         for(const b of bufs){ total+=b.length;
@@ -127,16 +129,16 @@ export class WasiShim {
           else if(f.type==='stderr') w.stderr(b.slice());
           else if(f.node&&f.node.type==='char'){ /* /dev/null: discard */ }
           else if(f.type==='pipe'){ const pi=w.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
-          else if(f.node&&f.node.type==='reg'){ const node=f.node;
+          else if(f.node&&f.node.type==='reg'){ const node=f.node; const p=w.pos(f);
             // Copy-on-write: never mutate a caller-mounted buffer.
             if(!node.mutable){ node.data=node.data?node.data.slice():new Uint8Array(0); node.mutable=true; }
-            const start=f.append?node.data.length:(f.off||0); const end=start+b.length;
+            const start=f.append?node.data.length:p.v; const end=start+b.length;
             if(end>node.data.length){ const nd=new Uint8Array(end); nd.set(node.data); node.data=nd; }
-            node.data.set(b,start); f.off=end;
+            node.data.set(b,start); p.v=end;
           }
         }
         w.dv().setUint32(out,total,true); return 0; },
-      fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const sz=f.node&&f.node.data?f.node.data.length:0; off=Number(off); f.off=whence===0?off:whence===1?(f.off||0)+off:sz+off; w.dv().setBigUint64(out,BigInt(f.off||0),true); return 0; },
+      fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const p=w.pos(f); const sz=f.node&&f.node.data?f.node.data.length:0; off=Number(off); p.v=whence===0?off:whence===1?p.v+off:sz+off; w.dv().setBigUint64(out,BigInt(p.v),true); return 0; },
       fd_readdir:(fd,buf,len,cookie,out)=>{ const f=w.fds.get(fd); if(!f||f.type!=='dir') return E.BADF; const node=w.lookup(f.path); const ents=node?Object.keys(node.children||{}):[]; let p=buf; let idx=Number(cookie); let written=0;
         for(;idx<ents.length;idx++){ const name=ents[idx]; const nb=strBytes(name); const child=node.children[name]; const need=24+nb.length; if(p+need>buf+len)break;
           w.dv().setBigUint64(p,BigInt(idx+1),true); w.dv().setBigUint64(p+8,BigInt(idx+1),true); w.dv().setUint32(p+16,nb.length,true); w.dv().setUint8(p+20,child.type==='dir'?FT.DIR:FT.REG); w.bytes().set(nb,p+24); p+=need; written+=need; }
@@ -247,6 +249,16 @@ export class WasiShim {
     pnode.children[path.slice(slash+1)]={type:'reg'};
     return node;
   }
+  // The seek offset of an fd, as a SHARED CELL. POSIX gives dup/dup2 one file
+  // offset per open file description, not per fd, and __host_dup/__host_dup2
+  // copy the descriptor with {...src} — so a plain `off` number gave every dup
+  // a private offset. Two real corruptions came from that: `cmd > f 2>&1` had
+  // fd 1 and fd 2 both writing from 0 and overwriting each other, and the
+  // fork-free evalpipe's fcntl(F_DUPFD,10)/dup2 save-restore REWOUND a
+  // file-backed stdin between pipeline stages. Sharing the cell fixes both.
+  // Lazy for non-file fds: pipes keep their offset on the pipe object and
+  // stdio has none, but fd_seek must still answer for them.
+  pos(f){ return f.pos || (f.pos={v:0}); }
   // Drop a pipe's buffers once no fd references it (close/dup2 both funnel here).
   gcPipe(idx){
     for(const f of this.fds.values()) if(f.type==='pipe'&&f.pipe===idx) return;

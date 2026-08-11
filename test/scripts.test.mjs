@@ -116,6 +116,24 @@ test('reading a missing /tmp path is an error, not silent EOF', async () => {
   assert.match(r.stderr + r.stdout, /can't open|rc=[1-9]/);
 });
 
+// Regression: dup'd fds MUST share one seek offset (POSIX: one offset per open
+// file description). __host_dup/__host_dup2 copy the descriptor with {...src},
+// so a plain `off` number gave each dup a private offset — fd 1 and fd 2 both
+// started at 0 under `> f 2>&1` and wrote over each other's bytes.
+test("`> f 2>&1`: stdout and stderr share one offset, no overwrite", async () => {
+  const r = await sh('{ echo OUTOUTOUT; ls /nope; echo TAIL; } > /tmp/f 2>&1; cat /tmp/f');
+  assert.equal(r.stdout, 'OUTOUTOUT\nls: /nope: No such file or directory\nTAIL\n');
+});
+
+// Same root cause, other direction: the fork-free evalpipe saves fd 0 with
+// fcntl(F_DUPFD,10) and restores it with dup2 around every stage. With private
+// offsets the restore REWOUND a file-backed stdin, so bytes a pipeline stage
+// had already consumed were served again to the next reader.
+test('a pipeline stage does not rewind a file-backed stdin', async () => {
+  const r = await sh('printf "L1\\nL2\\nL3\\n" > /in.txt; { read a; echo "a=$a"; cat | cat; read b; echo "b=[$b]"; } < /in.txt');
+  assert.equal(r.stdout, 'a=L1\nL2\nL3\nb=[]\n', 'cat consumed L2/L3; the restore must not rewind');
+});
+
 // ─── in-process applets (busybox tools as builtins) ──────────────────────────
 
 test('applets resolve before PATH; unknown commands still fail', async () => {
