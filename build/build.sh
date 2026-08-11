@@ -4,7 +4,7 @@
 #
 #   build/build.sh [--plain] [--toolchain zig|ziglang|wasi-sdk] [--keep]
 #
-#   --plain      skip ash-forkfree.patch (fork stays ENOSYS and every $( )
+#   --plain      skip ash-forkfree.patch only (fork stays ENOSYS and every $( )
 #                fails; you almost never want this)
 #   --toolchain  zig      = a `zig` binary on PATH        (verified recipe)
 #                ziglang  = `python3 -m ziglang` (pip install ziglang)
@@ -24,8 +24,9 @@
 # - busybox kbuild folds each dir with `ld -r`; that maps onto
 #   `wasm-ld --relocatable` (the zld wrapper).
 # - The final link is done BY HAND with raw wasm-ld:
-#     --import-undefined  leaves the env.__host_* fd hooks as wasm imports
-#                         (implemented by the JS shim);
+#     --import-undefined  leaves the env.__host_* hooks as wasm imports
+#                         (implemented by the JS shim): the fd/winsize hooks
+#                         plus __host_builtin_lookup/__host_builtin_run;
 #     --wrap fcntl        routes ash's fcntl() through wasistubs.c's
 #                         __wrap_fcntl so F_DUPFD reaches __host_dup —
 #                         without it busybox cannot relocate the script fd
@@ -102,6 +103,14 @@ perl -0777 -i -pe 's/^#\s*if \(S_IRWXU.*?== 07777\n#\s*undef mode_t\n#\s*define 
 if [ "$PLAIN" = no ]; then
 	patch -p1 -d "$BB" < "$here/ash-forkfree.patch"
 fi
+
+# Host builtins: let the embedder register JS-backed command names (see
+# build/shim/wasistubs.c's host_builtin_* wrappers and src/shim.mjs). Applied
+# UNCONDITIONALLY — it needs none of the fork-free machinery, and it also fixes
+# a crash that exists either way: a slashed command name (`/bin/php`, `./x.sh`)
+# reaches vforkexec(), vfork() is ENOSYS, and ash aborts the whole script with
+# "can't fork" and status 2 instead of reporting 127.
+patch -p1 -d "$BB" < "$here/ash-hostbuiltin.patch"
 
 # --- configure (ash-only + LFS + read-frac + math-base) ------------------------
 cp "$here/busybox.config" "$BB/.config"
@@ -225,8 +234,11 @@ echo "linked: $OUT ($(wc -c < "$OUT") bytes)"
 # --- smoke test: refuse to install a broken binary ------------------------------
 node --input-type=module -e "
 import { runScript } from '$pkg/src/node.mjs';
-const r = await runScript('echo ok; x=\$(printf hi); echo \$x; echo \$((10#09)); seq 3 | grep -v 2 | tail -n 1', { wasm: '$OUT' });
-if (r.stdout !== 'ok\nhi\n9\n3\n' || r.exitCode !== 0) {
+// Line 5 pins the host-builtin patch's two invariants WITHOUT registering any
+// builtin: an unknown name is still a plain 127, and a SLASHED unknown name is
+// too (before the patch it died with 'can't fork' and never reached the echo).
+const r = await runScript('echo ok; x=\$(printf hi); echo \$x; echo \$((10#09)); seq 3 | grep -v 2 | tail -n 1; nosuch 2>/dev/null; echo n=\$?; /bin/nosuch 2>/dev/null; echo s=\$?', { wasm: '$OUT' });
+if (r.stdout !== 'ok\nhi\n9\n3\nn=127\ns=127\n' || r.exitCode !== 0) {
   console.error('SMOKE TEST FAILED:', JSON.stringify(r));
   process.exit(1);
 }

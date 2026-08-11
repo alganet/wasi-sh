@@ -220,3 +220,69 @@ int sync2(void){ return 0; }
 int sched_getaffinity(int p,unsigned long s,void*m){ (void)p;(void)s;(void)m; errno=ENOSYS; return -1; }
 void *popen(const char*c,const char*m){ (void)c;(void)m; errno=ENOSYS; return 0; }
 int pclose(void*f){ (void)f; return -1; }
+
+/* ---- host builtins (see ARCHITECTURE.md, build/ash-hostbuiltin.patch) ----
+ * The embedder registers command names in JS; the patched find_command()
+ * resolves them to CMDHOST and evalcommand() dispatches here. Two plain
+ * externs, per the usual mechanism: --import-undefined turns any unresolved
+ * __host_* symbol into an env.* wasm import that the JS shim supplies.
+ *
+ * Every parameter and both returns are i32 (pointers and ints on wasm32), so
+ * there is no signature mismatch to trap on (cf. mknod's dev_t above), and
+ * neither hook writes through a guest pointer, so there is no narrow-store
+ * hazard either (cf. the sigset_t and xfunc_error_retval notes above).
+ *
+ * ash.c calls the two non-underscore wrappers below, so the busybox patch
+ * stays free of any wasm-import knowledge and this file keeps sole ownership
+ * of the ABI. */
+/* getcwd is declared by hand rather than via <unistd.h>: this file defines its
+ * own getlogin_r above with a narrower signature than wasi-libc's, so pulling
+ * in unistd.h here is a conflicting-types error. <stddef.h> gets size_t and
+ * declares nothing else. */
+#include <stddef.h>
+#include <limits.h>
+extern char *getcwd(char *buf, size_t size);
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* NAME is a NUL-terminated command word, LEN its strlen so the JS side can
+ * decode a bounded slice instead of scanning linear memory for a terminator.
+ * Returns 1 if the embedder registered exactly that name.
+ * MUST stay cheap and side-effect free: ash calls it for every command word it
+ * cannot otherwise resolve, including prehash()'s speculative per-pipeline-stage
+ * lookups, and the answer is deliberately never cached (see the patch). */
+extern int __host_builtin_lookup(const char *name, int len);
+int host_builtin_lookup(const char *name)
+{
+	return __host_builtin_lookup(name, (int)strlen(name)) ? 1 : 0;
+}
+
+/* Run a registered builtin to completion, SYNCHRONOUSLY — a wasm import cannot
+ * await, so the JS handler must not either.
+ *
+ * argv/envp are the usual NULL-terminated arrays of pointers to NUL-terminated
+ * strings; the JS side walks them with a DataView (wasm32 => 4-byte
+ * little-endian pointers). argc is passed so that walk is bounded.
+ *
+ * cwd comes from getcwd(), i.e. wasi-libc's own cwd — the thing the guest's
+ * relative path_open()s actually resolve against, and unlike ash's $PWD not
+ * something a script can overwrite.
+ *
+ * fds 0/1/2 already carry this command's redirections and pipeline dup2s by the
+ * time we are called, so the handler just reads/writes them through the shim's
+ * fd table and pipes, <, > and 2>&1 work with no extra machinery.
+ *
+ * Returns 0..255, or -1 when the host could not run it at all. The JS side
+ * catches its own exceptions: one thrown out of a wasm import unwinds straight
+ * through _start() and would kill the whole shell. */
+extern int __host_builtin_run(const char *cwd, int argc, char **argv, char **envp);
+int host_builtin_run(char **argv, char **envp)
+{
+	static char cwd[PATH_MAX];   /* .bss, zero-init: no size cost in the wasm */
+	int argc = 0, r;
+	while (argv[argc]) argc++;
+	if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = '\0'; }
+	r = __host_builtin_run(cwd, argc, argv, envp);
+	return r < 0 ? -1 : (r & 0xFF);   /* WEXITSTATUS-style clamp */
+}

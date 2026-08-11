@@ -1,0 +1,158 @@
+wasi-sh: host builtins — let the embedder register JS-backed command names.
+
+Applied AFTER ash-forkfree.patch, but independent of it: this needs no
+fork-free machinery and also fixes a crash that exists either way.
+
+The embedder registers names in JS; find_command() resolves them to a new
+CMDHOST and evalcommand() dispatches them in-process, exactly like a
+busybox applet — argv in, exit status out, no address space, no wait.
+The ABI lives entirely in build/shim/wasistubs.c (host_builtin_lookup /
+host_builtin_run), so this patch carries no wasm knowledge.
+
+Hunk 6 is an independent bug fix: a command name containing a slash
+(`/bin/php`, `./x.sh`) takes find_command's slash short circuit, reaches
+vforkexec(), and dies on vfork()==ENOSYS with "can't fork" and status 2,
+ABORTING THE SCRIPT. It now reports 127 "not found" and continues.
+
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -8520,6 +8520,14 @@
+ #define CMDNORMAL       0       /* command is an executable program */
+ #define CMDFUNCTION     1       /* command is a shell function */
+ #define CMDBUILTIN      2       /* command is a shell builtin */
++/* wasi-sh: a name the JS embedder registered (build/shim/wasistubs.c). This is
++ * a distinct type and NOT a sentinel index inside CMDNORMAL: the applet
++ * dispatch in evalcommand computes applet_no = -index - 2 and indexes the
++ * applet table with it, so any negative sentinel is one reordering away from
++ * running a random applet. It also must never be missed by a switch —
++ * evalcommand's `default:` arm IS the exec path, which here means "can't fork"
++ * and a dead shell. */
++#define CMDHOST         3       /* command is a host (JS) builtin */
+ 
+ struct cmdentry {
+ 	smallint cmdtype;       /* CMDxxx */
+@@ -8770,6 +8778,16 @@
+ #endif
+ static void readcmdfile(char *name);
+ 
++/* wasi-sh host builtins. Both are defined in build/shim/wasistubs.c, which owns
++ * the env.__host_builtin_* wasm-import ABI so this file needs to know nothing
++ * about it.
++ *   host_builtin_lookup(name)     -> 1 if the embedder registered NAME
++ *   host_builtin_run(argv, envp)  -> exit status 0..255, or -1 if the host
++ *                                    could not run it (the JS side traps its
++ *                                    own exceptions and returns -1). */
++extern int host_builtin_lookup(const char *name);
++extern int host_builtin_run(char **argv, char **envp);
++
+ /*
+  * Resolve a command name.  If you change this routine, you may have to
+  * change the shellexec routine as well.
+@@ -8871,6 +8889,24 @@
+ 		}
+ 	}
+ #endif
++	/* wasi-sh: host (JS-backed) builtins. Resolved AFTER functions, the hash
++	 * table, shell builtins and the applet table — so nothing an embedder
++	 * registers can silently change what `cd`, `export` or `sed` mean — and
++	 * BEFORE the path search, which in this build can never succeed anyway
++	 * (the shim FS has no permission bits, so test_exec() always fails).
++	 *
++	 * Like the applet branch above, this NEVER writes to cmdtable. The host's
++	 * command set is JS state the embedder may change between two
++	 * invocations, so a cached answer would be wrong in both directions —
++	 * and a CMDHOST entry in the table could not be flushed, since
++	 * clearcmdentry() only frees CMDNORMAL entries and hashcd() would never
++	 * mark it for rehash. u.index is set only so no caller reads an
++	 * uninitialised union. */
++	if (host_builtin_lookup(name)) {
++		entry->cmdtype = CMDHOST;
++		entry->u.index = -1;
++		return;
++	}
+ 	/* We have to search path. */
+ 	prev = -1;              /* where to start */
+ 	if (cmdp /*TRUE: && cmdp->rehash*/) {
+@@ -9189,6 +9225,18 @@
+ 		}
+ 		break;
+ 
++	case CMDHOST:
++		/* wasi-sh: `type foo` and `command -v foo` must not lie about a
++		 * registered host builtin. Brief mode prints the bare name, like a
++		 * builtin or an applet does, so `p=$(command -v foo); "$p" args`
++		 * round-trips back through find_command to CMDHOST. */
++		if (describe_command_verbose) {
++			out1str(" is a host builtin");
++		} else {
++			out1str(command);
++		}
++		break;
++
+ 	default:
+ 		if (describe_command_verbose) {
+ 			out1str(": not found\n");
+@@ -11248,6 +11296,39 @@
+ 		flush_stdout_stderr();
+ 		goto bail;
+ 
++	case CMDHOST: {
++		/* wasi-sh: a JS-backed builtin, run in-process like an applet.
++		 * By now every redirection and every pipeline dup2 is already
++		 * installed on fds 0/1/2 (redirectsafe() above, plus the
++		 * fork-free evalpipe()'s F_DUPFD-10 save/dup2 dance), and the
++		 * handler reads and writes those fds THROUGH the shim's fd
++		 * table — so pipes, <, >, 2>&1 and $(...) all just work.
++		 *
++		 * The environment handed over is ash's exported set PLUS this
++		 * command's prefix assignments (VAR=val cmd), exactly what the
++		 * NOFORK applet branch below builds. The shim's own env copy is
++		 * frozen at instantiation and would be permanently stale.
++		 *
++		 * Flush first: ash's stdout is a buffered FILE*, the handler
++		 * writes straight to the fd, so pending bytes would otherwise
++		 * surface AFTER the command's output. (run_nofork_applet()
++		 * flushes on success but not on its die path, so this is not
++		 * merely theoretical.) Nothing to flush afterwards — the call
++		 * touches no libc stdio. */
++		char **envp;
++
++		INTOFF;
++		flush_stdout_stderr();
++		envp = listvars(VEXPORT, VUNSET, varlist.list, /*end:*/ NULL);
++		exitstatus = host_builtin_run(argv, envp);
++		if (exitstatus < 0) {    /* handler missing, or it threw JS-side */
++			exitstatus = 126;
++			ash_msg("%s: host builtin failed", argv[0]);
++		}
++		INTON;
++		break;
++	}
++
+ 	default: {
+ 
+ #if ENABLE_FEATURE_SH_STANDALONE \
+@@ -11289,6 +11370,23 @@
+ 			break;
+ 		}
+ #endif
++		/* wasi-sh: there is no exec of any kind in this build. With the
++		 * applet gate above consuming every applet, reaching here means
++		 * cmdentry.u.index is -1, i.e. find_command()'s slash short
++		 * circuit (`/bin/php`, `./x.sh`, `foo/bar`) — or a path hit,
++		 * which cannot happen since test_exec() always fails here.
++		 * Upstream hands this to vforkexec(); vfork() is ENOSYS, so
++		 * forkparent() sees pid < 0 and raises
++		 * ash_msg_and_raise_perror("can't fork") => EXERROR with status
++		 * 2, which ABORTS THE WHOLE SCRIPT — `./x.sh; echo $?` never
++		 * reaches the echo. Report it the way a path miss is reported
++		 * instead: a plain 127 "not found", and carry on.
++		 * (Delete this block if exec ever becomes possible.) */
++		ash_msg("%s: %s", argv[0], errmsg(ENOENT, E_EXEC));
++		status = 127;
++		flush_stdout_stderr();
++		goto bail;
++
+ 		/* Fork off a child process if necessary. */
+ 		/* Can we avoid forking? For example, very last command
+ 		 * in a script or a subshell does not need forking,
