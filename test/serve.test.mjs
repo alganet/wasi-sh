@@ -1,0 +1,150 @@
+// serve(): the worker-side registration path, driven headlessly.
+//
+// A dedicated Worker's globals are just `self.addEventListener` and
+// `self.postMessage`, so stubbing those drives the REAL src/worker.mjs — no
+// hand-copied twin to drift. node --test gives each file its own process, so
+// installing a global `self` here is contained.
+//
+// This is the only route by which host builtins reach a browser session, and
+// until now worker.mjs had no coverage at all.
+import { test, before } from 'node:test';
+import assert from 'node:assert/strict';
+import { compileWasm } from '../src/node.mjs';
+
+let wasm;
+before(async () => { wasm = await compileWasm(); });
+
+const HOSTB_READY = () => WebAssembly.Module.imports(wasm)
+  .some((i) => i.module === 'env' && i.name === '__host_builtin_run');
+
+// A Worker global stand-in. Returns the module's message handler plus whatever
+// it posted back.
+function fakeSelf() {
+  const posted = [];
+  let onMessage;
+  globalThis.self = {
+    addEventListener(type, fn) { if (type === 'message') onMessage = fn; },
+    postMessage(m) { posted.push(m); },
+  };
+  return { posted, deliver: (data) => onMessage({ data }) };
+}
+
+// Import worker.mjs fresh each time: `config`/`started` are module state, and a
+// cached module would leak one test's builtins into the next.
+async function loadWorker() {
+  return import(`../src/worker.mjs?t=${Math.random()}`);
+}
+
+const dec = new TextDecoder();
+function collect(posted) {
+  const out = { stdout: '', stderr: '' };
+  for (const m of posted) if (m.type === 'out') out[m.channel] += dec.decode(new Uint8Array(m.bytes));
+  const exit = posted.find((m) => m.type === 'exit');
+  const err = posted.find((m) => m.type === 'error');
+  return { ...out, exitCode: exit ? exit.code : undefined, error: err && err.msg };
+}
+
+async function runInWorker(script, options) {
+  const self_ = fakeSelf();
+  const { serve } = await loadWorker();
+  serve(options);
+  await self_.deliver({
+    module: wasm,
+    files: { '/main.sh': script },
+    args: ['busybox', 'sh', '/main.sh'],
+    env: { PATH: '/', HOME: '/', LC_ALL: 'C' },
+    stdin: new Uint8Array(0),
+  });
+  return collect(self_.posted);
+}
+
+test('serve() registers builtins for the worker’s shell', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins — run npm run build:wasm'); return; }
+  const r = await runInWorker('hi there; echo "rc=$?"', {
+    builtins: { hi: (ctx) => { ctx.stdout(`hi ${ctx.argv[1]}\n`); return 0; } },
+  });
+  assert.equal(r.stdout, 'hi there\nrc=0\n');
+  assert.equal(r.exitCode, 0);
+});
+
+// The reason the factory form exists: boot the expensive thing ONCE, before
+// _start(), so every invocation afterwards can be synchronous.
+test('serve(): an async builtins() factory is awaited before the shell starts', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  let boots = 0;
+  const r = await runInWorker('n; n; n', {
+    async builtins() {
+      boots++;
+      await new Promise((res) => setTimeout(res, 5));
+      const engine = { greet: () => 'warm' };
+      return { n: (ctx) => { ctx.stdout(`${engine.greet()}\n`); return 0; } };
+    },
+  });
+  assert.equal(r.stdout, 'warm\nwarm\nwarm\n');
+  assert.equal(boots, 1, 'setup runs once, not per command');
+});
+
+test('serve(): a failing factory surfaces as an error, not a hang', async () => {
+  const self_ = fakeSelf();
+  const { serve } = await loadWorker();
+  serve({ builtins: async () => { throw new Error('engine did not boot'); } });
+  await self_.deliver({
+    module: wasm, files: { '/main.sh': 'echo hi' },
+    args: ['busybox', 'sh', '/main.sh'], env: {}, stdin: new Uint8Array(0),
+  });
+  const r = collect(self_.posted);
+  assert.match(r.error, /engine did not boot/);
+  assert.match(r.error, /serve\(\{ builtins \}\)/, 'names the option that failed');
+});
+
+// Calling serve() after the startup message means its builtins were ignored —
+// the silent-failure mode the synchronous-call rule exists to prevent.
+test('serve(): calling it too late throws and reports, instead of failing quietly', async () => {
+  const self_ = fakeSelf();
+  const { serve } = await loadWorker();
+  await self_.deliver({
+    module: wasm, files: { '/main.sh': 'echo hi' },
+    args: ['busybox', 'sh', '/main.sh'], env: {}, stdin: new Uint8Array(0),
+  });
+  assert.throws(() => serve({ builtins: { x: () => 0 } }), /before any top-level await/);
+  assert.ok(self_.posted.some((m) => m.type === 'error' && /serve\(\)/.test(m.msg)),
+    'also posted so the page sees a failure rather than a shell missing its builtins');
+});
+
+test('serve() with no builtins is just the default worker', async () => {
+  const r = await runInWorker('echo plain', {});
+  assert.equal(r.stdout, 'plain\n');
+  assert.equal(r.exitCode, 0);
+});
+
+// Pins examples/host-builtins.html: the page is only manually verifiable in a
+// browser, but its handlers are ordinary functions and can be checked here.
+test('the host-builtins example composes json and num in a pipeline', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const self_ = fakeSelf();          // the example calls serve() at import time
+  const { builtins } = await import('../examples/host-builtins.worker.mjs');
+  const { serve } = await loadWorker();
+  serve({ builtins });
+  await self_.deliver({
+    module: wasm,
+    files: {
+      '/data/repo.json': JSON.stringify({ name: 'wasi-sh', stars: 1234567 }),
+      '/main.sh': 'json name /data/repo.json\n'
+        + 'json stars /data/repo.json | num\n'
+        + 'json stars /data/repo.json | LANG=de-DE num\n'
+        + 'type json\n'
+        + 'json nope /data/repo.json; echo "exit=$?"\n',
+    },
+    args: ['busybox', 'sh', '/main.sh'],
+    env: { PATH: '/', HOME: '/', LANG: 'C.UTF-8' },   // the wasi-sh default
+    stdin: new Uint8Array(0),
+  });
+  const r = collect(self_.posted);
+  assert.equal(r.stdout,
+    'wasi-sh\n'
+    + '1,234,567\n'
+    + '1.234.567\n'
+    + 'json is a host builtin\n'
+    + 'exit=1\n');
+  assert.match(r.stderr, /no such path: nope/);
+});

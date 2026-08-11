@@ -1,0 +1,96 @@
+<!doctype html>
+<!-- wasi-sh use case C: extend the shell's command namespace with JS.
+     `json` and `num` below are host builtins — plain JS functions the shell
+     dispatches to like any applet, composing in pipes and redirects. No
+     SharedArrayBuffer, no COOP/COEP: this page works on any static host. -->
+<meta charset="utf-8">
+<title>wasi-sh — host builtins</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 9rem; font: 13px/1.45 ui-monospace, monospace; }
+  pre { background: #0b0e14; color: #d8dee9; padding: 1rem; min-height: 6rem; white-space: pre-wrap; }
+  pre .err { color: #ff8c8c; }
+  button { font-size: 15px; padding: .35rem 1.2rem; }
+  code { background: #eef1f5; padding: .1rem .3rem; border-radius: 3px; }
+  .ex { font: 13px ui-monospace, monospace; cursor: pointer; }
+</style>
+
+<h1>wasi-sh: host builtins</h1>
+<p>The shell resolves a command name against its functions, its builtins and the
+busybox applet table — and then, if the embedder registered one, a
+<strong>host builtin</strong>: a JS function that takes argv and returns an exit
+status. In-process, like an applet, and just as much not a process.</p>
+
+<p>Two are registered in
+<code>examples/host-builtins.worker.mjs</code>: <code>json</code> pulls a value
+out of JSON by dotted path (the guest has no JSON parser; the host always had
+one), and <code>num</code> formats numbers for a locale. Both are ordinary
+filters, so both compose:</p>
+
+<p>
+  <span class="ex">cat /data/repo.json | json stars | num</span> &nbsp;·&nbsp;
+  <span class="ex">json name /data/repo.json</span> &nbsp;·&nbsp;
+  <span class="ex">type json</span>
+</p>
+
+<textarea id="src">echo "== a value, by path =="
+json name /data/repo.json
+
+echo
+echo "== builtins compose with applets =="
+json stars /data/repo.json | num
+
+echo
+echo "== the environment a builtin sees is ash's live one =="
+json stars /data/repo.json | LANG=de-DE num
+
+echo
+echo "== and they are visible to the shell =="
+type json
+json nope /data/repo.json; echo "exit=$?"</textarea>
+<p><button id="go">Run</button> <span id="status"></span></p>
+<pre id="out"></pre>
+
+<script type="module">
+  import { run } from '../src/index.mjs';
+
+  const out = document.getElementById('out');
+  const status = document.getElementById('status');
+  const src = document.getElementById('src');
+
+  for (const el of document.querySelectorAll('.ex')) {
+    el.onclick = () => { src.value = el.textContent; };
+  }
+
+  document.getElementById('go').onclick = async () => {
+    out.textContent = '';
+    status.textContent = 'running…';
+    const dec = new TextDecoder();
+    try {
+      const result = await run({
+        script: src.value,
+        files: {
+          '/data/repo.json': JSON.stringify({
+            name: 'wasi-sh',
+            stars: 1234567,
+            tags: ['wasm', 'shell'],
+          }),
+        },
+        // The handlers live in the worker; the page just points at it. Passing
+        // `builtins` here instead would throw — functions do not survive
+        // structured clone.
+        workerUrl: new URL('./host-builtins.worker.mjs', import.meta.url),
+        onOutput: (bytes, channel) => {
+          const span = document.createElement('span');
+          if (channel === 'stderr') span.className = 'err';
+          span.textContent = dec.decode(bytes);
+          out.appendChild(span);
+        },
+      });
+      status.textContent = `exit ${result.exitCode}`;
+    } catch (e) {
+      status.textContent = 'failed';
+      out.textContent += `\n${e.message}\n`;
+    }
+  };
+</script>

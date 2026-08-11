@@ -68,6 +68,9 @@ into the busybox applets compiled into the wasm, never as processes:
   uname nproc stty` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
   globs, functions)
 
+You can add to that list: see [Host builtins](#host-builtins-your-own-commands)
+for registering your own commands, written in JS.
+
 `command -v NAME` / `type NAME` tell you what exists. `find -exec` and
 `xargs` work for simple children like `echo`. The filesystem you mount via
 `files:` is **writable inside the sandbox** (copy-on-write — your buffers are
@@ -96,6 +99,15 @@ never touched; everything vanishes when the run ends), so
   deliberately absent; `ls -l` shows placeholders).
 - A tool that fails or even calls `exit` only sets `$?` — the shell and
   session survive.
+- **Host builtins are builtins**, so every limit above applies to them
+  unchanged: `myTool &`, `(myTool)`, `exec myTool`, `timeout myTool` and
+  `find -exec myTool` all fail exactly as they would for `echo`. And a handler
+  runs **outside** the sandbox with your page's or process's full authority —
+  `run()` is a hermetic script runner *until* you register one, after which the
+  trust boundary is your handler. Validate `argv`.
+- **A command name containing a slash is always "not found"** (`./x.sh`,
+  `/bin/tool`) — there is nothing to exec, and host builtins are deliberately
+  reachable by name only, never by path.
 - **`$(...)` leaks `cd`, positional parameters, function definitions, aliases and
   traps** into the parent (variables and shell options *are* reverted).
   `x=$(cd /tmp)` leaves you in `/tmp`; `set -- a b` inside `$()` changes `$@`
@@ -163,6 +175,88 @@ Any other web terminal integrates the same way — see
 and `<input>` with no terminal library at all, and `examples/repl.html` for
 an xterm-based REPL (xterm from a CDN; not a dependency).
 
+## Host builtins: your own commands
+
+The shell resolves a name against its functions, its builtins and the applet
+table — and then, if you registered one, a **host builtin**: a JS function that
+takes argv and returns an exit status.
+
+```js
+import { run } from 'wasi-sh';
+
+const { stdout } = await run({
+  inline: true,                       // node default; see below for browsers
+  command: 'json .name < /pkg.json | tr a-z A-Z',
+  files: { '/pkg.json': '{"name":"wasi-sh"}' },
+  builtins: {
+    json(ctx) {
+      const doc = JSON.parse(new TextDecoder().decode(ctx.stdin()));
+      ctx.stdout(`${doc[ctx.argv[1].slice(1)]}\n`);
+      return 0;
+    },
+  },
+});
+// stdout === 'WASI-SH\n'
+```
+
+They are builtins, not processes — in-process, argv in, status out, no address
+space and nothing to wait for, exactly like a busybox applet. What you get from
+that is composition: by the time a builtin is dispatched the shell has already
+installed its redirections, so **`ctx.stdout` goes wherever fd 1 currently
+points** — a pipeline stage, a `> file`, a `$(...)` capture — with no work on
+your part.
+
+`ctx` is `{ argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs }`.
+`env` is the shell's live environment, exports and `VAR=x cmd` prefixes
+included; `cwd` comes from the guest itself, so relative paths in `ctx.fs`
+resolve the way the script expects. `type name` reports `name is a host
+builtin` and `command -v name` prints it, so scripts can probe.
+
+**Handlers must be synchronous.** The guest is a synchronous wasm stack frame
+below the call — there is nothing to await into. Returning a promise is
+reported as an error rather than silently succeeding at exit 0. Throwing is
+contained: the message goes to stderr and the command fails, but the shell
+lives.
+
+Precedence is functions → shell builtins → applets → **host builtins** → the
+path search. Applets win, so registering `grep` does nothing: what the shipped
+toolbox means cannot be changed out from under a script.
+
+### In a browser: register them in the worker
+
+Handlers are functions, and `postMessage` structured-clones its payload — so
+they cannot be handed to a worker from the page. Write a worker module that
+registers them, and point `run()` (or `spawn()`) at it:
+
+```js
+// my-worker.mjs
+import { serve } from 'wasi-sh/worker';
+
+serve({
+  async builtins() {              // awaited once, BEFORE the shell starts
+    const engine = await bootSomethingExpensive();
+    return { mytool: (ctx) => { ctx.stdout(engine.run(ctx.argv)); return 0; } };
+  },
+});
+```
+
+```js
+// the page
+await run({ command: 'mytool | wc -l', workerUrl: new URL('./my-worker.mjs', import.meta.url) });
+```
+
+That split is the point: the *setup* is async and happens once, so every
+*invocation* can be synchronous. It is what lets a builtin be backed by a whole
+second wasm module — an interpreter, say — booted up front and called warm.
+
+Call `serve()` **synchronously**, at the top of the module, before any
+top-level `await`. A startup message that arrives while the module is suspended
+is delivered to no one, and the shell would quietly run without your builtins;
+`serve()` detects a late call and fails loudly instead.
+
+Working example: [`examples/host-builtins.html`](examples/host-builtins.html)
+and its [worker](examples/host-builtins.worker.mjs).
+
 ## API
 
 | import | what |
@@ -172,7 +266,7 @@ an xterm-based REPL (xterm from a CDN; not a dependency).
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
 | `wasi-sh/ring` | `createStdinRing`, `RingWriter`, `RingReader` — the SAB stdin ring |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
-| `wasi-sh/worker` | the Worker entry (referenced by URL, not imported) |
+| `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register host builtins |
 | `wasi-sh/busybox.wasm` | the shell binary |
 
 **Shared options** (`run` and `spawn`): `wasm` (URL \| string \| `Response` \|

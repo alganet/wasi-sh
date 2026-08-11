@@ -13,7 +13,7 @@ worker.mjs                 Web Worker / worker_threads
    │  WebAssembly.instantiate(module, shim.imports())
    ▼
 shim.mjs (WasiShim)        WASI preview1 + env.__host_* hooks
-   │
+   │                       ▲ host builtins call back out here
 busybox.wasm               busybox ash + applets, fork-free, wasm32-wasi
 ```
 
@@ -27,8 +27,10 @@ Two stdin transports plug into the same shim `input` contract:
 
 A minimal preview1 implementation (27 imports total) plus `env.*` hooks: four
 that back busybox's fork-free machinery (`__host_pipe`/`__host_dup`/`__host_dup2`
-/`__host_trace`) and two for terminal geometry (`__host_winsize`/`__host_winch`,
-see "Terminal resize" below).
+/`__host_trace`), two for terminal geometry (`__host_winsize`/`__host_winch`,
+see "Terminal resize" below), and two for host builtins
+(`__host_builtin_lookup`/`__host_builtin_run`, see "Host builtins" below).
+Eight in total.
 
 **Filesystem.** A flat map of absolute path → node (`{type, data?, children?}`).
 Writable: `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` honored, file creation
@@ -39,6 +41,14 @@ EINVAL ("not a symlink"), which is the truth. Every node gets a **unique
 inode** lazily — busybox `find`/`cp -r` detect directory loops via `dev:ino`
 pairs, and a constant ino makes every directory look like a recursion.
 Directory rename rewrites the whole key-prefixed subtree (flat map).
+
+**File offsets are shared, not copied.** POSIX gives one offset per open file
+description, and `__host_dup`/`__host_dup2` copy the descriptor with `{...src}`
+— so the offset lives in a cell (`pos: {v}`) that the copy shares. A plain
+number gave every dup its own, and two things broke silently: `cmd > f 2>&1`
+had fd 1 and fd 2 both writing from 0, interleaving over each other's bytes,
+and `evalpipe`'s `fcntl(F_DUPFD,10)`/`dup2` save-restore *rewound* a
+file-backed stdin between stages, re-serving bytes an earlier stage had eaten.
 
 **Pipes.** `env.__host_pipe` allocates an in-memory pipe as a chunk list;
 reads drain consumed chunks and `fd_close`/`__host_dup2` free the pipe when
@@ -222,9 +232,111 @@ sockets, `/proc`, or a real tty.
   in-process run (upstream-documented NOFORK gap); an applet that
   stdio-buffers stdin and exits early strands those buffered bytes.
 
+## Host builtins (`build/ash-hostbuiltin.patch`)
+
+The applet section above extends the shell's command namespace at *link* time.
+This extends it at *run* time, from JS: `new WasiShim({ builtins })` takes a
+`{ lookup(name), run(ctx) }` pair — the same pluggable-capability shape as
+`input`, absent by default, degrading to "no such command" exactly as
+`__host_winsize` degrades to "no info".
+
+**Where ash hooks in.** `find_command()` resolves a name against functions, the
+hash table, shell builtins, then the applet table. The new probe sits directly
+after the applet block and before the path search — which in this build can
+never succeed anyway, since the shim FS has no permission bits and `test_exec()`
+therefore always fails. A hit sets a new `CMDHOST` cmdtype, and `evalcommand`
+grows a `case` for it that calls the handler and `break`s; `jp` is `NULL` there,
+so `waitforjob` hands back `exitstatus` and the ordinary redirection teardown
+runs. `describe_command` grows a case too, so `type` says `is a host builtin`
+and `command -v` prints the bare name (which round-trips: `"$(command -v x)"`
+resolves back through `find_command`).
+
+Three things about that placement are load-bearing:
+
+- **`CMDHOST` is a distinct type, not a sentinel index inside `CMDNORMAL`.** The
+  applet dispatch computes `applet_no = -index - 2` and indexes the applet table
+  with it, so any negative sentinel is one reordering away from running an
+  arbitrary applet. And `evalcommand`'s `default:` arm *is* the exec path — a
+  cmdtype with no `case` falls into `vforkexec`, i.e. "can't fork" and a dead
+  shell.
+- **It never writes to `cmdtable`.** The applet branch returns before the cache
+  for its own reasons; here it is stronger, because the host's command set is JS
+  state that can change between two invocations. A cached `CMDHOST` entry could
+  not even be flushed — `clearcmdentry` only frees `CMDNORMAL`, and `hashcd`
+  would never mark it for rehash.
+- **Applets win.** Registering `grep` does nothing, so what the shipped toolbox
+  means cannot be changed out from under a script. Moving the probe above the
+  applet block would invert that; it is a one-line change if the trade ever
+  looks different.
+
+**The ABI is two i32-only imports**, declared in `build/shim/wasistubs.c` so the
+busybox patch carries no wasm knowledge at all:
+
+    __host_builtin_lookup(name, len)          -> 0 | 1
+    __host_builtin_run(cwd, argc, argv, envp) -> 0..255 | -1
+
+Nothing is written through a guest pointer and there is no u64, so neither the
+`mknod` `dev_t` trap nor the narrow-store hazards documented in that file apply.
+`envp` comes from `listvars(VEXPORT, VUNSET, varlist.list, NULL)` — the same
+call the applet branch makes, so exports *and* `VAR=x cmd` prefixes are visible;
+the shim's own `env` is frozen at construction and would be permanently stale.
+`cwd` comes from `getcwd()`, i.e. wasi-libc's cwd, which is what the guest's own
+relative `path_open`s resolve against and which — unlike `$PWD` — a script
+cannot lie about.
+
+**Why the handler's stdio must go through the fd table.** By dispatch time
+`redirectsafe()` and the fork-free `evalpipe`'s `dup2` dance have already put
+this command's redirections on fds 0/1/2. So `ctx.stdout` calls `writeFd(1, …)`,
+which routes on the fd's *table type* — pipe, file, or terminal. Calling the
+shim's `stdout` callback instead would print `cmd | grep x` straight past grep
+to the terminal and hand grep an empty pipe: the same fd-number-vs-fd-type
+mistake `poll_oneoff` made once. That is why `fd_read`/`fd_write` were split
+into iovec scatter/gather around reusable `readFd`/`writeFd`.
+
+**Containment.** A JS exception thrown out of a wasm import unwinds the entire
+guest stack — the instance is dead, and no guest `setjmp` can catch it (the same
+reason `--wrap exit` exists for applets). So `run` is wrapped: a throw writes
+`name: message` to fd 2 and returns a status, and the shell survives. A nested
+`WasiExit` is caught there too — letting it escape would make an inner module's
+`exit(1)` silently become the *outer* shell's exit code, since `worker.mjs`
+reads a `WasiExit` as a clean shutdown. The status is masked to 8 bits like
+`wait(2)`. And because a thenable coerces to i32 `0` at the boundary — silent
+success, with the real output landing later against whatever fd 1 has become —
+returning a promise is reported as an error instead.
+
+**Browsers need `serve()`.** Handlers are functions and `postMessage`
+structured-clones its payload, so `builtins` cannot cross into a worker. `src/worker.mjs`
+exports `serve({ builtins })` for a custom worker module, reached through the
+existing `workerUrl` option. It must be called synchronously at module
+evaluation: a task cannot interleave with synchronous script execution, so a
+synchronous call always wins the startup message, whereas a module that
+top-level-awaits first hands that message to a shell with no builtins. `serve()`
+detects the late call and fails loudly. The factory form (`async builtins()`) is
+awaited before instantiation, which is where an expensive boot belongs — that
+split is what lets a builtin be backed by a second wasm module: async once, then
+synchronous per invocation.
+
+**Independent fix in the same patch.** A command name containing a slash took
+`find_command`'s slash short circuit, reached `vforkexec()`, and died on
+`vfork() == ENOSYS` with `can't fork` and status 2 — which is `EXERROR`, so it
+*aborted the whole script*: `./x.sh; echo $?` never reached the echo. It now
+reports 127 like any other miss and carries on. Host builtins are deliberately
+**not** reachable by path; a virtual `/bin` would imply `[ -x ]`, shebangs and
+PATH ordering, none of which exist here.
+
+**What still does not work**, because host builtins are builtins: `exec cmd`
+(`shellexec` never consults the table — note `exec date` *does* work via its
+applet branch, so this is an asymmetry, and ~5 lines would close it),
+`find -exec cmd` and `xargs cmd` (libbb `spawn_and_wait` has its own applet
+check), and `cmd &` / `(cmd)` (still `forkshell`). Async handlers are out of
+scope entirely — that would need a SAB request/response ring, a separate
+mechanism.
+
 ## Build recipe (`build/build.sh`)
 
-Pinned busybox tarball (SHA-256-verified) + the fork-free patch + an
+Pinned busybox tarball (SHA-256-verified) + the fork-free patch + the
+host-builtin patch (applied unconditionally: it depends on none of the
+fork-free machinery, and carries the slashed-name fix) + an
 ash-plus-applets config, cross-compiled with zig cc (or wasi-sdk) to plain
 wasm32-wasi. Notable quirks, each earned the hard way:
 
