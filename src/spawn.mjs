@@ -18,6 +18,9 @@ const ENC = new TextEncoder();
 // Options: { args | command | script, files, env, wasm,
 //            stdinBufferSize, worker, workerUrl,
 //            onOutput, onExit, onError }
+// Host builtins are registered INSIDE the worker with serve() — handler
+// functions cannot be structured-cloned — so there is no `builtins` option
+// here; point workerUrl at your serve() module instead.
 // Resolves to a Session once the worker reports ready (module instantiated,
 // _start about to run).
 export async function spawn(options = {}) {
@@ -63,7 +66,10 @@ export async function spawn(options = {}) {
     sab,
   };
   worker.postMessage(msg, msg.wasmBytes ? [msg.wasmBytes.buffer] : []);
-  await session._ready;
+  // Bounded: a custom worker module that top-level-awaits before installing a
+  // message handler drops the startup message entirely, and an unbounded await
+  // here would hang spawn() forever with nothing to show for it.
+  await session._readyWithin(options.readyTimeoutMs ?? 30000);
   return session;
 }
 
@@ -80,7 +86,7 @@ export class Session {
     this.exited = new Promise((res) => { this._exitResolve = res; });
     // Reject-before-ready surfaces instantiation failures through spawn().
     this._ready.catch(() => {});
-    worker.onmessage = (e) => {
+    worker.addEventListener('message', (e) => {
       const m = e.data;
       if (m.type === 'out') {
         const bytes = new Uint8Array(m.bytes);
@@ -99,13 +105,36 @@ export class Session {
         // _exit (idempotent) resolves exited, fires onExit, and disposes.
         this._exit(134);
       }
-    };
-    worker.onerror = (e) => {
+    });
+    // addEventListener, not onmessage/onerror: a caller-supplied `worker` may
+    // already have handlers of its own (a serve() module does), and assigning
+    // would silently clobber them.
+    worker.addEventListener('error', (e) => {
       const err = e.error || new Error(e.message || 'worker error');
       readyReject(err);
       for (const fn of this._errorFns) fn(err);
       this._exit(134);   // as above: never leave `exited` pending on a worker error
-    };
+    });
+  }
+
+  // `ready`, but it always settles. A worker that never answers is otherwise
+  // indistinguishable from a slow one, and the usual cause is a custom serve()
+  // module that awaited before registering — so name that in the message.
+  _readyWithin(ms) {
+    if (!(ms > 0)) return this._ready;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        this._exit(134);
+        reject(new Error(
+          `spawn(): the worker did not report ready within ${ms}ms. If it is a custom `
+          + 'worker module, make sure it calls serve() synchronously at the top, before '
+          + 'any top-level await — a startup message that arrives while the module is '
+          + 'suspended is delivered to no one. Raise readyTimeoutMs if setup is simply slow.'
+        ));
+      }, ms);
+      const clear = (fn) => (v) => { clearTimeout(t); fn(v); };
+      this._ready.then(clear(resolve), clear(reject));
+    });
   }
 
   // Feed stdin. Strings are UTF-8-encoded; bytes pass through.

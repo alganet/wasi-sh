@@ -4,6 +4,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { compileWasm, runScript } from '../src/node.mjs';
+import { WasiShim } from '../src/shim.mjs';
 
 let wasm;
 before(async () => { wasm = await compileWasm(); });
@@ -309,4 +310,136 @@ test('isolation: set -e inside $() does not escape', async () => {
 test('isolation: pipe stages are subshells (POSIX ash)', async () => {
   const r = await sh('echo hi | read foo; echo "foo=[$foo]"');
   assert.equal(r.stdout, 'foo=[]\n');
+});
+
+// ─── host builtins (JS-backed command names) ─────────────────────────────────
+
+// Only meaningful on a binary built with the host-builtin C support (compiled
+// at `npm run build:wasm`); probe the module's imports so these stay green on
+// an older dist/busybox.wasm instead of failing. The JS side is pinned
+// unconditionally in test/builtins.test.mjs.
+const HOSTB_READY = () => WebAssembly.Module.imports(wasm)
+  .some((i) => i.module === 'env' && i.name === '__host_builtin_run');
+const skipUnlessHostBuiltins = (t) => {
+  if (HOSTB_READY()) return false;
+  t.skip('dist/busybox.wasm predates host builtins — run npm run build:wasm');
+  return true;
+};
+
+// `up` uppercases its args, or stdin when it has none. Deliberately not
+// PHP-shaped: a host builtin is just a function.
+const upper = {
+  up: (ctx) => {
+    const rest = ctx.argv.slice(1);
+    const text = rest.length ? rest.join(' ') : new TextDecoder().decode(ctx.stdin());
+    ctx.stdout(text.toUpperCase());
+    return 0;
+  },
+};
+const shb = (script, builtins = upper, opts = {}) => sh(script, { builtins, ...opts });
+
+test('a host builtin runs, with argv', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('up hello world');
+  assert.equal(r.stdout, 'HELLO WORLD');
+  assert.equal(r.exitCode, 0);
+});
+
+// The whole point of routing through the fd table rather than the stdout
+// callback: whatever the shell last dup2'd onto fd 1 is where the bytes go.
+test('a host builtin composes in a pipeline', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('up abc def | tr " " "-"');
+  assert.equal(r.stdout, 'ABC-DEF', 'fd 1 was the pipe, not the terminal');
+});
+
+test('a host builtin reads a pipe on stdin', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('printf "quiet\\n" | up');
+  assert.equal(r.stdout, 'QUIET\n');
+});
+
+test('a host builtin honours a redirect', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('up to a file > /o.txt; cat /o.txt');
+  assert.equal(r.stdout, 'TO A FILE');
+});
+
+test('a host builtin is captured by $(...)', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('x=$(up sub); echo "[$x]"');
+  assert.equal(r.stdout, '[SUB]\n');
+});
+
+test('the return value becomes $?, truncated to 8 bits', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const rc = { rc: (ctx) => Number(ctx.argv[1]) };
+  assert.equal((await shb('rc 0; echo "s=$?"', rc)).stdout, 's=0\n');
+  assert.equal((await shb('rc 42; echo "s=$?"', rc)).stdout, 's=42\n');
+  assert.equal((await shb('rc 255; echo "s=$?"', rc)).stdout, 's=255\n');
+  assert.equal((await shb('rc 300; echo "s=$?"', rc)).stdout, 's=44\n', 'wait(2) truncation');
+});
+
+test('a host builtin sees exports and VAR=x prefixes, and the live cwd', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const probe = { probe: (ctx) => { ctx.stdout(`${ctx.cwd} ${ctx.env.FOO} ${ctx.env.BAR}\n`); return 0; } };
+  const r = await shb('mkdir -p /w; cd /w; export BAR=exported; FOO=prefix probe', probe);
+  assert.equal(r.stdout, '/w prefix exported\n', 'envp comes from listvars, cwd from getcwd');
+});
+
+test('`type` and `command -v` tell the truth about a host builtin', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  assert.equal((await shb('type up')).stdout, 'up is a host builtin\n');
+  assert.equal((await shb('command -v up')).stdout, 'up\n', 'bare name, so "$(command -v up)" re-dispatches');
+});
+
+// Precedence: functions, shell builtins and busybox applets all win, so the
+// shipped toolbox cannot be changed out from under a script.
+test('an applet of the same name still wins', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('echo real', { echo: (ctx) => { ctx.stdout('HIJACKED'); return 0; } });
+  assert.equal(r.stdout, 'real\n', 'registering `echo` must not change what echo means');
+});
+
+test('a throwing handler costs one command, not the shell', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb('boom; echo "after=$?"', { boom: () => { throw new Error('kaboom'); } });
+  assert.equal(r.stdout, 'after=1\n', 'the shell survived and kept running');
+  assert.match(r.stderr, /boom: kaboom/);
+});
+
+test('with nothing registered the shell is unchanged: 127 and "not found"', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await sh('up hi; echo "s=$?"');
+  assert.equal(r.stdout, 's=127\n');
+  assert.match(r.stderr, /up: not found/);
+});
+
+// Independent of host builtins, and fixed by the same patch: a slashed name
+// took find_command's slash short circuit into vforkexec(), where vfork() is
+// ENOSYS — ash raised "can't fork" with status 2 and ABORTED the script, so the
+// echo never ran.
+test('a slashed unknown name is 127, not a dead shell', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  for (const name of ['/bin/nope', './nope.sh', 'foo/bar']) {
+    const r = await sh(`${name}; echo "after=$?"`);
+    assert.equal(r.stdout, 'after=127\n', `${name} must not abort the script`);
+    assert.equal(r.exitCode, 0);
+  }
+});
+
+// Drift guard. --import-undefined means any unresolved __host_* symbol silently
+// becomes a wasm import, so a typo or a new hook links cleanly and only fails at
+// instantiate ("function import requires a callable") — in production, for every
+// run. Pin the whole surface here instead: whatever the binary asks for, the
+// shim must supply.
+test('the shim supplies every env import the binary declares', () => {
+  const shim = new WasiShim({});
+  const supplied = shim.imports().env;
+  const declared = WebAssembly.Module.imports(wasm)
+    .filter((i) => i.module === 'env')
+    .map((i) => i.name);
+  const missing = declared.filter((n) => typeof supplied[n] !== 'function');
+  assert.deepEqual(missing, [], `dist/busybox.wasm imports env.${missing.join('/')} but src/shim.mjs does not provide it`);
+  assert.ok(declared.every((n) => n.startsWith('__host_')), `unexpected env import: ${declared.join(' ')}`);
 });

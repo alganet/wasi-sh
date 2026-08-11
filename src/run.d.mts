@@ -1,4 +1,4 @@
-import type { Files } from './shim.mjs';
+import type { Files, HostBuiltins, BuiltinMap } from './shim.mjs';
 
 export type WasmSource =
   | URL
@@ -32,6 +32,18 @@ export interface RunOptions {
   worker?: Worker;
   /** Alternate URL for the wasi-sh worker module. */
   workerUrl?: URL | string;
+  /**
+   * Host builtins — JS-backed command names, resolved after shell functions,
+   * builtins and busybox applets. A name → handler map, a HostBuiltins
+   * provider, or a factory (awaited once) returning either.
+   *
+   * Works directly only when the shell runs on the calling thread — i.e.
+   * inline:true, the node default. Handler functions cannot be
+   * structured-cloned into a Worker, so in a browser register them INSIDE a
+   * worker module with serve() and pass it as `workerUrl`; passing `builtins`
+   * to a stock worker throws and says so.
+   */
+  builtins?: BuiltinMap | HostBuiltins | (() => BuiltinMap | HostBuiltins | Promise<BuiltinMap | HostBuiltins>);
 }
 
 export interface RunResult {

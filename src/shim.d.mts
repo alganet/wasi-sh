@@ -24,6 +24,76 @@ export interface ShimInput {
 
 export type Files = Record<string, string | Uint8Array>;
 
+/** The in-memory FS, as a host builtin sees it. Relative paths resolve against
+ *  the builtin's `cwd`. */
+export interface HostFs {
+  /** Absolutize against cwd and normalize (`..` clamps at root). */
+  resolve(path: string): string;
+  /** File contents, or null if absent or a directory. Always a fresh copy. */
+  read(path: string): Uint8Array | null;
+  /** Create or overwrite a file. False if the parent directory is missing. */
+  write(path: string, data: string | Uint8Array | ArrayLike<number>): boolean;
+  exists(path: string): boolean;
+  stat(path: string): { type: 'file' | 'dir'; size: number } | null;
+  /** Entry names, or null if not a directory. */
+  list(path: string): string[] | null;
+  /** False if it exists already or the parent directory is missing. */
+  mkdir(path: string): boolean;
+  /** Unlink a file, or remove an empty directory. */
+  remove(path: string): boolean;
+}
+
+/** What a host builtin is handed. Everything is materialized before the call. */
+export interface BuiltinContext {
+  /** argv[0] is the command name as typed. */
+  argv: string[];
+  /** The guest's LIVE environment: exports plus this command's VAR=x prefixes. */
+  env: Record<string, string>;
+  /** The shell's working directory (from getcwd, not $PWD). */
+  cwd: string;
+  /**
+   * Read up to `max` bytes of stdin. Empty means EOF. Blocking — on an
+   * interactive session with a live stdin ring this PARKS the whole session
+   * until the embedder writes or calls end(); there is no ^C.
+   */
+  stdin(max?: number): Uint8Array;
+  /** Write to fd 1 — wherever the shell put it (pipe, file, terminal). */
+  stdout(data: string | Uint8Array): void;
+  /** Write to fd 2 — likewise. */
+  stderr(data: string | Uint8Array): void;
+  fs: HostFs;
+}
+
+/**
+ * A host builtin: argv in, exit status out, in-process — like a busybox
+ * applet, and just as much NOT a process.
+ *
+ * MUST be synchronous. The guest is a synchronous wasm stack frame below the
+ * call and there is nothing to await into; returning a Promise is reported as
+ * an error rather than silently succeeding. Do async setup once, up front —
+ * see serve({ async builtins() {...} }).
+ *
+ * The return value becomes `$?`, truncated to 8 bits like wait(2). Throwing is
+ * contained: the message goes to stderr and the command fails, but the shell
+ * survives.
+ */
+export type BuiltinHandler = (ctx: BuiltinContext) => number;
+
+/** A name → handler map, the 95% case. */
+export type BuiltinMap = Record<string, BuiltinHandler>;
+
+/**
+ * The resolved contract the shim consumes. Implement it directly instead of
+ * passing a map when the namespace is dynamic (a whole bin/ directory, a lazy
+ * index) rather than a fixed set of keys.
+ */
+export interface HostBuiltins {
+  /** Is this a host builtin? Must NOT run it — `type` and `command -v` ask. */
+  lookup(name: string): boolean;
+  /** Execute; the return value becomes `$?`. */
+  run(ctx: BuiltinContext): number;
+}
+
 export interface WasiShimOptions {
   /** Full argv; busybox is a multicall binary, argv[0] selects the applet. */
   args?: string[];
@@ -36,11 +106,19 @@ export interface WasiShimOptions {
   stdout?: (bytes: Uint8Array) => void;
   stderr?: (bytes: Uint8Array) => void;
   input?: ShimInput;
+  /**
+   * Host builtins: JS-backed names added to the shell's command namespace.
+   * Absent, the shell behaves exactly as it did before — an unregistered name
+   * is a plain 127 "not found".
+   */
+  builtins?: HostBuiltins;
 }
 
 /**
- * Minimal WASI preview1 shim plus the env.__host_pipe/__host_dup/__host_dup2
- * hooks backing busybox's fork-free pipes.
+ * Minimal WASI preview1 shim plus the env.__host_* hooks: __host_pipe /
+ * __host_dup / __host_dup2 backing busybox's fork-free pipes, __host_winsize /
+ * __host_winch for terminal geometry, and __host_builtin_lookup /
+ * __host_builtin_run for host builtins.
  */
 export class WasiShim {
   constructor(options?: WasiShimOptions);

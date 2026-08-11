@@ -79,6 +79,41 @@ export function toBytes(data) {
   return typeof data === 'string' ? ENC.encode(data) : data;
 }
 
+// Normalize `builtins` into the shim's host-builtin contract:
+//   lookup(name) -> bool     is this a host builtin? (`type` and `command -v`
+//                            ask, so it must answer WITHOUT running anything)
+//   run(ctx)     -> status   execute it, synchronously
+// A plain { name: handler } map is the 95% case. An object that ALREADY has
+// both methods is passed through untouched — that is the extension point for a
+// dynamic namespace (a whole bin/ directory, a lazy index). Requiring BOTH
+// methods is what keeps a map containing a command literally named `run` from
+// being mistaken for a provider.
+// hasOwn is not paranoia: a bare `typeof map[name] === 'function'` claims
+// toString, constructor and valueOf as builtins, so `type toString` would
+// answer yes and then dispatch into Object.prototype.
+export function hostBuiltins(spec) {
+  if (!spec) return undefined;
+  if (typeof spec.lookup === 'function' && typeof spec.run === 'function') return spec;
+  const pick = (name) => (Object.hasOwn(spec, name) && typeof spec[name] === 'function' ? spec[name] : null);
+  return {
+    lookup: (name) => pick(name) != null,
+    run(ctx) {
+      const fn = pick(ctx.argv[0]);
+      if (!fn) { ctx.stderr(`${ctx.argv[0]}: not found\n`); return 127; }
+      return fn(ctx);
+    },
+  };
+}
+
+// The public `builtins` option: a map, a provider, or a factory returning
+// either. The factory is the only reason this is async — it exists so a worker
+// can `await` a heavy dependency (a wasm interpreter, an OPFS handle) ONCE,
+// before _start(), and keep every handler synchronous afterwards.
+export async function resolveBuiltins(spec) {
+  if (!spec) return undefined;
+  return hostBuiltins(typeof spec === 'function' ? await spec() : spec);
+}
+
 // The WasiShim input contract over a fixed byte buffer: drain, then EOF.
 // This is the whole of run()'s stdin story — nothing ever blocks on a user.
 export function fixedInput(data) {

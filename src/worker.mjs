@@ -2,25 +2,68 @@
 // interactive spawn() (a SAB stdin ring the worker parks on via Atomics.wait)
 // and non-interactive run() (a fixed stdin buffer, plain postMessage, no SAB).
 //
+// Two ways in:
+//   default   run()/spawn() point a plain `new Worker(...)` at this module and
+//             get a shell with no host builtins.
+//   serve()   a CUSTOM worker module imports it to register host builtins.
+//             Handlers are FUNCTIONS and postMessage structured-clones its
+//             payload, so registering them HERE, inside the worker, is the only
+//             way `builtins` can reach a browser session. Point run()/spawn()
+//             at your module with `workerUrl`.
+//
+// serve() must be called SYNCHRONOUSLY at module evaluation, before any
+// top-level await. A task can never interleave with synchronous script
+// execution, so a synchronous call always wins the startup message; a module
+// that awaits first hands that message to whatever handler exists at that
+// moment — this one, with no builtins — and the shell would silently run
+// without them. serve() detects that and says so instead. Async setup belongs
+// inside builtins(), which is awaited before the module is instantiated.
+//
 // Startup message: { module | wasmBytes, files, args, env, sab? , stdin? }
 // Outbound:        { type:'out', channel:'stdout'|'stderr', bytes }
 //                  { type:'ready' } after instantiation, before _start()
 //                  { type:'exit', code } | { type:'error', msg }
 import { WasiShim, WasiExit } from './shim.mjs';
 import { RingReader } from './ring.mjs';
-import { fixedInput } from './options.mjs';
+import { fixedInput, resolveBuiltins } from './options.mjs';
 
-self.onmessage = async (e) => {
+let config = {};
+let started = false;
+
+export function serve(options = {}) {
+  if (started) {
+    const msg =
+      'wasi-sh serve(): called after the shell already started, so its builtins '
+      + 'were ignored. Call serve() at the TOP of your worker module, before any '
+      + 'top-level await — a startup message that arrives while the module is '
+      + 'suspended is delivered without them. Move the async setup inside '
+      + 'builtins(), which is awaited before the module is instantiated: '
+      + 'serve({ async builtins() { const x = await heavy(); return { name: (ctx) => …x… }; } })';
+    self.postMessage({ type: 'error', msg });   // surfaces as a real failure, not a hang
+    throw new Error(msg);
+  }
+  config = options;
+}
+
+self.addEventListener('message', async (e) => {
+  started = true;
   const { module, wasmBytes, files, args, env, sab, stdin } = e.data;
   try {
     const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
-    const compiled = module || await WebAssembly.compile(wasmBytes);
+    // Builtin setup and wasm compilation are independent; overlapping them
+    // hides an interpreter-sized init behind the compile.
+    const [builtins, compiled] = await Promise.all([
+      resolveBuiltins(config.builtins).catch((ex) => {
+        throw new Error(`serve({ builtins }): setup failed: ${(ex && ex.message) || ex}`);
+      }),
+      module || WebAssembly.compile(wasmBytes),
+    ]);
     const post = (channel) => (b) => self.postMessage({ type: 'out', channel, bytes: b }, [b.buffer]);
     const shim = new WasiShim({
       args, env, files,
       stdout: post('stdout'),
       stderr: post('stderr'),
-      input,
+      input, builtins,
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);
@@ -36,4 +79,4 @@ self.onmessage = async (e) => {
   } catch (ex) {
     self.postMessage({ type: 'error', msg: String(ex && ex.message || ex) });
   }
-};
+});

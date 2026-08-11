@@ -22,6 +22,13 @@ export interface SpawnOptions {
   worker?: Worker;
   /** Alternate URL for the wasi-sh worker module. */
   workerUrl?: URL | string;
+  /**
+   * How long to wait for the worker's `ready` before rejecting (default
+   * 30000; 0 disables). Guards against a custom serve() module that awaited
+   * before registering its handler and so never saw the startup message —
+   * without a bound, spawn() would simply hang.
+   */
+  readyTimeoutMs?: number;
   onOutput?: (bytes: Uint8Array, channel: OutputChannel) => void;
   onExit?: (code: number) => void;
   onError?: (err: Error) => void;

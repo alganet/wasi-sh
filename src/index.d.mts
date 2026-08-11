@@ -5,5 +5,8 @@ export type { SpawnOptions } from './spawn.mjs';
 export { fetchTree } from './files.mjs';
 export type { FetchTreeOptions } from './files.mjs';
 export { WasiShim, WasiExit } from './shim.mjs';
-export type { WasiShimOptions, ShimInput, Files } from './shim.mjs';
+export type {
+  WasiShimOptions, ShimInput, Files,
+  HostBuiltins, BuiltinMap, BuiltinHandler, BuiltinContext, HostFs,
+} from './shim.mjs';
 export { createStdinRing, RingWriter, RingReader, RingOverflowError } from './ring.mjs';

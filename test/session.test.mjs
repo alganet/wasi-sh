@@ -5,12 +5,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Session } from '../src/spawn.mjs';
 
-// Minimal Worker stand-in: Session assigns onmessage/onerror; we call them.
+// Minimal Worker stand-in. Session SUBSCRIBES with addEventListener rather than
+// assigning onmessage, so a caller-supplied worker (a serve() module has its
+// own handler) is not silently clobbered — the fake models that, and keeps a
+// list so a second subscriber would be visible.
 function fakeWorker() {
   return {
     terminated: 0,
+    listeners: { message: [], error: [] },
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
     terminate() { this.terminated++; },
-    emit(m) { this.onmessage({ data: m }); },
+    emit(m) { for (const fn of this.listeners.message) fn({ data: m }); },
+    emitError(e) { for (const fn of this.listeners.error) fn(e); },
   };
 }
 
@@ -79,13 +85,13 @@ test('error message settles exited (134) — a guest trap must not hang awaiters
   assert.ok(w.terminated >= 1, 'owned worker disposed after an error');
 });
 
-test('worker.onerror settles exited (134) too', async () => {
+test('a worker error event settles exited (134) too', async () => {
   const w = fakeWorker();
   const s = new Session(w, null, true);
   s._ready.catch(() => {});
   const errs = [];
   s.onError((e) => errs.push(e.message));
-  w.onerror({ message: 'worker blew up' });
+  w.emitError({ message: 'worker blew up' });
   assert.equal(await s.exited, 134);
   assert.deepEqual(errs, ['worker blew up']);
 });

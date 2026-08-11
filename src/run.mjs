@@ -5,12 +5,12 @@
 // postMessage Worker by default; pass inline:true (the node default) to run
 // on the calling thread instead.
 import { WasiShim, WasiExit } from './shim.mjs';
-import { resolveArgv, mergeEnv, resolveWasm, resolveWasmForWorker, fixedInput, toBytes } from './options.mjs';
+import { resolveArgv, mergeEnv, resolveWasm, resolveWasmForWorker, fixedInput, toBytes, resolveBuiltins } from './options.mjs';
 
 const DEC = new TextDecoder();
 
 // Options: { command | script | args, stdin, files, env, wasm, inline,
-//            onOutput, workerUrl, worker }
+//            onOutput, workerUrl, worker, builtins }
 // Resolves to { stdout, stderr, exitCode }. onOutput streams raw bytes as
 // they happen: onOutput(bytes, channel) with channel 'stdout' | 'stderr'.
 export async function run(options = {}) {
@@ -33,6 +33,7 @@ async function runInline(options) {
     stdout: sink('stdout'),
     stderr: sink('stderr'),
     input: fixedInput(options.stdin),
+    builtins: await resolveBuiltins(options.builtins),
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
   shim.bindMemory(instance.exports.memory);
@@ -64,6 +65,18 @@ function decodeAll(list) {
 // Browser off-thread mode: same worker module as spawn(), but with a fixed
 // stdin buffer instead of a SAB ring — plain postMessage, no Atomics.
 async function runInWorker(options) {
+  // Handlers are functions and postMessage structured-clones its payload, so
+  // `builtins` cannot cross into a stock worker. Registering them inside a
+  // custom worker module with serve() is the supported route.
+  if (options.builtins && !options.worker && !options.workerUrl) {
+    throw new Error(
+      'run({ builtins }) needs a worker that registers them: handler functions '
+      + 'cannot be structured-cloned into a Worker. Either pass inline:true to '
+      + 'run on the calling thread, or write a worker module that calls '
+      + "serve({ builtins }) from 'wasi-sh/worker' and pass it as workerUrl. "
+      + 'See the host builtins section of the wasi-sh README.'
+    );
+  }
   const { argv, extraFiles } = resolveArgv(options);
   const wasm = await resolveWasmForWorker(options.wasm);
   const worker = options.worker
@@ -72,7 +85,7 @@ async function runInWorker(options) {
       : new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' }));
   const chunks = { stdout: [], stderr: [] };
   const result = new Promise((resolve, reject) => {
-    worker.onmessage = (e) => {
+    worker.addEventListener('message', (e) => {
       const m = e.data;
       if (m.type === 'out') {
         const bytes = new Uint8Array(m.bytes);
@@ -87,8 +100,11 @@ async function runInWorker(options) {
       } else if (m.type === 'error') {
         reject(new Error(m.msg));
       }
-    };
-    worker.onerror = (e) => reject(e.error || new Error(e.message || 'worker error'));
+    });
+    // addEventListener, not onmessage/onerror: a caller-supplied `worker` may
+    // already have handlers of its own (a serve() module does), and assigning
+    // would silently clobber them.
+    worker.addEventListener('error', (e) => reject(e.error || new Error(e.message || 'worker error')));
   });
   const msg = {
     ...wasm, // { module } or { wasmBytes }
