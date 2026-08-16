@@ -1,5 +1,8 @@
 # wasi-sh
 
+[![npm](https://img.shields.io/npm/v/wasi-sh.svg)](https://www.npmjs.com/package/wasi-sh)
+[![CI](https://github.com/alganet/wasi-sh/actions/workflows/ci.yml/badge.svg)](https://github.com/alganet/wasi-sh/actions/workflows/ci.yml)
+
 Run **shell scripts in the browser** (and node) — busybox `ash` plus a set of
 coreutils, compiled to plain `wasm32-wasi`, fork-free. Pipes, command
 substitution, `grep`/`sed`/`awk`/`find`, `read -t` timing: a real
@@ -16,6 +19,15 @@ const { stdout, exitCode } = await run({
 
 That works on **any static host with no special headers** — non-interactive
 execution never blocks on the user, so it needs no `SharedArrayBuffer`.
+
+## Install
+
+```sh
+npm install wasi-sh
+```
+
+Zero dependencies. The `.wasm` ships inside the package, so there is nothing
+to fetch at runtime and no CDN to point at. Node 20+, or any modern browser.
 
 ## Two ways to use it
 
