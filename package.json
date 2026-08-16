@@ -4,6 +4,14 @@
   "description": "Run shell scripts in the browser — busybox ash + coreutils compiled to wasm32-wasi, fork-free",
   "license": "ISC",
   "author": "Alexandre Gomes Gaigalas <alganet@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alganet/wasi-sh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/alganet/wasi-sh/issues"
+  },
+  "homepage": "https://github.com/alganet/wasi-sh#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.mjs",
