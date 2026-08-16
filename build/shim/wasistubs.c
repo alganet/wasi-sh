@@ -205,7 +205,11 @@ long long __wasilibc_tell(int fd){ /* lseek(fd, 0, SEEK_CUR) fast path */
   if (e) { errno = e; return -1; }
   return (long long)pos;
 }
-int __wasilibc_fd_renumber(int fd,int newfd){ /* freopen's fd move (awk file args) */
+/* freopen's fd move (awk file args). Wrapped rather than defined outright:
+ * current wasi-libc ships its own __wasilibc_fd_renumber.o, and defining the
+ * bare name here collides with it at link time. --wrap sends every reference
+ * to this version and leaves libc's copy unreferenced. */
+int __wrap___wasilibc_fd_renumber(int fd,int newfd){
   if (dup2(fd,newfd) < 0) return -1;
   if (fd != newfd) close(fd);
   return 0;

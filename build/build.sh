@@ -33,8 +33,13 @@
 #                         and dies at startup ("Invalid argument").
 # - wasi-sdk ships real crt/libc files, so the zig cache-probing below is
 #   unnecessary there; but the setjmp rt.o must still come from wasi-libc's
-#   musl setjmp/wasm32/rt.c compiled with the EH flags (wasi-sdk does not
-#   ship it pre-built for the EH-sjlj configuration).
+#   musl setjmp/wasm32/rt.c compiled with the EH flags (nothing ships it
+#   pre-built for the EH-sjlj configuration). No current toolchain ships that
+#   source either, so it is fetched and pinned like the busybox tarball.
+# - Note that only zig works as a toolchain in practice: busybox's libbb.h
+#   needs netdb.h, paths.h, pwd.h, grp.h, sys/wait.h and termios.h, and zig
+#   supplies all six from lib/libc/include/generic-musl. The wasi-sdk sysroot
+#   has none of them, so that path needs vendored headers to build.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 pkg=$(cd "$here/.." && pwd)
@@ -44,6 +49,11 @@ BB_VER=1.38.0
 BB_TARBALL="busybox-${BB_VER}.tar.bz2"
 BB_SHA256=34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2
 BB="$work/busybox-${BB_VER}"
+
+# Fallback source for musl's setjmp rt.c — see the rt.o step below for why it
+# is fetched rather than taken from the toolchain.
+WASI_LIBC_TAG=wasi-sdk-33
+RT_SHA256=1d12042174aa55f4b24b2df235b1a0b72893a6cb791f297a4d772e543123e1b7
 
 PLAIN=no; TOOLCHAIN=auto; KEEP=no
 while [ $# -gt 0 ]; do
@@ -169,8 +179,7 @@ done
 zcc -O2 -c "$SHIM/wasistubs.c" -o "$work/wasistubs.o"
 zcc -O2 -c "$SHIM/ppoll.c"     -o "$work/ppoll.o"
 if [ "$TOOLCHAIN" = ziglang ]; then
-	ZLROOT=$(python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))")
-	RT_SRC="$ZLROOT/lib/libc/wasi/libc-top-half/musl/src/setjmp/wasm32/rt.c"
+	ZLROOT=$(python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))")/lib
 elif [ "$TOOLCHAIN" = zig ]; then
 	# `zig env` prints JSON (<=0.13: "lib_dir": "...") or ZON (0.14+:
 	# .lib_dir = "..."); match either.
@@ -180,12 +189,26 @@ elif [ "$TOOLCHAIN" = zig ]; then
 	if [ -z "$ZLROOT" ] || [ ! -d "$ZLROOT" ]; then
 		echo "could not locate zig's lib dir via 'zig env'" >&2; exit 1
 	fi
-	RT_SRC="$ZLROOT/libc/wasi/libc-top-half/musl/src/setjmp/wasm32/rt.c"
 else
-	# wasi-sdk: rt.c is not shipped; fetch the matching wasi-libc source once.
+	ZLROOT=""
+fi
+
+# rt.c used to come out of the toolchain's own wasi-libc tree, but no shipping
+# toolchain still has it: zig 0.13/0.14/0.15 bundle only a trimmed musl subset
+# with no src/setjmp at all, and wasi-sdk never shipped it (it has no prebuilt
+# rt.o for the EH-sjlj configuration either). So prefer the in-tree copy if a
+# toolchain ever carries one again, and otherwise fetch it — pinned to a tag
+# and SHA-256 verified, like the busybox tarball above, so the build stays
+# reproducible.
+RT_SRC="$ZLROOT/libc/wasi/libc-top-half/musl/src/setjmp/wasm32/rt.c"
+if [ -z "$ZLROOT" ] || [ ! -f "$RT_SRC" ]; then
 	RT_SRC="$work/rt.c"
-	[ -f "$RT_SRC" ] || curl -sSfLo "$RT_SRC" \
-	  "https://raw.githubusercontent.com/WebAssembly/wasi-libc/main/libc-top-half/musl/src/setjmp/wasm32/rt.c"
+	if [ ! -f "$RT_SRC" ]; then
+		echo "fetching setjmp rt.c…"
+		curl -sSfLo "$RT_SRC" \
+		  "https://raw.githubusercontent.com/WebAssembly/wasi-libc/${WASI_LIBC_TAG}/libc-top-half/musl/src/setjmp/wasm32/rt.c"
+	fi
+	echo "$RT_SHA256  $RT_SRC" | shasum -a 256 -c -
 fi
 zcc -O2 -c "$RT_SRC" -o "$work/rt.o"
 
@@ -224,6 +247,7 @@ fi
 #   (its poll() call is wrapped as well).
 OUT="$work/busybox.wasm"
 $WASM_LD --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
+  --wrap __wasilibc_fd_renumber \
   "$CRT" "$BB/libbb/appletlib.o" "$BB/applets/applets.o" \
   $(find "$BB" -name built-in.o | sort) $(find "$BB" -name lib.a | sort) \
   "$work/wasistubs.o" "$work/ppoll.o" "$work/rt.o" \
