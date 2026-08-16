@@ -269,6 +269,9 @@ if (r.stdout !== 'ok\nhi\n9\n3\nn=127\ns=127\n' || r.exitCode !== 0) {
 console.log('smoke test passed:', JSON.stringify(r.stdout));
 "
 
+# dist/ is not committed, so a clean checkout does not have it — create it
+# rather than assuming a previous build or a tracked file left it behind.
+mkdir -p "$pkg/dist"
 cp "$OUT" "$pkg/dist/busybox.wasm"
 echo "-> installed $pkg/dist/busybox.wasm"
 [ "$KEEP" = yes ] || rm -rf "$BB"
