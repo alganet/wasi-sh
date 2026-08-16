@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Bare semver, no `v` prefix. Prereleases are deliberately excluded.
+      - '[0-9]+\.[0-9]+\.[0-9]+'
+
+# Never cancel a release mid-publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Cheap and first: a tag that disagrees with package.json should fail in
+  # seconds, not after a full busybox compile.
+  verify-version:
+    name: Verify tag matches package.json version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - run: |
+          TAG_VERSION="${GITHUB_REF_NAME}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+
+  build:
+    needs: verify-version
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Must match the environment configured for the trusted publisher on npm.
+    environment: release
+    permissions:
+      contents: read
+      # Trusted Publishing: npm authenticates by exchanging a GitHub OIDC
+      # token, so the job must be allowed to mint one. Without this the publish
+      # fails with no token to fall back on.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing needs npm >= 11.5.1; the npm bundled with node 22 is
+      # not guaranteed to be that new.
+      - name: Use an npm that supports Trusted Publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # The tarball is cut from the artifact the build job already smoke-tested
+      # and ran the suite against, rather than from a second, unverified build
+      # of the same commit. Everything else in "files" comes from the checkout.
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Verify package contents
+        run: |
+          [ -s dist/busybox.wasm ] || { echo "::error::missing or empty dist/busybox.wasm"; exit 1; }
+          npm pack --dry-run
+
+      # No NODE_AUTH_TOKEN: authentication is the OIDC exchange above, and
+      # provenance is attested automatically under Trusted Publishing. The
+      # package is unscoped, so public access is already the default.
+      - name: Publish
+        run: npm publish
