@@ -336,11 +336,25 @@ Interactive semantics are testable headless too — drive a
 
 `dist/busybox.wasm` is busybox 1.38.0 (`ash` + the applet set above), built
 by `build/build.sh` — pinned tarball + SHA-256, the fork-free patch, an
-ash-plus-applets config, and a `wasm32-wasi` toolchain (zig or wasi-sdk; see
-the script and [ARCHITECTURE.md](ARCHITECTURE.md) for the flag rationale).
-`npm run build:wasm` rebuilds it and refuses to install a binary that fails
-its smoke test. After a rebuild, run `npm test` and the downstream consumer
-checks before trusting it.
+ash-plus-applets config, and a `wasm32-wasi` toolchain (see the script and
+[ARCHITECTURE.md](ARCHITECTURE.md) for the flag rationale).
+
+It ships in the npm package but is **not committed to git**, so a fresh
+clone has to build before it can test:
+
+```sh
+pip install ziglang==0.15.1      # or install zig itself
+npm run build:wasm
+npm test
+```
+
+`build:wasm` refuses to install a binary that fails its smoke test. After a
+rebuild, run `npm test` and the downstream consumer checks before trusting
+it.
+
+The toolchain has to be zig: busybox's `libbb.h` needs `netdb.h`, `paths.h`,
+`pwd.h`, `grp.h`, `sys/wait.h` and `termios.h`, and zig supplies all six from
+its `generic-musl` include tree, which the wasi-sdk sysroot does not ship.
 
 ## Licensing
 

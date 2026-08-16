@@ -1,6 +1,10 @@
 # build workspace (tarball, extracted tree, objects)
 /build/work/
 
+# build output — not committed; produced by `npm run build:wasm` or by CI,
+# and packed into the npm tarball from a CI-built, smoke-tested artifact
+/dist/
+
 # node
 node_modules/
 package-lock.json

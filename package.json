@@ -37,9 +37,11 @@
     "./src/worker.mjs"
   ],
   "scripts": {
+    "pretest": "[ -s dist/busybox.wasm ] || { echo 'dist/busybox.wasm is missing — run: npm run build:wasm' >&2; exit 1; }",
     "test": "node --test",
     "serve": "node scripts/serve.mjs",
-    "build:wasm": "build/build.sh"
+    "build:wasm": "build/build.sh",
+    "prepack": "[ -s dist/busybox.wasm ] || { echo 'refusing to pack without dist/busybox.wasm — run: npm run build:wasm' >&2; exit 1; }"
   },
   "engines": {
     "node": ">=20"
