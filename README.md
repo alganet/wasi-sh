@@ -364,6 +364,11 @@ npm test
 rebuild, run `npm test` and the downstream consumer checks before trusting
 it.
 
+The shipped module is stripped of DWARF — that was two thirds of its size —
+but keeps its `name` section, so wasm stack traces still symbolicate. Pass
+`build/build.sh --debug` if you need the debug info while working on the
+shim.
+
 The toolchain has to be zig: busybox's `libbb.h` needs `netdb.h`, `paths.h`,
 `pwd.h`, `grp.h`, `sys/wait.h` and `termios.h`, and zig supplies all six from
 its `generic-musl` include tree, which the wasi-sdk sysroot does not ship.

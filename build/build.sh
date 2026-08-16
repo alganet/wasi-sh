@@ -11,6 +11,7 @@
 #                wasi-sdk = $WASI_SDK_PATH/bin/clang      (documented variant;
 #                           same flags, simpler link — see notes below)
 #   --keep       keep build/work/ around for inspection
+#   --debug      keep DWARF in the output (see the strip note at the link)
 #
 # Everything is pinned and self-contained: the busybox tarball is fetched and
 # SHA-256-verified, sources are patched from a pristine extract, and the
@@ -55,12 +56,13 @@ BB="$work/busybox-${BB_VER}"
 WASI_LIBC_TAG=wasi-sdk-33
 RT_SHA256=1d12042174aa55f4b24b2df235b1a0b72893a6cb791f297a4d772e543123e1b7
 
-PLAIN=no; TOOLCHAIN=auto; KEEP=no
+PLAIN=no; TOOLCHAIN=auto; KEEP=no; DEBUG=no
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--plain) PLAIN=yes;;
 		--toolchain) TOOLCHAIN="$2"; shift;;
 		--keep) KEEP=yes;;
+		--debug) DEBUG=yes;;
 		*) echo "unknown arg: $1" >&2; exit 2;;
 	esac
 	shift
@@ -245,9 +247,17 @@ fi
 #   waits in poll(); __wrap_poll runs winch_dispatch() after every poll so a
 #   host-posted resize fires ash's captured WINCH handler. Covers ppoll.c too
 #   (its poll() call is wrapped as well).
+#
+# --strip-debug: DWARF dominated this binary — about 1.05 MB of a 1.55 MB
+#   module, two thirds of what every browser had to download, for debug info
+#   describing busybox internals that no consumer of this package steps
+#   through. It also embedded the absolute build paths of whoever ran the
+#   script. The `name` section is deliberately kept (~15 KB): it costs little
+#   and keeps wasm stack traces readable. Build with --debug to keep DWARF.
 OUT="$work/busybox.wasm"
 $WASM_LD --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
   --wrap __wasilibc_fd_renumber \
+  $([ "$DEBUG" = yes ] || echo --strip-debug) \
   "$CRT" "$BB/libbb/appletlib.o" "$BB/applets/applets.o" \
   $(find "$BB" -name built-in.o | sort) $(find "$BB" -name lib.a | sort) \
   "$work/wasistubs.o" "$work/ppoll.o" "$work/rt.o" \
