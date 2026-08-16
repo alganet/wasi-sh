@@ -1,0 +1,113 @@
+# The single build. CI and the npm release both call this instead of each
+# carrying their own copy: a tag would otherwise recompile busybox from scratch
+# a second time and publish a binary no test had ever run against.
+name: Build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    # A full busybox compile, not a six-hour job; GitHub's default would sit on
+    # a runner all afternoon if the link ever hangs.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # build.sh supports `--toolchain ziglang` (`python3 -m ziglang`), so the
+      # wasm32-wasi toolchain is one pip install and no third-party action.
+      # zig specifically, not wasi-sdk: busybox's libbb.h needs netdb.h,
+      # paths.h, pwd.h, grp.h, sys/wait.h and termios.h, and only zig supplies
+      # them (lib/libc/include/generic-musl). The pin is deliberate — the
+      # script probes zig's crt/libc cache paths, which move between releases.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-ziglang-0.15.1
+
+      # The retry is not superstition: a truncated wheel in the pip cache fails
+      # the hash check, and because the cache key is fixed it would fail every
+      # subsequent run the same way. Re-fetching without the cache clears it.
+      - name: Install the wasm32-wasi toolchain
+        run: |
+          python3 -m pip install --disable-pip-version-check ziglang==0.15.1 \
+            || python3 -m pip install --disable-pip-version-check --no-cache-dir ziglang==0.15.1
+          python3 -m ziglang version
+
+      # Just the two downloads: build.sh deletes the extracted tree on the way
+      # out, so caching the rest would only preserve stale object files. A
+      # stale entry is harmless — both files are SHA-256 verified on every run
+      # and re-fetched on mismatch. The key tracks build.sh because every pin
+      # (BB_VER, BB_SHA256, WASI_LIBC_TAG, RT_SHA256) lives in it.
+      - name: Cache downloaded sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/work/*.tar.bz2
+            build/work/rt.c
+          key: sources-${{ hashFiles('build/build.sh') }}
+
+      # Fetches, verifies, patches, compiles, links by hand, and refuses to
+      # install a binary that fails its own smoke test.
+      - name: Build busybox.wasm
+        run: ./build/build.sh --toolchain ziglang
+
+      # The busybox compile is intentionally allowed to fail its final link
+      # (build.sh does that one by hand), so the real compile errors only exist
+      # in this file — and only inside the runner.
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: make-log
+          path: build/work/make.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Report artifact size
+        run: |
+          raw=$(wc -c < dist/busybox.wasm)
+          gz=$(gzip -c dist/busybox.wasm | wc -c)
+          echo "| dist/busybox.wasm | bytes |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ---: |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| raw | $raw |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| gzipped | $gz |" >> "$GITHUB_STEP_SUMMARY"
+
+      # No install step: the package has zero dependencies and no lockfile, so
+      # `npm ci` would fail and `npm install` would do nothing.
+      - name: Test
+        run: npm test
+
+      # package.json promises dist/busybox.wasm through the "./busybox.wasm"
+      # export; make sure it is actually in the tarball before anything
+      # downstream publishes it.
+      - name: Verify package contents
+        run: |
+          [ -s dist/busybox.wasm ] || { echo "::error::missing or empty dist/busybox.wasm"; exit 1; }
+          npm pack --dry-run
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
