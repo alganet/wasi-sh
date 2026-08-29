@@ -8,5 +8,6 @@ export { WasiShim, WasiExit } from './shim.mjs';
 export type {
   WasiShimOptions, ShimInput, Files,
   HostBuiltins, BuiltinMap, BuiltinHandler, BuiltinContext, HostFs,
+  HostPort, HostVerbMap, HostVerb,
 } from './shim.mjs';
 export { createStdinRing, RingWriter, RingReader, RingOverflowError } from './ring.mjs';

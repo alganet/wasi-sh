@@ -2,14 +2,20 @@
 // bare WebAssembly.Memory with no wasm module, calling the WASI imports the
 // way the guest would — so they pin the JS side even when dist/busybox.wasm
 // predates the feature. The end-to-end shell dispatch lives in scripts.test.mjs.
-import { test } from 'node:test';
+import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { WasiShim } from '../src/shim.mjs';
+import { compileWasm, runScript } from '../src/node.mjs';
+import { hostPort, resolveHost } from '../src/options.mjs';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 const EPERM = 63, EIO = 29, EINVAL = 28;
+
+let wasm;
+before(async () => { wasm = await compileWasm(); });
+const sh = (script, opts = {}) => runScript(script, { wasm, env: { LC_ALL: 'C' }, ...opts });
 
 function makeShim(host) {
   const out = { stderr: [] };
@@ -55,6 +61,39 @@ function verb(t, line) {
   assert.equal(writeFd(t, openHost(t), line).errno, 0, `write(${JSON.stringify(line)})`);
   return readFd(t, openHost(t)).text;
 }
+
+// ─── the normalizer ──────────────────────────────────────────────────────────
+
+test('hostPort: a verb map becomes a port', () => {
+  const p = hostPort({ 'clipboard.read': (payload, verb) => `${verb}:${payload.length}` });
+  assert.equal(p.request('clipboard.read', new Uint8Array(3)), 'clipboard.read:3');
+  assert.throws(() => p.request('clipboard.write', new Uint8Array(0)), /no such verb/);
+});
+
+test('hostPort: an object that already has request() passes through untouched', () => {
+  const port = { request: () => 'x' };
+  assert.equal(hostPort(port), port, 'a dynamic namespace must not be wrapped');
+});
+
+// Without hasOwn every Object.prototype member is a reachable verb, and
+// `toString` would dispatch into Object.prototype.
+test('hostPort: inherited properties are not verbs', () => {
+  const p = hostPort({ real: () => '' });
+  for (const name of ['toString', 'constructor', 'valueOf', 'hasOwnProperty']) {
+    assert.throws(() => p.request(name, new Uint8Array(0)), /no such verb/, name);
+  }
+});
+
+test('resolveHost: a factory is awaited once, so setup happens before the shell', async () => {
+  let boots = 0;
+  const p = await resolveHost(async () => { boots++; return { hi: () => 'there' }; });
+  assert.equal(boots, 1);
+  assert.equal(p.request('hi', new Uint8Array(0)), 'there');
+});
+
+test('resolveHost: undefined stays undefined (capability absent by default)', async () => {
+  assert.equal(await resolveHost(undefined), undefined);
+});
 
 // ─── the capability ──────────────────────────────────────────────────────────
 
@@ -228,6 +267,89 @@ test('a diagnostic cannot re-enter the port through a redirected fd 2', () => {
   assert.equal(t.shim.imports().env.__host_dup2(hostFd, 2), 2, 'fd 2 is now /dev/host');
   assert.equal(writeFd(t, hostFd, 'bad\n').errno, EIO);
   assert.deepEqual(seen, ['bad'], 'the error message did not become a second request');
+});
+
+// ─── through a real shell ────────────────────────────────────────────────────
+// The suite above drives the imports by hand; these run busybox ash against the
+// shipped wasm, which is what pins the composition — redirections, $(…), $? and
+// stdio buffering are all somebody else's code.
+
+test('a script reaches the port and reads the answer back', async () => {
+  const clipboard = { text: 'copied earlier' };
+  const r = await sh(
+    "printf 'clipboard.read\\n' > /dev/host\n"
+    + 'paste=$(cat /dev/host)\n'
+    + 'echo "got [$paste]"\n',
+    { host: { 'clipboard.read': () => clipboard.text } },
+  );
+  assert.equal(r.stdout, 'got [copied earlier]\n');
+  assert.equal(r.exitCode, 0);
+});
+
+test('a payload crosses on the request line', async () => {
+  let wrote = null;
+  const r = await sh(
+    "echo 'clipboard.write the whole line' > /dev/host\n"
+    + 'echo done\n',
+    { host: { 'clipboard.write': (payload) => { wrote = dec.decode(payload); } } },
+  );
+  assert.equal(wrote, 'the whole line');
+  assert.equal(r.stdout, 'done\n');
+});
+
+// A map is the 95% case, and an unregistered verb has to be a failure a script
+// can see rather than an empty answer that looks like a verb with nothing to say.
+test('an unregistered verb fails the script, not silently', async () => {
+  const r = await sh(
+    'echo nope > /dev/host || echo refused\n',
+    { host: { yes: () => 'ok' } },
+  );
+  assert.match(r.stdout, /refused/);
+  assert.match(r.stderr, /\/dev\/host: nope: no such verb/);
+  assert.match(r.stderr, /write error/, 'the shell reports the failed write too');
+});
+
+// Whether the write's STATUS carries the failure is the writer's business, not
+// the port's: `echo` is an ash builtin and checks its write, while `printf` is a
+// busybox applet writing through buffered stdio and never looks. The errno
+// reaches the guest either way and the diagnostic always lands, so the reliable
+// signal is the RESPONSE — a failed request leaves nothing to read.
+test('a busybox applet may not check the write; the response still tells', async () => {
+  const r = await sh(
+    "printf 'nope\\n' > /dev/host; echo \"status=$?\"\n"
+    + 'echo "answer=[$(cat /dev/host)]"\n',
+    { host: { yes: () => 'ok' } },
+  );
+  assert.equal(r.stdout, 'status=0\nanswer=[]\n', 'printf`s stdio swallowed it');
+  assert.match(r.stderr, /no such verb/, 'but the port said why');
+});
+
+// Capabilities are injected, never ambient: the default port is nothing.
+test('with no port the script is refused at the device, and can say so', async () => {
+  const r = await sh("cat /dev/host 2>/dev/null || echo 'no port here'");
+  assert.equal(r.stdout, 'no port here\n');
+});
+
+test('a verb that throws costs one command, not the session', async () => {
+  const r = await sh(
+    "echo boom > /dev/host || echo 'write failed'\n"
+    + 'echo fine > /dev/host\n'
+    + 'cat /dev/host\n',
+    { host: { boom: () => { throw new Error('the host said no'); }, fine: () => 'still here\n' } },
+  );
+  assert.match(r.stdout, /write failed/);
+  assert.match(r.stdout, /still here/);
+  assert.match(r.stderr, /the host said no/);
+});
+
+// A capability object cannot be structured-cloned, so a stock Worker cannot be
+// handed one — and silently running without the port would be the worst answer.
+test('run({ host }) into a stock worker refuses instead of dropping it', async () => {
+  const { run } = await import('../src/run.mjs');
+  await assert.rejects(
+    () => run({ command: 'true', inline: false, host: { x: () => '' } }),
+    /serve\(\{ host \}\)/,
+  );
 });
 
 // ─── the overlay still owns the name ─────────────────────────────────────────

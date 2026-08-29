@@ -5,7 +5,7 @@
 // postMessage Worker by default; pass inline:true (the node default) to run
 // on the calling thread instead.
 import { WasiShim, WasiExit } from './shim.mjs';
-import { resolveArgv, mergeEnv, resolveWasm, resolveWasmForWorker, fixedInput, toBytes, resolveBuiltins } from './options.mjs';
+import { resolveArgv, mergeEnv, resolveWasm, resolveWasmForWorker, fixedInput, toBytes, resolveBuiltins, resolveHost } from './options.mjs';
 
 const DEC = new TextDecoder();
 
@@ -35,6 +35,7 @@ async function runInline(options) {
     stderr: sink('stderr'),
     input: fixedInput(options.stdin),
     builtins: await resolveBuiltins(options.builtins),
+    host: await resolveHost(options.host),
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
   shim.bindMemory(instance.exports.memory);
@@ -76,6 +77,14 @@ async function runInWorker(options) {
       'run({ fs }) needs a worker that registers the store: a filesystem cannot '
       + 'be structured-cloned into a Worker. Either pass inline:true to run on '
       + "the calling thread, or call serve({ fs }) from 'wasi-sh/worker' in a "
+      + 'worker module and pass it as workerUrl.'
+    );
+  }
+  if (options.host && !options.worker && !options.workerUrl) {
+    throw new Error(
+      'run({ host }) needs a worker that registers the port: a capability object '
+      + 'cannot be structured-cloned into a Worker. Either pass inline:true to run '
+      + "on the calling thread, or call serve({ host }) from 'wasi-sh/worker' in a "
       + 'worker module and pass it as workerUrl.'
     );
   }
