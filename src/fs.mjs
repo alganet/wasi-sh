@@ -29,7 +29,7 @@
 //   - Open file descriptions. Offsets are ARGUMENTS here, so the `pos:{v}`
 //     cell that POSIX shares across dup/dup2 never reaches a store and cannot
 //     be got wrong by one.
-//   - Devices. /dev/null (and, later, the host port) are the shim's overlay,
+//   - Devices. /dev/null and /dev/host are the shim's overlay,
 //     so mounting a store never means writing device nodes into somebody's
 //     real directory.
 //

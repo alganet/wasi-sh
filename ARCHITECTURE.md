@@ -30,7 +30,8 @@ that back busybox's fork-free machinery (`__host_pipe`/`__host_dup`/`__host_dup2
 /`__host_trace`), two for terminal geometry (`__host_winsize`/`__host_winch`,
 see "Terminal resize" below), and two for host builtins
 (`__host_builtin_lookup`/`__host_builtin_run`, see "Host builtins" below).
-Eight in total.
+Eight in total — and still eight with the host port, which is a device rather
+than an import (see "The host port" below).
 
 **Filesystem.** A pluggable store (see "The `fs` contract" below), defaulting
 to `memoryFs(files)` — so a shim with no `fs` is the sealed in-memory sandbox
@@ -42,12 +43,14 @@ node gets a **unique inode** — busybox `find`/`cp -r` detect directory loops
 via `dev:ino` pairs, and a constant ino makes every directory look like a
 recursion.
 
-**Devices are the shim's, not the store's.** `/dev/null` lives in an overlay
-above the store, and `/dev` is shadowed *whole* rather than entry by entry.
-Two reasons: mounting a real directory must not mean writing device nodes into
-somebody's project, and a name the overlay hides must not be creatable
-underneath it — otherwise `mv work.txt /dev/null` writes the file to a path
-`ls /dev` will never show and reports success.
+**Devices are the shim's, not the store's.** `/dev/null` and `/dev/host` live
+in an overlay above the store, and `/dev` is shadowed *whole* rather than entry
+by entry. Two reasons: mounting a real directory must not mean writing device
+nodes into somebody's project, and a name the overlay hides must not be
+creatable underneath it — otherwise `mv work.txt /dev/null` writes the file to
+a path `ls /dev` will never show and reports success. One registration
+(`addDevice`) owns the map entry *and* the inode, so listing, stat and open
+cannot answer for different sets of names.
 
 **A store failure is an errno, never an exception.** A JS exception thrown out
 of a wasm import unwinds the entire guest stack and the instance is dead — the
@@ -402,6 +405,80 @@ applet branch, so this is an asymmetry, and ~5 lines would close it),
 check), and `cmd &` / `(cmd)` (still `forkshell`). Async handlers are out of
 scope entirely — that would need a SAB request/response ring, a separate
 mechanism.
+
+## The host port (`/dev/host`)
+
+The fourth pluggable seam, beside `input`, `fs` and `builtins` — and the first
+aimed *outward*, at the browser rather than at the shell. One capability
+object, one virtual device, verbs instead of a hook per feature:
+
+```js
+spawn({ host: { request(verb, payloadBytes) { /* -> bytes */ } } })
+```
+```sh
+printf 'clipboard.read\n' > /dev/host
+paste=$(cat /dev/host)
+```
+
+**Nothing in the wasm changes**, which is the point. Guest → host synchronously
+is the direction that was already solved — a host builtin is exactly that shape
+— so the port needs no shared memory, no `Atomics.wait`, no cross-origin
+isolation and no new import. `/dev/host` is an ordinary path reached through
+`path_open`, `fd_read` and `fd_write`, and a script talks to it with `echo` and
+`cat`.
+
+**Framing is by line, not by write boundary**, because a write boundary is not
+one: stdio splits a long payload at its buffer size and the guest's own
+`printf` decides where. A verb runs to the first space; the rest of the line is
+the payload, verbatim. A blank line is nothing; a line with no verb fails the
+write. An unterminated line is capped — `yes > /dev/host` completes no request
+and would otherwise grow a buffer until the tab dies.
+
+**The buffers belong to the shim, not to the fd.** A request and its answer are
+two commands, so two opens — and a fork-free shell restores a redirection with
+`dup2`, which replaces an fd's record without `fd_close` ever seeing it. Nothing
+per-descriptor could survive between the two halves of a single exchange.
+
+**Security is a property of the port.** No `host` and the device is still there,
+refusing every open with `EPERM`: *"this session did not grant it"* and *"this
+build has no port"* are different answers, and only the second should be
+indistinguishable from a name that does not exist. Refusing at open rather than
+at the first read matters too — a silent EOF reads as an empty answer. Hand
+over an object implementing only `clipboard.*` and that is the whole reachable
+surface; there is nothing shell-side to widen it, exactly as a read-only store
+is a read-only shell.
+
+**Containment mirrors the builtin path**, for the same reason: a JS exception
+out of a wasm import unwinds the entire guest stack and the instance is dead. A
+verb that throws, returns a thenable, or answers with something that is not
+bytes fails one write with `EIO`. Two details are specific to a device:
+
+- **Diagnostics go to the stderr *sink*, never through `writeFd(2)`.** fd 2 can
+  be redirected onto this very device (`cmd > /dev/host 2>/dev/host`), and an
+  error written there would re-enter the port in the middle of a dispatch. The
+  sink cannot be redirected, so there is no reentrancy to guard against.
+- **Payloads and responses are both copied.** A payload is a slice of the
+  guest's linear memory, which `memory.grow` can detach and the guest overwrites
+  immediately; a response may come from a handler's reused scratch buffer.
+
+**Whether a failure reaches `$?` is the writer's business, not the port's.**
+`echo` is an ash builtin and checks its write, so `echo verb > /dev/host` fails
+properly; `printf` is an applet writing through buffered stdio and never looks,
+so its status says 0 while the diagnostic still lands and the response is empty.
+The reliable signal is the response — the same stdio-owns-the-buffer family as
+a short-reading applet leaving bytes behind in a pipeline.
+
+**Devices got two capabilities for this**, both general: a device may refuse an
+open, and a device write may fail instead of every one being reported as
+delivered. Registration is `shim.addDevice(path, device)`, which assigns the
+inode itself so that `ls /dev`, stat and open can never describe different sets
+of names.
+
+**What this is not.** The port is outbound only. Nothing outside the worker can
+*initiate* anything: a live session is one synchronous `_start()` frame, so a
+`postMessage` to a running shell worker is not slow, it is undelivered. Inbound
+needs shared memory polled by the guest at a blocking point — the mechanism
+`winch` already uses at `__wrap_poll` — and that is a separate piece of work.
 
 ## Build recipe (`build/build.sh`)
 

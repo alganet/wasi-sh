@@ -307,6 +307,66 @@ is delivered to no one, and the shell would quietly run without your builtins;
 Working example: [`examples/host-builtins.html`](examples/host-builtins.html)
 and its [worker](examples/host-builtins.worker.mjs).
 
+## The host port: reaching outside the sandbox
+
+A host builtin extends the shell's *command* namespace. The **host port**
+extends what a script can reach *outside* it — the clipboard, the page around
+it, whatever you decide to hand over. One capability object, one virtual
+device, verbs instead of an option per feature:
+
+```js
+const { stdout } = await run({
+  inline: true,
+  script: "printf 'clipboard.read\\n' > /dev/host\n"
+        + 'echo "pasted: $(cat /dev/host)"\n',
+  host: {
+    'clipboard.read': () => navigator.clipboard.readText(),   // …if it were sync
+    'clipboard.write': (payload) => { stash(payload); },
+  },
+});
+```
+
+A request is a **line** written to `/dev/host` — a verb, optionally a space and
+a payload — and the answer is read back from the same name. A verb answers with
+a `Uint8Array`, a string, or nothing; the response is raw bytes, so the verb
+decides its own format.
+
+**Capabilities are injected, never ambient.** With no `host` the device is
+still there and every open is `EPERM`, so a script can tell *"this session did
+not grant it"* from *"no such thing"*:
+
+```sh
+if ! cat /dev/host >/dev/null 2>&1; then echo "no port here"; fi
+```
+
+Hand over an object implementing only `clipboard.*` and that is the entire
+surface a script can reach. There is nothing shell-side to widen it.
+
+**Verbs must be synchronous**, for the same reason builtins must: the guest is
+a wasm stack frame below the call. That is not the restriction it sounds like —
+the port is *outbound* only, and outbound synchronous is the direction that
+needs no shared memory, no `Atomics.wait` and no cross-origin isolation. Async
+setup goes in the factory form, which is awaited once before the shell starts.
+
+A verb that throws, returns a promise, or answers with something that is not
+bytes fails that one write and says why on stderr; the shell lives. Whether the
+failure reaches `$?` is the writer's business rather than the port's — `echo`
+is an ash builtin and checks its write, while `printf` goes through buffered
+stdio and never looks. **The reliable signal is the response**: a failed
+request leaves nothing to read.
+
+In a browser, register the port in the worker exactly as with builtins — a
+capability object cannot be structured-cloned either:
+
+```js
+serve({ async host() {
+  const db = await openDatabase();
+  return { 'db.get': (payload) => db.get(new TextDecoder().decode(payload)) };
+} });
+```
+
+This is also the only way an interactive `spawn()` session gets one.
+
 ## API
 
 | import | what |
@@ -318,7 +378,7 @@ and its [worker](examples/host-builtins.worker.mjs).
 | `wasi-sh/fs` | `memoryFs` and the `fs` contract — the filesystem, pluggable |
 | `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
-| `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register host builtins |
+| `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register builtins, a store, a host port |
 | `wasi-sh/busybox.wasm` | the shell binary |
 
 **Shared options** (`run` and `spawn`): `wasm` (URL \| string \| `Response` \|
@@ -328,9 +388,10 @@ argv — busybox is a multicall binary, argv[0] is `busybox`), `command`
 (`{ '/path': string | Uint8Array }`), `env` (merged over
 `PATH=/ HOME=/ TERM=xterm-256color LANG=C.UTF-8`).
 
-`run` also takes `fs` (a store; needs `inline: true`, since a live object
-cannot be structured-cloned into a Worker — off-thread runs and `spawn` use
-`serve({ fs })` in a worker module instead).
+`run` also takes `fs` (a store) and `host` (a capability port). Both need
+`inline: true`, since a live object cannot be structured-cloned into a Worker —
+off-thread runs and `spawn` use `serve({ fs, host })` in a worker module
+instead, and passing either to a stock worker throws and says so.
 
 **`fetchTree`** assembles `files` from URLs:
 
