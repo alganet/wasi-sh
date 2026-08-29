@@ -59,10 +59,14 @@ const FT = { CHAR:2, DIR:3, REG:4 };
 // Linux ENOENT 2 is WASI EACCES, which is how the same confusion in the other
 // direction made a missing file report "Permission denied" downstream. An
 // unrecognized failure is EIO: the store broke in a way we cannot name.
+// Every code fs.mjs's ERRNO publishes is here: a store told to speak that
+// vocabulary and then translated to EIO would be worse off for having been
+// precise.
 const WASI_ERRNO = {
   EPERM:63, ENOENT:44, EIO:29, EBADF:8, EACCES:2, EBUSY:10, EEXIST:20, EXDEV:75,
   ENOTDIR:54, EISDIR:31, EINVAL:28, ENFILE:41, EMFILE:33, ENOSPC:51, EROFS:69,
   EMLINK:34, ENOSYS:52, ENOTEMPTY:55, ELOOP:32, ENAMETOOLONG:37,
+  EAGAIN:6, ENOMEM:48, EFBIG:22, ESPIPE:70, EPIPE:64,
 };
 const wasiErrno = (err) => WASI_ERRNO[err && err.code] ?? E.IO;
 
@@ -220,8 +224,9 @@ export class WasiShim {
         // a path the overlay permanently hides — `mv work.txt /dev/null` would
         // look like it worked and lose the file.
         if(st.device||w.ownsPath(from)||w.ownsPath(to)) return E.PERM;
-        const tparent=w.statAt(parentOf(to));
-        if(!tparent||!isDir(tparent.mode)) return E.NOENT;
+        const tp=w.statOf(parentOf(to));
+        if(!tp.st) return tp.errno ?? E.NOENT;
+        if(!isDir(tp.st.mode)) return E.NOTDIR;
         if(from===to) return 0;
         // Renaming ONTO a name unlinks whatever was there, so fds open on the
         // destination need the same snapshot an unlink would give them —
@@ -241,7 +246,7 @@ export class WasiShim {
       // fstflags: 1=ATIM 2=ATIM_NOW 4=MTIM 8=MTIM_NOW; times are nanoseconds.
       path_filestat_set_times:(fd,flags,pathp,plen,atim,mtim,fstflags=0)=>{
         const path=w.resolve(fd,w.str(pathp,plen));
-        const st=w.statAt(path); if(!st) return E.NOENT;
+        const { st, errno }=w.statOf(path); if(!st) return errno ?? E.NOENT;
         if(st.device) return 0;
         const now=Date.now(), meta={};
         if(fstflags&1) meta.atimeMs=Number(atim)/1e6;
@@ -526,8 +531,11 @@ export class WasiShim {
         const data=f.gone.data.subarray(p.v,p.v+take); p.v+=take;
         return { data, errno:0 };
       }
-      const st=this.statAt(f.path);
-      if(!st) return { data:EMPTY, errno:0 };
+      // statOf, not statAt: a store that FAILED here is not an empty file. Read
+      // it as EOF and `cat` stops early, reporting success, having silently
+      // truncated whatever it was piping.
+      const { st, errno }=this.statOf(f.path);
+      if(!st) return { data:EMPTY, errno:(errno==null||errno===E.NOENT)?0:errno };
       const take=Math.min(max,st.size-p.v);
       if(take<=0) return { data:EMPTY, errno:0 };
       // The range is clamped to the size the store just reported, so a short
@@ -622,7 +630,12 @@ export class WasiShim {
         return true; },
       exists(p){ return !!w.statAt(abs(p)); },
       stat(p){ const st=w.statAt(abs(p)); return st?{ type:isDir(st.mode)?'dir':'file', size:st.size }:null; },
-      list(p){ const path=abs(p); const st=w.statAt(path); return st&&isDir(st.mode)?w.readdirAt(path):null; },
+      // The one store call here that can throw on its own: statAt already
+      // swallows a failure into null, and a builtin gets null from every other
+      // method rather than an exception through the middle of its run.
+      list(p){ const path=abs(p); const st=w.statAt(path);
+        if(!st||!isDir(st.mode)) return null;
+        try { return w.readdirAt(path); } catch { return null; } },
       mkdir(p){ return w.makeDir(abs(p))===0; },
       remove(p){ const path=abs(p); const st=w.statAt(path); return st?w.removeNode(path,isDir(st.mode))===0:false; },
     };

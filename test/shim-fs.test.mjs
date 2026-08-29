@@ -409,3 +409,60 @@ test('a failing flush is reported rather than swallowed', () => {
   assert.throws(() => t.p1.proc_exit(3), (e) => e.code === 3, 'the exit still happens');
   assert.match(err, /flushing the filesystem failed: disk gone/);
 });
+
+test('a store that fails mid-read reports it instead of ending the file', () => {
+  // The read path stats to learn the size, and a failed stat is not an empty
+  // file. Reading it as EOF makes `cat`/`$(...)` stop at whatever they had and
+  // exit 0 — a truncation the shell has no way to notice. The open must
+  // succeed first, so the failure has to arrive with the fd already in hand.
+  const base = memoryFs({ '/f.txt': 'abcdef' });
+  let opened = false;
+  const flaky = wrapStore(base, {
+    statSync: (path) => { if (opened) throw fsError('EIO', path); return base.statSync(path); },
+  });
+  const t = makeShim({ fs: flaky });
+  const fd = openPath(t, '/f.txt');
+  opened = true;
+  assert.equal(readFd(t, fd).errno, 29 /* EIO */, 'the read fails loudly');
+});
+
+test('a store failure under a rename target is not reported as ENOENT', () => {
+  // `mv a b` stats b's parent to check it is a directory. A store that fails
+  // that lookup used to answer "no such file or directory", which describes a
+  // store that is merely unreachable as one that is definitely empty.
+  const base = memoryFs({ '/a.txt': 'x' });
+  const guarded = wrapStore(base, {
+    statSync: (path) => { if (path === '/locked') throw fsError('EACCES', path); return base.statSync(path); },
+  });
+  const t = makeShim({ fs: guarded });
+  const [pf, lf] = putStr(t, 0x100, '/a.txt');
+  const [pt, lt] = putStr(t, 0x180, '/locked/b.txt');
+  assert.equal(t.p1.path_rename(3, pf, lf, 3, pt, lt), 2 /* WASI EACCES */);
+});
+
+test('renaming into a non-directory is ENOTDIR, not ENOENT', () => {
+  const t = makeShim({ files: { '/a.txt': 'x', '/file': 'y' } });
+  const [pf, lf] = putStr(t, 0x100, '/a.txt');
+  const [pt, lt] = putStr(t, 0x180, '/file/b.txt');
+  assert.equal(t.p1.path_rename(3, pf, lf, 3, pt, lt), 54 /* ENOTDIR */);
+});
+
+test('utimes on a store that fails the lookup keeps the store`s reason', () => {
+  const guarded = wrapStore(memoryFs({ '/f.txt': 'x' }), {
+    statSync: (path) => { throw fsError('EACCES', path); },
+  });
+  const t = makeShim({ fs: guarded });
+  const [p_, l_] = putStr(t, 0x100, '/f.txt');
+  assert.equal(t.p1.path_filestat_set_times(3, 0, p_, l_, 0n, 0n, 4), 2 /* EACCES */);
+});
+
+test('a host builtin sees null from fs.list(), not an exception', () => {
+  // Every other ctx.fs method answers a broken store with null/false; list()
+  // reached readdirSync unguarded, so a failure there unwound the guest.
+  const base = memoryFs({ '/d/f': 'x' });
+  const broken = wrapStore(base, { readdirSync: () => { throw fsError('EIO', '/d'); } });
+  const t = makeShim({ fs: broken });
+  const fs = t.shim.hostFs('/');
+  assert.equal(fs.list('/d'), null);
+  assert.equal(fs.list('/nope'), null, 'and a missing path is still null');
+});
