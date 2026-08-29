@@ -91,6 +91,12 @@ const wasiErrno = (err) => WASI_ERRNO[err && err.code] ?? E.IO;
 const DEV_DEV = 2n;
 const DEV_DIR_INO = 1;
 const DEV_NULL = { read:()=>EMPTY, write:()=>{} };
+// A device read answers with BYTES or with an ERRNO — the same two-shape
+// vocabulary its write already speaks (an errno to refuse, nothing to accept).
+// A number is an errno; anything else is data. Needed because a device that
+// can block has to be able to say EAGAIN, which bytes cannot express: an empty
+// read means EOF, and a device with more to come later must not claim it.
+const devRead = (r) => (typeof r === 'number' ? { data:EMPTY, errno:r } : { data:r||EMPTY, errno:0 });
 
 // What one exchange may hold: a request line waiting for its terminating
 // newline, and answers waiting to be read. Neither is a tuning knob — both are
@@ -314,7 +320,7 @@ export class WasiShim {
       poll_oneoff:(subs,events,nsubs,out)=>{
         // Parse subscriptions: a clock (timeout) and/or fd_read events. Events
         // must ECHO the subscription's userdata (WASI matches by it).
-        let timeoutMs=null, clockUD=null, stdinUD=null, otherRead=null;
+        let timeoutMs=null, clockUD=null, stdinUD=null, otherRead=null, devUD=null, devPoll=null;
         for(let i=0;i<nsubs;i++){ const s=subs+i*48; const ud=w.dv().getBigUint64(s,true); const tag=w.dv().getUint8(s+8);
           if(tag===0){ const t=w.dv().getBigUint64(s+24,true); timeoutMs=Number(t)/1e6; clockUD=ud; }
           else if(tag===1){ const fd=w.dv().getUint32(s+16,true);
@@ -327,12 +333,33 @@ export class WasiShim {
             // (`echo 1 | read -t 0.01`) mis-detected, forcing a 1s escape
             // timeout in the browser. Matches fd_read, which keys on type too.
             const f=w.fds.get(fd);
-            if(f && f.type==='stdin') stdinUD=ud; else otherRead=ud; } }
+            if(f && f.type==='stdin') stdinUD=ud;
+            // A device that offers poll() is ASKED, never assumed. Assuming is
+            // precisely how a queued resize went undelivered for as long as you
+            // cared to wait: poll answered "readable" at once, so the wait
+            // happened in the read that followed, where nothing wakes it. A
+            // device whose read can block is that same trap with a new door.
+            else if(f && f.device && f.device.poll){ devUD=ud; devPoll=f.device; }
+            else otherRead=ud; } }
         let nev=0;
         const emitRead=(ud)=>{ const ev=events+nev*32; w.dv().setBigUint64(ev,ud,true); w.dv().setUint16(ev+8,0,true); w.dv().setUint8(ev+10,1); w.dv().setBigUint64(ev+16,64n,true); w.dv().setUint16(ev+24,0,true); nev++; };
         const emitClock=(ud)=>{ const ev=events+nev*32; w.dv().setBigUint64(ev,ud,true); w.dv().setUint16(ev+8,0,true); w.dv().setUint8(ev+10,0); nev++; };
         // Non-stdin read subs (pipes/files) are regular fds -> always readable.
         if(otherRead!==null) emitRead(otherRead);
+        if(devPoll){
+          // Two parkable subscriptions in one poll would each want the whole
+          // wait, and nothing here ever asks for both — busybox's `read` polls
+          // one fd. So the device only parks when it is alone; beside stdin it
+          // is asked without waiting and stdin owns the park.
+          const ready=devPoll.poll((nev>0||stdinUD!==null)?0:timeoutMs);
+          if(ready) emitRead(devUD);
+          else if(timeoutMs!=null) emitClock(clockUD);
+          // Untimed, asked to park, and back with nothing: the device declined
+          // to wait. Report readable rather than no events at all — a poll that
+          // returns zero of both is a busy-spin, and the read behind it can
+          // still answer EOF or EAGAIN for itself.
+          else emitRead(devUD);
+        }
         if(stdinUD!==null){
           // A closed stdin is READABLE (POSIX: EOF wakes poll) — the caller
           // then reads and gets EOF instead of timing out forever.
@@ -361,7 +388,11 @@ export class WasiShim {
           // decide whether a handler wanted it (see build/shim/wasistubs.c).
           else if(nev===0 && canPark && w.input.winchPending()){ w.dv().setUint32(out,0,true); return E.INTR; }
           else emitRead(stdinUD); // no reason to wait: let the caller read (may EOF)
-        } else if(otherRead===null && timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
+        // A bare timeout, with nothing readable subscribed at all — sleep it
+        // out. A device sub counts as something: it has already done this
+        // poll's waiting and reported for itself, and sleeping the timeout a
+        // second time here would double it.
+        } else if(otherRead===null && devPoll===null && timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
         w.dv().setUint32(out,nev,true); return 0; },
     };
     return {
@@ -470,8 +501,9 @@ export class WasiShim {
   // written to a name that `ls /dev` will never show.
   ownsPath(path){ return ownsDevPath(path); }
   // Register a character device in the /dev overlay:
-  //   read(max)      -> bytes            write(bytes) -> errno | undefined
-  //   open()         -> errno | 0        (refuse the open; the port's EPERM)
+  //   read(max,owner,nonblock) -> bytes | errno    write(bytes,owner) -> errno | undefined
+  //   open() -> errno | 0   (refuse the open; the port's EPERM)
+  //   poll(ms) -> bool      (optional; true when a read would not block)
   // The inode is assigned HERE, which is the whole point — a device is one
   // entry in one map, so `ls /dev`, stat and open cannot describe different
   // sets of names.
@@ -491,9 +523,15 @@ export class WasiShim {
     // that may be written.
     this.devices.set(p,{
       ino:this.nextDevIno++,
-      read:typeof dev.read==='function'?(max,owner)=>dev.read(max,owner):()=>EMPTY,
+      read:typeof dev.read==='function'?(max,owner,nonblock)=>devRead(dev.read(max,owner,nonblock)):()=>({ data:EMPTY, errno:0 }),
       write:typeof dev.write==='function'?(b,owner)=>dev.write(b,owner):()=>E.PERM,
       open:typeof dev.open==='function'?()=>dev.open():null,
+      // Optional, and its PRESENCE is the signal — exactly as input.winchPending's
+      // is. A device with no poll() is readable the moment it is asked, which is
+      // true of everything the overlay held until now; one that can make a read
+      // WAIT has to be asked first, or the wait lands in the read that follows
+      // and nothing there can end it. See poll_oneoff.
+      poll:typeof dev.poll==='function'?(ms)=>!!dev.poll(ms):null,
     });
     return this;
   }
@@ -596,7 +634,9 @@ export class WasiShim {
     // shared across dup/dup2 exactly as POSIX shares an offset. A device that
     // holds per-exchange state (the host port does) needs to know which open
     // it is being spoken to through; one that does not can ignore it.
-    if(f.device) return { data:f.device.read(max,this.pos(f)), errno:0 };   // /dev/null EOF
+    // `nonblock` reaches the device too: one that can wait needs to know
+    // whether it may. /dev/null ignores both and reads EOF.
+    if(f.device) return f.device.read(max,this.pos(f),!!nonblock);
     if(f.type==='pipe'){
       const pi=this.pipes[f.pipe];
       if(!pi) return { data:EMPTY, errno:0 };

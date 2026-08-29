@@ -174,6 +174,95 @@ test('/dev/null reads EOF and discards writes', () => {
   assert.equal(w.n, 9, 'write claims success');
 });
 
+// ─── a device that can make a read wait ──────────────────────────────────────
+// Everything the overlay held until now answers instantly, so poll_oneoff could
+// call any non-stdin fd readable and be right. A device whose read BLOCKS turns
+// that into the trap S2 found for a resize: poll says readable, the wait happens
+// in the read behind it, and nothing there can end it.
+
+// Lay out `subs` ({ud, fd} for a read sub, {ud, ms} for a clock) and return the
+// events poll_oneoff produced.
+function pollOneoff(t, subs) {
+  const SUB = 48, EV = 32, at = 0xb00, out = 0xd00;
+  t.bytes().fill(0, at, at + subs.length * SUB);
+  subs.forEach((s, i) => {
+    const o = at + i * SUB;
+    t.view().setBigUint64(o, BigInt(s.ud), true);
+    const clock = s.fd === undefined;
+    t.view().setUint8(o + 8, clock ? 0 : 1);
+    if (clock) t.view().setBigUint64(o + 24, BigInt(Math.round(s.ms * 1e6)), true);
+    else t.view().setUint32(o + 16, s.fd, true);
+  });
+  const errno = t.p1.poll_oneoff(at, out, subs.length, 0xf00);
+  const n = t.view().getUint32(0xf00, true);
+  const events = [];
+  for (let i = 0; i < n; i++) {
+    events.push({ ud: Number(t.view().getBigUint64(out + i * EV, true)), type: t.view().getUint8(out + i * EV + 10) });
+  }
+  return { errno, events };
+}
+
+test('a device offering poll() is asked, not assumed readable', () => {
+  const asked = [];
+  const t = makeShim();
+  t.shim.addDevice('/dev/slow', { read: () => 6 /* EAGAIN */, poll: (ms) => { asked.push(ms); return false; } });
+  const fd = openPath(t, '/dev/slow');
+  const r = pollOneoff(t, [{ ud: 7, fd }, { ud: 9, ms: 50 }]);
+  assert.deepEqual(asked, [50], 'the device got the timeout to wait out');
+  assert.deepEqual(r.events, [{ ud: 9, type: 0 }], 'the clock fired; the fd was never called readable');
+});
+
+test('a device that says it is ready is reported readable', () => {
+  const t = makeShim();
+  t.shim.addDevice('/dev/quick', { read: () => enc.encode('hi'), poll: () => true });
+  const fd = openPath(t, '/dev/quick');
+  assert.deepEqual(pollOneoff(t, [{ ud: 3, fd }, { ud: 4, ms: 50 }]).events, [{ ud: 3, type: 1 }]);
+});
+
+// The half that must NOT change: /dev/null and /dev/host answer the moment they
+// are asked, so the absence of poll() has to keep meaning "readable now".
+test('a device with no poll() is readable at once, as it always was', () => {
+  const t = makeShim();
+  const fd = openPath(t, '/dev/null');
+  assert.deepEqual(pollOneoff(t, [{ ud: 1, fd }, { ud: 2, ms: 5000 }]).events[0], { ud: 1, type: 1 });
+});
+
+// Two parkable subscriptions in one poll would each want the whole wait. Nothing
+// busybox does asks for both, and stdin is the one with a signal path, so it
+// owns the park and the device is asked without waiting.
+test('a device beside stdin is asked without waiting', () => {
+  const asked = [];
+  const t = makeShim({ input: { pollReadable: () => false, read: () => new Uint8Array(0), closed: () => true } });
+  t.shim.addDevice('/dev/slow', { read: () => 6, poll: (ms) => { asked.push(ms); return false; } });
+  const fd = openPath(t, '/dev/slow');
+  pollOneoff(t, [{ ud: 1, fd }, { ud: 2, fd: 0 }, { ud: 3, ms: 20 }]);
+  assert.deepEqual(asked, [0]);
+});
+
+test('a device read answers with bytes or with an errno', () => {
+  const t = makeShim();
+  let armed = false;
+  t.shim.addDevice('/dev/late', { read: () => (armed ? enc.encode('at last') : 6 /* EAGAIN */) });
+  const fd = openPath(t, '/dev/late');
+  const first = readFd(t, fd);
+  assert.equal(first.errno, 6, 'an errno is not an empty read — empty already means EOF');
+  assert.equal(first.n, 0);
+  armed = true;
+  assert.equal(dec.decode(readFd(t, fd).data), 'at last');
+});
+
+// A blocking device has to know whether it may block, the same way stdin does.
+test('a device read is told whether the fd is non-blocking', () => {
+  const seen = [];
+  const t = makeShim();
+  t.shim.addDevice('/dev/flag', { read: (max, owner, nonblock) => { seen.push(nonblock); return enc.encode('x'); } });
+  const fd = openPath(t, '/dev/flag');
+  readFd(t, fd);
+  t.p1.fd_fdstat_set_flags(fd, 4 /* O_NONBLOCK */);
+  readFd(t, fd);
+  assert.deepEqual(seen, [false, true]);
+});
+
 test('fd_readdir walks children with cookies and d_type', () => {
   const t = makeShim({ files: { '/dir/a.txt': 'a', '/dir/b.txt': 'b' } });
   const fd = openPath(t, '/dir');
