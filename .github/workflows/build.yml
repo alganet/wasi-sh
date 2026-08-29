@@ -92,8 +92,21 @@ jobs:
           echo "| raw | $raw |" >> "$GITHUB_STEP_SUMMARY"
           echo "| gzipped | $gz |" >> "$GITHUB_STEP_SUMMARY"
 
-      # No install step: the package has zero dependencies and no lockfile, so
-      # `npm ci` would fail and `npm install` would do nothing.
+      # `dependencies` is still empty and stays that way — this installs the
+      # one devDependency, @zenfs/core, so a stock third-party backend runs our
+      # fs conformance suite beside our own store.
+      #
+      # --ignore-scripts is the point of this step being written out rather
+      # than implied: dist/busybox.wasm is already built by now and this job's
+      # artifact is what release.yml publishes, so a lifecycle script from any
+      # transitive dependency would run with the finished binary sitting on
+      # disk. Nothing here needs to build itself.
+      #
+      # `npm ci` is not an option: package-lock.json is deliberately not
+      # committed. The version is pinned exactly instead.
+      - name: Install dev dependencies
+        run: npm install --no-audit --no-fund --ignore-scripts
+
       - name: Test
         run: npm test
 

@@ -21,6 +21,7 @@
     "./worker": "./src/worker.mjs",
     "./ring": "./src/ring.mjs",
     "./fs": "./src/fs.mjs",
+    "./fs/conformance": "./src/fs-conformance.mjs",
     "./files": "./src/files.mjs",
     "./node": "./src/node.mjs",
     "./busybox.wasm": "./dist/busybox.wasm",
@@ -57,5 +58,8 @@
     "browser",
     "terminal",
     "webassembly"
-  ]
+  ],
+  "devDependencies": {
+    "@zenfs/core": "2.6.3"
+  }
 }

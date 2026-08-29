@@ -54,75 +54,35 @@ test('two stores can share one seed map', () => {
   assert.equal(readAll(b, '/f.txt'), 'seed', 'the second store is unaffected');
 });
 
-test('inodes are unique per node and stable across writes', () => {
-  const fs = memoryFs({ '/a.txt': 'a', '/b.txt': 'b' });
-  const a1 = fs.statSync('/a.txt').ino;
-  const b = fs.statSync('/b.txt').ino;
-  const root = fs.statSync('/').ino;
-  assert.notEqual(a1, b, 'distinct nodes get distinct inos');
-  assert.notEqual(a1, root);
-  fs.writeSync('/a.txt', enc.encode('more'), 1);
-  assert.equal(fs.statSync('/a.txt').ino, a1, 'the same node keeps its ino');
-});
-
-test('timestamps are real and advance on write', async () => {
+test('the type bits of a mode are not the caller`s to rewrite', () => {
+  // The conformance suite pins that permission bits apply; this pins that a
+  // caller cannot smuggle a new file TYPE in through the same field.
   const fs = memoryFs({ '/f.txt': 'x' });
-  const before = fs.statSync('/f.txt').mtimeMs;
-  assert.ok(before > 0, 'seeded files are not stuck at epoch 0');
-  await new Promise((r) => setTimeout(r, 2));
-  fs.writeSync('/f.txt', enc.encode('y'), 1);
-  assert.ok(fs.statSync('/f.txt').mtimeMs > before, 'a write moves mtime');
-});
-
-test('writes past EOF leave a zero hole', () => {
-  const fs = memoryFs();
-  fs.createFileSync('/tmp/sparse');
-  fs.writeSync('/tmp/sparse', enc.encode('end'), 5);
-  const { size } = fs.statSync('/tmp/sparse');
-  assert.equal(size, 8);
-  const buf = new Uint8Array(size);
-  fs.readSync('/tmp/sparse', buf, 0, size);
-  assert.deepEqual([...buf.subarray(0, 5)], [0, 0, 0, 0, 0]);
-  assert.equal(dec.decode(buf.subarray(5)), 'end');
-});
-
-test('mode carries the file type, and touchSync cannot rewrite it', () => {
-  const fs = memoryFs({ '/f.txt': 'x' });
-  assert.ok(isFile(fs.statSync('/f.txt').mode));
   fs.touchSync('/f.txt', { mode: 0o40777 });
   const { mode } = fs.statSync('/f.txt');
   assert.ok(isFile(mode), 'still a regular file');
   assert.equal(mode & 0o7777, 0o777, 'permission bits did apply');
 });
 
-test('renaming a directory carries its subtree and refuses its own child', () => {
+test('a rename into its own subtree is refused, and moves nothing', () => {
   const fs = memoryFs({ '/a/deep/f.txt': 'payload' });
+  assert.throws(() => fs.renameSync('/a', '/a/deep/a'), { code: 'EINVAL' });
+  assert.equal(readAll(fs, '/a/deep/f.txt'), 'payload', 'a refused rename moved nothing');
   fs.renameSync('/a', '/b');
-  assert.equal(readAll(fs, '/b/deep/f.txt'), 'payload');
-  assert.throws(() => fs.statSync('/a/deep/f.txt'), { code: 'ENOENT' });
   assert.deepEqual(fs.readdirSync('/').sort(), ['b', 'tmp']);
-  assert.throws(() => fs.renameSync('/b', '/b/deep/b'), { code: 'EINVAL' });
-  assert.equal(readAll(fs, '/b/deep/f.txt'), 'payload', 'a refused rename moved nothing');
 });
 
-test('linkSync gives one node two names; unlink drops one', () => {
+test('hard links are real, but never to a directory', () => {
   const fs = memoryFs({ '/f.txt': 'shared' });
   fs.linkSync('/f.txt', '/also.txt');
-  assert.equal(fs.statSync('/also.txt').ino, fs.statSync('/f.txt').ino);
   assert.equal(fs.statSync('/f.txt').nlink, 2);
-  fs.writeSync('/also.txt', enc.encode('SHARED'), 0);
-  assert.equal(readAll(fs, '/f.txt'), 'SHARED', 'both names see one node');
   fs.unlinkSync('/f.txt');
-  assert.equal(readAll(fs, '/also.txt'), 'SHARED');
   assert.equal(fs.statSync('/also.txt').nlink, 1);
   assert.throws(() => fs.linkSync('/tmp', '/tmp2'), { code: 'EPERM' }, 'no directory links');
 });
 
-test('directory operations fail with an errno, never a TypeError', () => {
-  const fs = memoryFs({ '/f.txt': 'x' });
-  assert.throws(() => fs.writeSync('/tmp', enc.encode('x'), 0), { code: 'EISDIR' });
-  assert.throws(() => fs.readSync('/tmp', new Uint8Array(1), 0, 1), { code: 'EISDIR' });
-  assert.throws(() => fs.readdirSync('/f.txt'), { code: 'ENOTDIR' });
+test('paths that name nothing, and the root, are refused', () => {
+  const fs = memoryFs();
   assert.throws(() => fs.statSync(''), { code: 'ENOENT' }, 'an empty path is not the root');
   assert.throws(() => fs.rmdirSync('/'), { code: 'EBUSY' }, 'the root cannot be removed');
   assert.throws(() => fs.renameSync('/', '/elsewhere'), { code: 'EBUSY' });
@@ -143,6 +103,8 @@ test('an ArrayBuffer seed is copy-on-write too', () => {
 });
 
 test('reads past EOF are short and zero the tail, never stale bytes', () => {
+  // The shim clamps its read ranges to the file size, so this is belt and
+  // braces: whatever the caller's buffer held must not surface as content.
   const fs = memoryFs({ '/f.txt': 'abc' });
   const buf = enc.encode('XXXXXXXX');
   fs.readSync('/f.txt', buf, 0, 8);
