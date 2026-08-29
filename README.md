@@ -89,6 +89,44 @@ for registering your own commands, written in JS.
 never touched; everything vanishes when the run ends), so
 `grep -r`, `sed -i`, redirects, and `/tmp` scratch files all behave normally.
 
+## The filesystem: bring your own
+
+`files:` seeds the default in-memory store. Pass `fs:` instead and the shell
+runs on **your** filesystem — that is the whole seam:
+
+```js
+import { memoryFs } from 'wasi-sh/fs';
+
+const store = memoryFs({ '/app/main.sh': 'echo hi' });
+await run({ command: 'sh /app/main.sh', fs: store, inline: true });
+// the guest's writes are in `store`, readable from JS, reusable next run
+```
+
+A store is a path-addressed **synchronous** filesystem in ZenFS's
+`FileSystem` shape — `statSync`, `readdirSync`, `createFileSync`, `mkdirSync`,
+`rmdirSync`, `unlinkSync`, `renameSync`, `linkSync`, positional
+`readSync`/`writeSync`, `touchSync`, `syncSync`. That shape is theirs on
+purpose: the ecosystem's backends (OPFS and real user directories via
+`@zenfs/dom`, a whole filesystem in a `SharedArrayBuffer`, copy-on-write
+layers, remote trees) work here as-is, and `wasi-sh` still ships with zero
+dependencies. Writing your own is fine too — `wasi-sh/fs/conformance` is the
+suite that says whether it will hold up:
+
+```js
+import { checkConformance } from 'wasi-sh/fs/conformance';
+const { failed } = checkConformance(() => myStore());
+```
+
+Four things worth knowing. A store is **injected, never ambient**: no `fs` is
+the sealed sandbox, and a read-only store is a read-only shell with nothing
+shell-side to bypass it. `/dev` belongs to the shim, so mounting a real
+directory never writes device nodes into it — and for the same reason a
+`files:` path under `/dev` is refused rather than mounted somewhere invisible.
+What a store *does* receive is your `files:`, plus `script:` if you use it,
+since that is mounted at `/main.sh`. And a store is a live object, so in a
+browser it is registered inside the worker with `serve({ fs })`, exactly like
+host builtins.
+
 ## Scope and drawbacks — read before depending on it
 
 - **No processes, ever.** There is no fork/exec: no external programs, no
@@ -277,6 +315,8 @@ and its [worker](examples/host-builtins.worker.mjs).
 | `wasi-sh/node` | `run`, `runScript`, `compileWasm`, `readTree` (fs sugar; node-only) |
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
 | `wasi-sh/ring` | `createStdinRing`, `RingWriter`, `RingReader` — the SAB stdin ring |
+| `wasi-sh/fs` | `memoryFs` and the `fs` contract — the filesystem, pluggable |
+| `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
 | `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register host builtins |
 | `wasi-sh/busybox.wasm` | the shell binary |
@@ -287,6 +327,10 @@ argv — busybox is a multicall binary, argv[0] is `busybox`), `command`
 (sugar for `sh -c`), `script` (mounted at `/main.sh`), `files`
 (`{ '/path': string | Uint8Array }`), `env` (merged over
 `PATH=/ HOME=/ TERM=xterm-256color LANG=C.UTF-8`).
+
+`run` also takes `fs` (a store; needs `inline: true`, since a live object
+cannot be structured-cloned into a Worker — off-thread runs and `spawn` use
+`serve({ fs })` in a worker module instead).
 
 **`fetchTree`** assembles `files` from URLs:
 

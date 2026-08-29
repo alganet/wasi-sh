@@ -32,15 +32,31 @@ see "Terminal resize" below), and two for host builtins
 (`__host_builtin_lookup`/`__host_builtin_run`, see "Host builtins" below).
 Eight in total.
 
-**Filesystem.** A flat map of absolute path → node (`{type, data?, children?}`).
-Writable: `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` honored, file creation
-requires an existing parent directory, and writes are copy-on-write — a
-caller-mounted `Uint8Array` is never mutated. Everything dies with the run.
-There are no symlinks, permissions, or timestamps; `path_readlink` answers
-EINVAL ("not a symlink"), which is the truth. Every node gets a **unique
-inode** lazily — busybox `find`/`cp -r` detect directory loops via `dev:ino`
-pairs, and a constant ino makes every directory look like a recursion.
-Directory rename rewrites the whole key-prefixed subtree (flat map).
+**Filesystem.** A pluggable store (see "The `fs` contract" below), defaulting
+to `memoryFs(files)` — so a shim with no `fs` is the sealed in-memory sandbox
+it always was. Writable: `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` honored, file
+creation requires an existing parent directory, and writes are copy-on-write —
+a caller-mounted `Uint8Array` is never mutated. There are still no symlinks;
+`path_readlink` answers EINVAL ("not a symlink"), which is the truth. Every
+node gets a **unique inode** — busybox `find`/`cp -r` detect directory loops
+via `dev:ino` pairs, and a constant ino makes every directory look like a
+recursion.
+
+**Devices are the shim's, not the store's.** `/dev/null` lives in an overlay
+above the store, and `/dev` is shadowed *whole* rather than entry by entry.
+Two reasons: mounting a real directory must not mean writing device nodes into
+somebody's project, and a name the overlay hides must not be creatable
+underneath it — otherwise `mv work.txt /dev/null` writes the file to a path
+`ls /dev` will never show and reports success.
+
+**A store failure is an errno, never an exception.** A JS exception thrown out
+of a wasm import unwinds the entire guest stack and the instance is dead — the
+same hazard `--wrap exit` exists for. Every store call is wrapped, and its
+Linux errno is translated to WASI's numbering at the edge: the two schemes
+overlap enough to look interchangeable and disagree exactly where it hurts
+(Linux `ENOENT` 2 is WASI `EACCES`). A failure carrying no errno at all
+becomes `EIO`, not a comfortable `ENOENT` — "the store broke" and "the file is
+not there" send a shell down very different paths.
 
 **File offsets are shared, not copied.** POSIX gives one offset per open file
 description, and `__host_dup`/`__host_dup2` copy the descriptor with `{...src}`
@@ -49,6 +65,13 @@ number gave every dup its own, and two things broke silently: `cmd > f 2>&1`
 had fd 1 and fd 2 both writing from 0, interleaving over each other's bytes,
 and `evalpipe`'s `fcntl(F_DUPFD,10)`/`dup2` save-restore *rewound* a
 file-backed stdin between stages, re-serving bytes an earlier stage had eaten.
+
+**Open descriptions outlive names.** A store is path-addressed, so two POSIX
+properties that used to come free from holding a node reference are now
+explicit. A file unlinked while open stays readable through the fd — its bytes
+move onto the fd, in a shared cell for the same reason `pos` is one. And an
+open fd follows its file across a rename, subtree included, because a rename
+moves a name and not the file.
 
 **Pipes.** `env.__host_pipe` allocates an in-memory pipe as a chunk list;
 reads drain consumed chunks and `fd_close`/`__host_dup2` free the pipe when
@@ -65,6 +88,54 @@ caller reads EOF, terminating `while read` loops.
 
 **Clocks.** id 0 (REALTIME) is `Date.now()`; monotonic/cputime ids get
 `performance.now()`, which cannot step backwards.
+
+## The `fs` contract (`src/fs.mjs`)
+
+The third pluggable seam, beside `input` and `builtins`. A store is a
+path-addressed **synchronous** filesystem — synchronous because the guest is a
+wasm stack frame below every call, so there is nothing to await into.
+
+The shape is **ZenFS's `FileSystem`**, deliberately not one of our own:
+`statSync` / `readdirSync` / `createFileSync` / `mkdirSync` / `rmdirSync` /
+`unlinkSync` / `renameSync` / `linkSync` / `readSync(path, buf, start, end)` /
+`writeSync(path, buf, offset)` / `touchSync(path, metadata)` / `syncSync()`.
+Borrowing it means the ecosystem's stores work here unmodified — persistence
+over OPFS or a user-granted directory, a filesystem in a `SharedArrayBuffer`,
+copy-on-write layers, remote trees — and every gap in the flat map it replaced
+is already a field of `InodeLike`: byte offsets, truncate, mode bits and
+timestamps.
+
+**Timestamps are why this could not wait.** The old map had none — filestat
+wrote zero for atim/mtim/ctim — and anything that caches by mtime never
+notices an edit. With an opcode cache validating timestamps, a script whose
+mtime never moves is never reloaded, so editing a file in the shell and
+reloading the page shows the old output, in a way that looks like a caching
+bug somewhere else entirely.
+
+**Two things stay out of a store**, both on purpose: open file descriptions
+(offsets are arguments here, so the shared `pos` cell never reaches one and
+cannot be got wrong by one), and devices.
+
+**`memoryFs` is the zero-dependency default**: JS objects, copy-on-write over
+the caller's `files`, state gone with the run. It is also the only store we
+write. Anything else — persistence, sharing, a foreign runtime's filesystem —
+is an adapter over somebody else's maintained implementation.
+
+**Stores are injected, never ambient.** No `fs` is a sealed sandbox exactly as
+before. A read-only store is a read-only shell, with nothing shell-side to
+bypass it, and `files` is the one thing a mount may write into an injected
+store, because passing both is an explicit request.
+
+**The conformance suite** (`src/fs-conformance.mjs`, exported as
+`wasi-sh/fs/conformance`) is what a store must do to back a shim, runner-
+agnostic so it runs under `node --test`, in a browser, or from a REPL. It is
+aimed inward as much as outward: a stock `@zenfs/core` backend runs the same
+cases our own store does, which is what keeps "we took their shape" true
+rather than merely claimed. That cross-check pays rent — it found three real
+deviations in that backend, recorded as `todo` so they re-check on every
+upgrade instead of turning somebody else's bug into a red build. `wasi-sh`
+itself takes no dependency on ZenFS: it is a `devDependency`, tested in a job
+that never touches the published artifact.
 
 ## The stdin ring (`src/ring.mjs`)
 

@@ -148,3 +148,35 @@ test('the host-builtins example composes json and num in a pipeline', async (t) 
     + 'exit=1\n');
   assert.match(r.stderr, /no such path: nope/);
 });
+
+// A store is a live object, so like builtins it can only be registered from
+// inside the worker — structured clone would arrive with the methods stripped.
+// This is the only route by which a real filesystem (OPFS, a directory the
+// user granted) reaches a browser session.
+test('serve({ fs }) puts the worker’s shell on the given store', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const { memoryFs } = await import('../src/fs.mjs');
+  const store = memoryFs({ '/seed.txt': 'from the store\n' });
+  const r = await runInWorker('cat /seed.txt; echo written > /out.txt', { fs: store });
+  assert.equal(r.stdout, 'from the store\n');
+  const out = new Uint8Array(store.statSync('/out.txt').size);
+  store.readSync('/out.txt', out, 0, out.length);
+  assert.equal(dec.decode(out), 'written\n', 'the guest wrote into the caller’s store');
+});
+
+// Same reason the builtins factory exists: opening OPFS or asking for a
+// directory handle is async, and it has to finish before _start().
+test('serve({ async fs() }) is awaited before the shell starts', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const { memoryFs } = await import('../src/fs.mjs');
+  let opens = 0;
+  const r = await runInWorker('cat /late.txt', {
+    async fs() {
+      opens++;
+      await new Promise((res) => setTimeout(res, 5));
+      return memoryFs({ '/late.txt': 'opened in time\n' });
+    },
+  });
+  assert.equal(opens, 1, 'opened once, up front');
+  assert.equal(r.stdout, 'opened in time\n');
+});
