@@ -92,21 +92,12 @@ jobs:
           echo "| raw | $raw |" >> "$GITHUB_STEP_SUMMARY"
           echo "| gzipped | $gz |" >> "$GITHUB_STEP_SUMMARY"
 
-      # `dependencies` is still empty and stays that way — this installs the
-      # one devDependency, @zenfs/core, so a stock third-party backend runs our
-      # fs conformance suite beside our own store.
-      #
-      # --ignore-scripts is the point of this step being written out rather
-      # than implied: dist/busybox.wasm is already built by now and this job's
-      # artifact is what release.yml publishes, so a lifecycle script from any
-      # transitive dependency would run with the finished binary sitting on
-      # disk. Nothing here needs to build itself.
-      #
-      # `npm ci` is not an option: package-lock.json is deliberately not
-      # committed. The version is pinned exactly instead.
-      - name: Install dev dependencies
-        run: npm install --no-audit --no-fund --ignore-scripts
-
+      # No install step, and that is the point: this job builds the binary that
+      # release.yml publishes, so nothing third-party is fetched or executed
+      # anywhere near it. The package still has zero `dependencies`; the one
+      # devDependency is exercised in the separate `conformance` job below,
+      # which never touches dist/. test/fs-zenfs.test.mjs skips itself when the
+      # package is absent, so the suite here is complete on its own terms.
       - name: Test
         run: npm test
 
@@ -124,3 +115,35 @@ jobs:
           name: dist
           path: dist/
           retention-days: 7
+
+  # The `fs` contract claims to be ZenFS's shape rather than one we invented,
+  # and a claim like that rots silently — so a stock @zenfs/core backend runs
+  # the same conformance suite our own store does. Its own job, deliberately:
+  # it installs third-party code, and the job above must not, since that one
+  # produces the artifact release.yml publishes. Nothing here needs busybox,
+  # so there is no wasm build and no dist/ in sight.
+  conformance:
+    name: fs conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # `npm ci` is not an option: package-lock.json is deliberately not
+      # committed. The one devDependency is pinned exactly instead, and
+      # nothing it brings along gets to run an install script.
+      - name: Install dev dependencies
+        run: npm install --no-audit --no-fund --ignore-scripts
+
+      # Not `npm test`: that wants dist/busybox.wasm, and these files are pure
+      # JS. A skipped @zenfs/core suite here would mean the install failed.
+      - name: Run the fs conformance suite
+        run: node --test test/fs.test.mjs test/fs-conformance.test.mjs test/fs-zenfs.test.mjs

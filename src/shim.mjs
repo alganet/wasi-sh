@@ -1,12 +1,13 @@
 // Minimal WASI preview1 shim for the busybox ash wasm module: the imports
 // busybox uses plus the env.__host_pipe/__host_dup/__host_dup2 hooks that back
-// its fork-free pipes and fd juggling (see build/shim/wasistubs.c). Writable
-// in-memory FS: mounted `files` plus anything the guest creates (O_CREAT needs
-// an existing parent dir). Writes are copy-on-write — the caller's mounted
-// buffers are never mutated — and all state vanishes with the run. /dev/null
-// and in-memory pipes included. Stdin is pluggable (`input`) so the same shim
-// serves scripted runs (fixed queue) and interactive sessions (SAB ring +
-// Atomics.wait) in any JS environment.
+// its fork-free pipes and fd juggling (see build/shim/wasistubs.c). The
+// filesystem is pluggable (`fs`) and defaults to memoryFs(files): mounted
+// `files` plus anything the guest creates (O_CREAT needs an existing parent
+// dir), copy-on-write over the caller's buffers, all of it gone with the run.
+// In-memory pipes included, and /dev/null is the shim's, not the store's.
+// Stdin is pluggable (`input`) so the same shim serves scripted runs (fixed
+// queue) and interactive sessions (SAB ring + Atomics.wait) in any JS
+// environment.
 //
 // The `input` contract:
 //   pollReadable(ms) -> bool     data available (waiting up to ms for some)
@@ -14,6 +15,12 @@
 //   readBlocking?(max) -> bytes  park until data or EOF (worker threads only)
 //   wait?(ms)                    sleep for a poll timeout
 //   closed?()        -> bool     no more data will ever arrive (stdin EOF)
+//
+// The `fs` contract is a third seam of the same kind (see fs.mjs): a
+// path-addressed synchronous store in ZenFS's `FileSystem` shape. Everything
+// the store does not own stays here — open file descriptions and their shared
+// offsets, and the device overlay — so a store can be a real directory, a
+// SharedArrayBuffer or somebody else's filesystem without knowing any of it.
 //
 // Host builtins are pluggable the same way (`builtins`), extending the shell's
 // command namespace with JS-backed names — in-process, argv in, status out,
@@ -30,17 +37,39 @@
 //   shim.bindMemory(instance.exports.memory);
 //   try { instance.exports._start(); } catch (e) { if (!(e instanceof WasiExit)) throw e; }
 
+import { memoryFs, normalize, isDir, isChar, S_IFDIR, S_IFREG, S_IFCHR } from './fs.mjs';
+
 export class WasiExit extends Error { constructor(code){ super('exit '+code); this.code=code; } }
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
-const E = { SUCCESS:0, BADF:8, EXIST:20, INVAL:28, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, NOTCAPABLE:76, AGAIN:6 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
+// Stores speak LINUX errno; WASI numbers its own list alphabetically. The two
+// overlap enough to look interchangeable and disagree exactly where it hurts —
+// Linux ENOENT 2 is WASI EACCES, which is how the same confusion in the other
+// direction made a missing file report "Permission denied" downstream. An
+// unrecognized failure is EIO: the store broke in a way we cannot name.
+const WASI_ERRNO = {
+  EPERM:63, ENOENT:44, EIO:29, EBADF:8, EACCES:2, EBUSY:10, EEXIST:20, EXDEV:75,
+  ENOTDIR:54, EISDIR:31, EINVAL:28, ENFILE:41, EMFILE:33, ENOSPC:51, EROFS:69,
+  EMLINK:34, ENOSYS:52, ENOTEMPTY:55, ELOOP:32, ENAMETOOLONG:37,
+};
+const wasiErrno = (err) => WASI_ERRNO[err && err.code] ?? E.IO;
+
+// Devices belong to the shim, never to the store: mounting a real directory
+// must not mean writing device nodes into it, and a read-only store must not
+// lose /dev/null. They shadow the store's own /dev if it has one, and they sit
+// on a different st_dev so their inodes cannot collide with its.
+const DEV_DEV = 2n;
+const DEV_INO = { '/dev':1, '/dev/null':2 };
+const DEV_NULL = { read:()=>EMPTY, write:()=>{} };
+
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, stdout, stderr, input, builtins }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
@@ -48,8 +77,21 @@ export class WasiShim {
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
     this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
     this.mem = null; this.view = null; this.u8 = null;
-    // Build the FS: map of absolute path -> {type, data?, children?}
-    this.fs = buildFs(files);
+    // The filesystem, as a store (see fs.mjs). Passing one is how a session
+    // reaches a real directory or a shared buffer; passing none keeps today's
+    // sealed in-memory sandbox. `files` seeds the default store — and is
+    // written THROUGH an injected one, because asking for both is explicit.
+    // Refuse up front rather than write a file to a name `ls /dev` will never
+    // show. Every other write path is guarded; seeding must be too, and saying
+    // so beats mounting something that silently cannot be read back.
+    for (const path of Object.keys(files || {})) {
+      const abs = normalize(path.startsWith('/') ? path : `/${path}`);
+      if (ownsDevPath(abs)) throw new Error(`files: '${abs}' is under /dev, which is the shim's device overlay — the file would be mounted and then hidden by it`);
+    }
+    this.store = fs || memoryFs(files);
+    if (fs) seedInto(this.store, files);
+    this.devices = new Map([['/dev/null', DEV_NULL]]);
+    this.bootMs = Date.now();
     // fd table. 0/1/2 std, 3 = preopen "/".
     this.fds = new Map();
     this.fds.set(0, { type:'stdin' });
@@ -58,10 +100,6 @@ export class WasiShim {
     this.fds.set(3, { type:'dir', path:'/', preopen:true });
     this.nextFd = 4;
     this.pipes = [];
-    // Inodes are handed out lazily per node. They must be UNIQUE: busybox
-    // find/cp -r detect directory recursion by dev:ino pairs, and a constant
-    // ino makes every directory look like a loop.
-    this.nextIno = 2;
   }
   bindMemory(memory){ this.mem = memory; this.refresh(); }
   refresh(){ this.view = new DataView(this.mem.buffer); this.u8 = new Uint8Array(this.mem.buffer); }
@@ -78,7 +116,15 @@ export class WasiShim {
       // Clock 0 is REALTIME (wall clock); 1/2/3 (monotonic, cputimes) must
       // never step backwards, which Date.now() can — use performance.now().
       clock_time_get:(id,prec,out)=>{ const ns=BigInt(Math.round((id===0?Date.now():performance.now())*1e6)); w.dv().setBigUint64(out,ns,true); return 0; },
-      proc_exit:(code)=>{ throw new WasiExit(code); },
+      // The one unambiguous flush point. A store that buffers — anything
+      // persistent — has nowhere else to learn the run is over, and a failure
+      // here is data loss, so it is reported rather than swallowed. It must
+      // not replace the exit: the caller is waiting for a WasiExit.
+      proc_exit:(code)=>{
+        try { w.store.syncSync(); }
+        catch(e) { w.stderr(strBytes(`wasi-sh: flushing the filesystem failed: ${(e&&e.message)||e}\n`)); }
+        throw new WasiExit(code);
+      },
       sched_yield:()=>0,
       random_get:(buf,len)=>{ const a=w.bytes().subarray(buf,buf+len);
         if(globalThis.crypto&&globalThis.crypto.getRandomValues){ for(let o=0;o<len;o+=65536) globalThis.crypto.getRandomValues(a.subarray(o,Math.min(o+65536,len))); }
@@ -89,22 +135,33 @@ export class WasiShim {
       fd_fdstat_set_flags:(fd,flags)=>{ const f=w.fds.get(fd); if(f) f.nonblock=(flags&4)!==0; return 0; },
       fd_prestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f||!f.preopen) return E.BADF; w.dv().setUint8(out,0); w.dv().setUint32(out+4,strBytes(f.path).length,true); return 0; },
       fd_prestat_dir_name:(fd,buf,len)=>{ const f=w.fds.get(fd); if(!f||!f.preopen) return E.BADF; w.bytes().set(strBytes(f.path).subarray(0,len),buf); return 0; },
-      fd_filestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const node=f.node||{type:f.type==='dir'?'dir':'char'}; w.writeFilestat(out,node); return 0; },
-      path_filestat_get:(fd,flags,pathp,plen,out)=>{ const path=w.resolve(fd,w.str(pathp,plen)); const node=w.lookup(path); if(!node) return E.NOENT; w.writeFilestat(out,node); return 0; },
+      fd_filestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF;
+        // `gone` first, exactly as readFd checks it: once a name is unlinked a
+        // NEW file can take it, and this fd must keep describing the one it
+        // actually still reads. stdio and pipes have no path to stat at all.
+        const st=(!f.gone&&f.path!==undefined&&w.statAt(f.path))||w.anonStat(f);
+        w.writeFilestat(out,st); return 0; },
+      path_filestat_get:(fd,flags,pathp,plen,out)=>{ const { st, errno }=w.statOf(w.resolve(fd,w.str(pathp,plen))); if(!st) return errno; w.writeFilestat(out,st); return 0; },
       path_open:(fd,dflags,pathp,plen,oflags,rb,ri,fdflags,out)=>{
         // oflags: 1=CREAT 2=DIRECTORY 4=EXCL 8=TRUNC; fdflags: 1=APPEND
-        const path=w.resolve(fd,w.str(pathp,plen)); let node=w.lookup(path);
-        if(!node){
-          if(!(oflags&1)) return E.NOENT;
-          node=w.createFile(path);
-          if(!node) return E.NOENT; // parent dir missing
+        const path=w.resolve(fd,w.str(pathp,plen));
+        let { st, errno }=w.statOf(path);
+        if(!st){
+          if(!(oflags&1)) return errno;
+          // Creating a name under /dev would land in the store, where the
+          // overlay then hides it forever.
+          if(w.ownsPath(path)) return E.PERM;
+          try { st=w.store.createFileSync(path,{}); } catch(e) { return wasiErrno(e); }
         } else if((oflags&1)&&(oflags&4)) return E.EXIST;
-        if(node.type==='reg'&&(oflags&8)){ node.data=new Uint8Array(0); node.mutable=true; }
+        const device=w.devices.get(path);
+        if(!device&&!isDir(st.mode)&&(oflags&8)){
+          try { w.store.touchSync(path,{size:0}); } catch(e) { return wasiErrno(e); }
+        }
         const nfd=w.nextFd++;
-        if(node.type==='dir') w.fds.set(nfd,{type:'dir',path,node});
+        if(isDir(st.mode)) w.fds.set(nfd,{type:'dir',path});
         // pos is a SHARED CELL, not a number: dup/dup2 copy the record with
         // {...src}, and POSIX says duped fds share one file offset (see pos()).
-        else w.fds.set(nfd,{type:'file',path,node,pos:{v:0},append:(fdflags&1)!==0});
+        else w.fds.set(nfd,{type:'file',path,device,pos:{v:0},append:(fdflags&1)!==0});
         w.dv().setUint32(out,nfd,true); return 0;
       },
       // fd_read/fd_write are the iovec scatter/gather around readFd/writeFd —
@@ -115,13 +172,36 @@ export class WasiShim {
         const { data, errno } = w.readFd(fd, bufs.reduce((a,b)=>a+b.length,0), f.nonblock);
         let o=0; for(const b of bufs){ const take=Math.min(b.length,data.length-o); b.set(data.subarray(o,o+take)); o+=take; if(o>=data.length)break; }
         w.dv().setUint32(out,o,true); return errno; },
+      // A failing writeFd used to be impossible past the BADF check, so its
+      // return value was dropped. A store can genuinely refuse — read-only,
+      // out of space, a revoked directory handle — and reporting those bytes
+      // as written is silent data loss. Stop at the failure and report the
+      // count that did land, exactly as a short write(2) does.
       fd_write:(fd,iovs,n,out)=>{ if(!w.fds.get(fd)) return E.BADF; const bufs=w.iovecs(iovs,n); let total=0;
-        for(const b of bufs){ total+=b.length; w.writeFd(fd,b); }
+        for(const b of bufs){
+          const errno=w.writeFd(fd,b);
+          if(!errno){ total+=b.length; continue; }
+          // Bytes already written stay written. WASI has one result, so an
+          // errno here means the whole call failed and wasi-libc returns -1 —
+          // a retry would then write those bytes twice. Once anything has
+          // landed this is a SHORT WRITE: success, with the partial count.
+          w.dv().setUint32(out,total,true);
+          return total?0:errno;
+        }
         w.dv().setUint32(out,total,true); return 0; },
-      fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const p=w.pos(f); const sz=f.node&&f.node.data?f.node.data.length:0; off=Number(off); p.v=whence===0?off:whence===1?p.v+off:sz+off; w.dv().setBigUint64(out,BigInt(p.v),true); return 0; },
-      fd_readdir:(fd,buf,len,cookie,out)=>{ const f=w.fds.get(fd); if(!f||f.type!=='dir') return E.BADF; const node=w.lookup(f.path); const ents=node?Object.keys(node.children||{}):[]; let p=buf; let idx=Number(cookie); let written=0;
-        for(;idx<ents.length;idx++){ const name=ents[idx]; const nb=strBytes(name); const child=node.children[name]; const need=24+nb.length; if(p+need>buf+len)break;
-          w.dv().setBigUint64(p,BigInt(idx+1),true); w.dv().setBigUint64(p+8,BigInt(idx+1),true); w.dv().setUint32(p+16,nb.length,true); w.dv().setUint8(p+20,child.type==='dir'?FT.DIR:FT.REG); w.bytes().set(nb,p+24); p+=need; written+=need; }
+      // A negative result is EINVAL and leaves the offset alone, as lseek does.
+      // Without the check a rewind past the start makes every later read ask
+      // the store for a range it will zero-fill, and the guest gets fabricated
+      // NUL bytes reported as a successful read.
+      fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const p=w.pos(f); const sz=w.sizeOf(f); off=Number(off);
+        const next=whence===0?off:whence===1?p.v+off:sz+off;
+        if(!Number.isFinite(next)||next<0) return E.INVAL;
+        p.v=next; w.dv().setBigUint64(out,BigInt(p.v),true); return 0; },
+      fd_readdir:(fd,buf,len,cookie,out)=>{ const f=w.fds.get(fd); if(!f||f.type!=='dir') return E.BADF;
+        let ents; try { ents=w.readdirAt(f.path); } catch(e) { return wasiErrno(e); }
+        let p=buf; let idx=Number(cookie); let written=0;
+        for(;idx<ents.length;idx++){ const name=ents[idx]; const nb=strBytes(name); const child=w.statAt(joinPath(f.path,name)); const need=24+nb.length; if(p+need>buf+len)break;
+          w.dv().setBigUint64(p,BigInt(idx+1),true); w.dv().setBigUint64(p+8,BigInt(child?child.ino:0),true); w.dv().setUint32(p+16,nb.length,true); w.dv().setUint8(p+20,child&&isDir(child.mode)?FT.DIR:FT.REG); w.bytes().set(nb,p+24); p+=need; written+=need; }
         w.dv().setUint32(out,written,true); return 0; },
       // ---- writable-FS ops (rm/mkdir/rmdir/mv and friends) ----
       path_unlink_file:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),false),
@@ -129,25 +209,42 @@ export class WasiShim {
       path_create_directory:(fd,pathp,plen)=>w.makeDir(w.resolve(fd,w.str(pathp,plen))),
       path_rename:(fd,pathp,plen,nfd,npathp,nplen)=>{
         const from=w.resolve(fd,w.str(pathp,plen)), to=w.resolve(nfd,w.str(npathp,nplen));
-        const node=w.lookup(from); if(!node) return E.NOENT;
-        const tparent=w.lookup(parentOf(to));
-        if(!tparent||tparent.type!=='dir') return E.NOENT;
+        const { st, errno }=w.statOf(from); if(!st) return errno;
+        // Both ends: renaming ONTO a device name would write into the store at
+        // a path the overlay permanently hides — `mv work.txt /dev/null` would
+        // look like it worked and lose the file.
+        if(st.device||w.ownsPath(from)||w.ownsPath(to)) return E.PERM;
+        const tparent=w.statAt(parentOf(to));
+        if(!tparent||!isDir(tparent.mode)) return E.NOENT;
         if(from===to) return 0;
-        w.unlinkEntry(from);
-        w.fs[to]=node;
-        // the FS map is keyed by full path: a directory brings its subtree
-        if(node.type==='dir'){
-          const prefix=from+'/';
-          for(const key of Object.keys(w.fs)){
-            if(key.startsWith(prefix)){ w.fs[to+'/'+key.slice(prefix.length)]=w.fs[key]; delete w.fs[key]; }
-          }
-        }
-        if(!tparent.children) tparent.children={};
-        tparent.children[to.slice(to.lastIndexOf('/')+1)]={type:node.type};
+        // Renaming ONTO a name unlinks whatever was there, so fds open on the
+        // destination need the same snapshot an unlink would give them —
+        // otherwise they silently start reading the source file instead.
+        const replaced=w.statAt(to);
+        let cell=null;
+        try {
+          if(replaced&&!isDir(replaced.mode)) cell=w.snapshotOpenFds(to,replaced);
+          w.store.renameSync(from,to);
+        } catch(e) { return wasiErrno(e); }
+        w.adoptSnapshot(to,cell);
+        w.retargetOpenFds(from,to);          // an open fd follows the file
         return 0;
       },
-      // touch decides create-vs-update from this errno; times aren't stored.
-      path_filestat_set_times:(fd,flags,pathp,plen)=>w.lookup(w.resolve(fd,w.str(pathp,plen)))?0:E.NOENT,
+      // touch lands here, and now it means something: mtime is a field of the
+      // store, so `touch f` moves it instead of quietly doing nothing.
+      // fstflags: 1=ATIM 2=ATIM_NOW 4=MTIM 8=MTIM_NOW; times are nanoseconds.
+      path_filestat_set_times:(fd,flags,pathp,plen,atim,mtim,fstflags=0)=>{
+        const path=w.resolve(fd,w.str(pathp,plen));
+        const st=w.statAt(path); if(!st) return E.NOENT;
+        if(st.device) return 0;
+        const now=Date.now(), meta={};
+        if(fstflags&1) meta.atimeMs=Number(atim)/1e6;
+        if(fstflags&2) meta.atimeMs=now;
+        if(fstflags&4) meta.mtimeMs=Number(mtim)/1e6;
+        if(fstflags&8) meta.mtimeMs=now;
+        try { w.store.touchSync(path,meta); } catch(e) { return wasiErrno(e); }
+        return 0;
+      },
       // No symlinks exist in this FS: readlink's EINVAL means "not a symlink".
       path_readlink:()=>E.INVAL,
       path_symlink:()=>E.NOSYS,
@@ -274,17 +371,91 @@ export class WasiShim {
     };
   }
   // ---- helpers ----
-  // Create an empty regular file (O_CREAT). Fails (null) unless the parent
-  // directory already exists — matching "can't create" errors from a real sh.
-  createFile(path){
-    const slash=path.lastIndexOf('/'); const parent=slash>0?path.slice(0,slash):'/';
-    const pnode=this.lookup(parent);
-    if(!pnode||pnode.type!=='dir') return null;
-    const node={type:'reg',data:new Uint8Array(0),mutable:true};
-    this.fs[path]=node;
-    if(!pnode.children) pnode.children={};
-    pnode.children[path.slice(slash+1)]={type:'reg'};
-    return node;
+  // stat across the device overlay and the store, keeping WHY it failed. A
+  // store refuses for reasons that are not "missing" — EACCES, a directory
+  // handle the user revoked — and collapsing those to ENOENT tells the guest a
+  // comfortable lie it will act on. Every FS import starts here, so /dev never
+  // reaches a store and a store's exception never escapes into the guest.
+  statOf(path){
+    const dev=this.deviceStat(path);
+    if(dev) return { st:dev };
+    if(this.ownsPath(path)) return { st:null, errno:E.NOENT };   // shadowed by the overlay
+    try { return { st:this.store.statSync(path) }; }
+    catch(e) { return { st:null, errno:wasiErrno(e) }; }
+  }
+  // The same, for the many callers that only need "is anything there".
+  statAt(path){ return this.statOf(path).st; }
+  // /dev belongs to the overlay whole, not entry by entry: a store with its
+  // own /dev is shadowed entirely rather than half-visible, so nothing can be
+  // written to a name that `ls /dev` will never show.
+  ownsPath(path){ return ownsDevPath(path); }
+  deviceStat(path){
+    const ino=DEV_INO[path];
+    if(ino===undefined) return null;
+    const dir=path==='/dev';
+    if(!dir&&!this.devices.has(path)) return null;
+    const t=this.bootMs;
+    return { ino, nlink:1, size:0, mode:(dir?S_IFDIR|0o755:S_IFCHR|0o666), uid:0, gid:0,
+      atimeMs:t, mtimeMs:t, ctimeMs:t, device:true };
+  }
+  // What an fd with no live path reports to fstat. An unlinked-but-open file
+  // is still a REGULAR file with its size — reporting a character device would
+  // fail every S_ISREG check in exactly the case the snapshot exists to save —
+  // and nlink 0 is what a real one says.
+  anonStat(f){
+    const t=this.bootMs, gone=f&&f.gone;
+    return { ino:0, nlink:gone?0:1, size:gone?gone.data.length:0,
+      mode:gone?(S_IFREG|0o644):(f&&f.type==='dir'?S_IFDIR|0o755:S_IFCHR|0o666), uid:0, gid:0,
+      atimeMs:t, mtimeMs:t, ctimeMs:t, device:!gone };
+  }
+  // Directory entries, with /dev grafted onto the root.
+  readdirAt(path){
+    if(path==='/dev') return [...this.devices.keys()].map((p)=>p.slice(p.lastIndexOf('/')+1));
+    const names=this.store.readdirSync(path);      // may throw; fd_readdir translates
+    if(path!=='/') return names;
+    return names.includes('dev')?names:['dev',...names];
+  }
+  sizeOf(f){
+    if(f.gone) return f.gone.data.length;
+    if(f.path===undefined) return 0;
+    const st=this.statAt(f.path);
+    return st?st.size:0;
+  }
+  // POSIX keeps an unlinked file readable through every fd still open on it.
+  // The store is path-addressed and forgets it the moment the name goes, so
+  // the bytes move onto the fds that still care — in a SHARED CELL, for the
+  // same reason `pos` is one: dup/dup2 copy the record with {...src}, and two
+  // fds on one open description must not drift apart when a write grows it.
+  //
+  // The one divergence: with nlink > 1 the file still exists under its other
+  // name, and writes through this fd will not reach it. The guest cannot make
+  // a hard link (path_link is ENOSYS), so only an embedder's pre-linked store
+  // can get here.
+  //
+  // Two phases, because the removal that motivates it can still fail: taking
+  // the snapshot must not commit anything, or a store that refuses the unlink
+  // leaves live fds writing into a phantom and reporting success.
+  snapshotOpenFds(path,st){
+    let wanted=false;
+    for(const f of this.fds.values()) if(f.path===path&&f.type==='file'&&!f.gone) { wanted=true; break; }
+    if(!wanted) return null;
+    const bytes=new Uint8Array(st.size);
+    if(st.size) this.store.readSync(path,bytes,0,st.size);
+    return { data:bytes };
+  }
+  adoptSnapshot(path,cell){
+    if(!cell) return;
+    for(const f of this.fds.values()) if(f.path===path&&f.type==='file'&&!f.gone) f.gone=cell;
+  }
+  // A rename does not disturb an open fd: it follows the file, not the name.
+  // Path-addressed fds have to be told, subtree and all.
+  retargetOpenFds(from,to){
+    const prefix=`${from}/`;
+    for(const f of this.fds.values()){
+      if(f.path===undefined) continue;
+      if(f.path===from) f.path=to;
+      else if(f.path.startsWith(prefix)) f.path=to+f.path.slice(from.length);
+    }
   }
   // Read up to `max` bytes from one fd, routing on the fd TABLE TYPE — fd_read's
   // whole body minus the iovec scatter. Returns { data, errno }:
@@ -312,7 +483,7 @@ export class WasiShim {
       }
       return { data, errno:0 };
     }
-    if(f.node&&f.node.type==='char') return { data:EMPTY, errno:0 };   // /dev/null EOF
+    if(f.device) return { data:f.device.read(max), errno:0 };          // /dev/null EOF
     if(f.type==='pipe'){
       const pi=this.pipes[f.pipe];
       if(!pi) return { data:EMPTY, errno:0 };
@@ -323,10 +494,23 @@ export class WasiShim {
         if(pi.off===c.length){ pi.chunks.shift(); pi.off=0; } }
       return { data:outb, errno:0 };
     }
-    if(f.node&&f.node.data){
-      const p=this.pos(f); const d=f.node.data; const take=Math.min(max,d.length-p.v);
+    if(f.type==='file'){
+      const p=this.pos(f);
+      if(f.gone){                            // unlinked while open: read the snapshot
+        const take=Math.min(max,f.gone.data.length-p.v);
+        if(take<=0) return { data:EMPTY, errno:0 };
+        const data=f.gone.data.subarray(p.v,p.v+take); p.v+=take;
+        return { data, errno:0 };
+      }
+      const st=this.statAt(f.path);
+      if(!st) return { data:EMPTY, errno:0 };
+      const take=Math.min(max,st.size-p.v);
       if(take<=0) return { data:EMPTY, errno:0 };
-      const data=d.subarray(p.v,p.v+take); p.v+=take;
+      // The range is clamped to the size the store just reported, so a short
+      // read cannot leave uninitialized bytes in the buffer we hand back.
+      const data=new Uint8Array(take);
+      try { this.store.readSync(f.path,data,p.v,p.v+take); } catch(e) { return { data:EMPTY, errno:wasiErrno(e) }; }
+      p.v+=take;
       return { data, errno:0 };
     }
     return { data:EMPTY, errno:0 };
@@ -344,14 +528,25 @@ export class WasiShim {
     if(!f) return E.BADF;
     if(f.type==='stdout') this.stdout(b.slice());
     else if(f.type==='stderr') this.stderr(b.slice());
-    else if(f.node&&f.node.type==='char'){ /* /dev/null: discard */ }
+    else if(f.device){ f.device.write(b); }
     else if(f.type==='pipe'){ const pi=this.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
-    else if(f.node&&f.node.type==='reg'){ const node=f.node; const p=this.pos(f);
-      // Copy-on-write: never mutate a caller-mounted buffer.
-      if(!node.mutable){ node.data=node.data?node.data.slice():new Uint8Array(0); node.mutable=true; }
-      const start=f.append?node.data.length:p.v; const end=start+b.length;
-      if(end>node.data.length){ const nd=new Uint8Array(end); nd.set(node.data); node.data=nd; }
-      node.data.set(b,start); p.v=end;
+    else if(f.type==='file'){
+      const p=this.pos(f);
+      // An unlinked file still has its bytes and its offset; nobody else can
+      // ever see them again, which is what POSIX says too.
+      if(f.gone){
+        const start=f.append?f.gone.data.length:p.v, end=start+b.length;
+        if(end>f.gone.data.length){ const grown=new Uint8Array(end); grown.set(f.gone.data); f.gone.data=grown; }
+        f.gone.data.set(b,start); p.v=end;
+        return 0;
+      }
+      const st=this.statAt(f.path);
+      if(!st) return E.NOENT;
+      // O_APPEND means "at the end as it is NOW", which is why the size is
+      // read here rather than tracked: another fd may have grown the file.
+      const start=f.append?st.size:p.v;
+      try { this.store.writeSync(f.path,b,start); } catch(e) { return wasiErrno(e); }
+      p.v=start+b.length;
     }
     return 0;
   }
@@ -367,34 +562,45 @@ export class WasiShim {
   pos(f){ return f.pos || (f.pos={v:0}); }
   // mkdir, shared by path_create_directory and a host builtin's ctx.fs.mkdir.
   makeDir(path){
-    if(this.lookup(path)) return E.EXIST;
-    const parent=this.lookup(parentOf(path));
-    if(!parent||parent.type!=='dir') return E.NOENT;
-    this.fs[path]={type:'dir',children:{}};
-    if(!parent.children) parent.children={};
-    parent.children[path.slice(path.lastIndexOf('/')+1)]={type:'dir'};
+    if(this.statAt(path)) return E.EXIST;
+    if(this.ownsPath(path)) return E.PERM;   // the overlay would hide it
+    try { this.store.mkdirSync(path,{}); } catch(e) { return wasiErrno(e); }
     return 0;
   }
-  // The in-memory FS as a small stable surface for host builtins, bound to the
-  // command's cwd. Deliberately NOT `this.fs` itself: the flat path->node map,
-  // the `mutable` copy-on-write flag and the {type} child stubs are internals,
-  // and handing them out would freeze them forever. read() copies for the same
-  // reason writeFd does copy-on-write — a builtin must not be able to scribble
-  // a caller-mounted buffer through the back door.
+  // The FS as a small stable surface for host builtins, bound to the command's
+  // cwd. Deliberately NOT the store itself: a builtin that held the store
+  // could seek past this seam into whatever the embedder mounted, and the
+  // narrow view is the same shape whichever store is underneath. read() copies
+  // for the same reason writes never touched a mounted buffer — a builtin must
+  // not be able to scribble one through the back door.
   hostFs(cwd){
     const w=this;
     const abs=(p)=>{ const s=String(p); return normalize(s.startsWith('/')?s:`${cwd.replace(/\/$/,'')}/${s}`); };
     return {
       resolve:abs,
-      read(p){ const n=w.lookup(abs(p)); return n&&n.type==='reg'&&n.data?n.data.slice():null; },
-      write(p,data){ const path=abs(p); const n=w.lookup(path)||w.createFile(path);
-        if(!n||n.type!=='reg') return false;
-        n.data=typeof data==='string'?strBytes(data):new Uint8Array(data); n.mutable=true; return true; },
-      exists(p){ return !!w.lookup(abs(p)); },
-      stat(p){ const n=w.lookup(abs(p)); return n?{ type:n.type==='dir'?'dir':'file', size:n.data?n.data.length:0 }:null; },
-      list(p){ const n=w.lookup(abs(p)); return n&&n.type==='dir'?Object.keys(n.children||{}):null; },
+      read(p){ const path=abs(p); const st=w.statAt(path);
+        if(!st||isDir(st.mode)||st.device) return null;
+        const out=new Uint8Array(st.size);
+        try { if(st.size) w.store.readSync(path,out,0,st.size); } catch { return null; }
+        return out; },
+      write(p,data){ const path=abs(p); const st=w.statAt(path);
+        if(st&&(isDir(st.mode)||st.device)) return false;
+        if(!st&&w.ownsPath(path)) return false;
+        const bytes=typeof data==='string'?strBytes(data):new Uint8Array(data);
+        try {
+          if(!st) w.store.createFileSync(path,{});
+          // Write first, THEN trim the old tail. Truncating up front would
+          // mean a store that refuses the write has already destroyed what was
+          // there, while this call still reports failure.
+          if(bytes.length) w.store.writeSync(path,bytes,0);
+          w.store.touchSync(path,{size:bytes.length});
+        } catch { return false; }
+        return true; },
+      exists(p){ return !!w.statAt(abs(p)); },
+      stat(p){ const st=w.statAt(abs(p)); return st?{ type:isDir(st.mode)?'dir':'file', size:st.size }:null; },
+      list(p){ const path=abs(p); const st=w.statAt(path); return st&&isDir(st.mode)?w.readdirAt(path):null; },
       mkdir(p){ return w.makeDir(abs(p))===0; },
-      remove(p){ const path=abs(p); const n=w.lookup(path); return n?w.removeNode(path,n.type==='dir')===0:false; },
+      remove(p){ const path=abs(p); const st=w.statAt(path); return st?w.removeNode(path,isDir(st.mode))===0:false; },
     };
   }
   // Drop a pipe's buffers once no fd references it (close/dup2 both funnel here).
@@ -402,20 +608,22 @@ export class WasiShim {
     for(const f of this.fds.values()) if(f.type==='pipe'&&f.pipe===idx) return;
     this.pipes[idx]=null;
   }
-  // Detach a path from the FS map and its parent's child list. Open fds keep
-  // their node reference, so unlink-while-open reads keep working (POSIX-ish).
-  unlinkEntry(path){
-    delete this.fs[path];
-    const parent=this.lookup(parentOf(path));
-    if(parent&&parent.children) delete parent.children[path.slice(path.lastIndexOf('/')+1)];
-  }
   // path_unlink_file / path_remove_directory: wantDir picks which is legal.
   removeNode(path,wantDir){
-    const node=this.lookup(path);
-    if(!node) return E.NOENT;
-    if(wantDir!==(node.type==='dir')) return wantDir?E.NOTDIR:E.INVAL;
-    if(wantDir&&node.children&&Object.keys(node.children).length) return E.NOTEMPTY;
-    this.unlinkEntry(path);
+    const { st, errno }=this.statOf(path);
+    if(!st) return errno;
+    // The store says EISDIR here; unlink of a directory has answered EINVAL
+    // since this shim's first line, and busybox's messages are tuned to it.
+    if(wantDir!==isDir(st.mode)) return wantDir?E.NOTDIR:E.INVAL;
+    if(st.device) return E.PERM;               // /dev is the shim's, not the guest's
+    try {
+      if(wantDir) this.store.rmdirSync(path);
+      else {
+        const cell=this.snapshotOpenFds(path,st);   // reads only
+        this.store.unlinkSync(path);                // may throw: nothing committed yet
+        this.adoptSnapshot(path,cell);
+      }
+    } catch(e) { return wasiErrno(e); }
     return 0;
   }
   str(p,len){ return DEC.decode(this.bytes().subarray(p,p+len)); }
@@ -430,25 +638,60 @@ export class WasiShim {
   cstrv(p,cap=4096){ const out=[]; if(!p) return out; for(let q=p;out.length<cap;q+=4){ const s=this.dv().getUint32(q,true); if(!s) break; out.push(this.cstr(s)); } return out; }
   iovecs(iovs,n){ const out=[]; for(let i=0;i<n;i++){ const buf=this.dv().getUint32(iovs+i*8,true); const l=this.dv().getUint32(iovs+i*8+4,true); out.push(this.bytes().subarray(buf,buf+l)); } return out; }
   resolve(fd,path){ if(path.startsWith('/')) return normalize(path); const base=(this.fds.get(fd)||{}).path||'/'; return normalize(base.replace(/\/$/,'')+'/'+path); }
-  lookup(path){ return this.fs[normalize(path)]||null; }
-  writeFilestat(out,node){ const d=this.dv(); if(!node.ino) node.ino=this.nextIno++; d.setBigUint64(out,1n,true); d.setBigUint64(out+8,BigInt(node.ino),true); d.setUint8(out+16,node.type==='dir'?FT.DIR:(node.type==='char'?FT.CHAR:FT.REG)); d.setBigUint64(out+24,1n,true); d.setBigUint64(out+32,BigInt(node.data?node.data.length:0),true); for(const o of [40,48,56]) d.setBigUint64(out+o,0n,true); }
+  // Introspection for tests and debugging, in the shape the private FS map
+  // used to have. `data` is a getter because reading a whole file to answer a
+  // stat would be absurd; nothing on a hot path goes through here.
+  lookup(path){
+    const st=this.statAt(path);
+    if(!st) return null;
+    const w=this, abs=normalize(path);
+    return {
+      type:isDir(st.mode)?'dir':(isChar(st.mode)?'char':'reg'), ino:st.ino, size:st.size,
+      get data(){ const out=new Uint8Array(st.size); if(st.size&&!st.device) w.store.readSync(abs,out,0,st.size); return out; },
+    };
+  }
+  // filestat: dev, ino, filetype, nlink, size, then atim/mtim/ctim in
+  // NANOSECONDS. The times used to be three zeroes, which is invisible until
+  // something caches by mtime and never notices an edit.
+  writeFilestat(out,st){
+    const d=this.dv();
+    d.setBigUint64(out,st.device?DEV_DEV:1n,true);
+    d.setBigUint64(out+8,BigInt(st.ino||0),true);
+    d.setUint8(out+16,isDir(st.mode)?FT.DIR:(isChar(st.mode)?FT.CHAR:FT.REG));
+    d.setBigUint64(out+24,BigInt(st.nlink ?? 1),true);   // ?? not ||: nlink 0 is real
+    d.setBigUint64(out+32,BigInt(st.size||0),true);
+    d.setBigUint64(out+40,msToNs(st.atimeMs),true);
+    d.setBigUint64(out+48,msToNs(st.mtimeMs),true);
+    d.setBigUint64(out+56,msToNs(st.ctimeMs),true);
+  }
 }
 
 function strBytes(s){ return ENC.encode(s); }
 function bytesOf(b){ return typeof b==='string'?strBytes(b):(b||EMPTY); }
 function envObj(list){ const o={}; for(const kv of list){ const i=kv.indexOf('='); if(i>0) o[kv.slice(0,i)]=kv.slice(i+1); } return o; }
 function parentOf(p){ const s=p.lastIndexOf('/'); return s>0?p.slice(0,s):'/'; }
-function normalize(p){ const parts=p.split('/').filter(x=>x&&x!=='.'); const st=[]; for(const x of parts){ if(x==='..')st.pop(); else st.push(x); } return '/'+st.join('/'); }
-function buildFs(files){
-  const fs={ '/':{type:'dir',children:{}}, '/dev':{type:'dir',children:{}}, '/dev/null':{type:'char'}, '/tmp':{type:'dir',children:{}} };
-  fs['/'].children['dev']={type:'dir'}; fs['/'].children['tmp']={type:'dir'}; fs['/dev'].children['null']={type:'char'};
-  for(const [path,content] of Object.entries(files)){
+function ownsDevPath(p){ return p==='/dev'||p.startsWith('/dev/'); }
+function joinPath(dir,name){ return dir==='/'?`/${name}`:`${dir}/${name}`; }
+function msToNs(ms){ return BigInt(Math.round((ms||0)*1e6)); }
+// Write `files` into an INJECTED store, through the contract — mkdir -p, then
+// replace. Only what the embedder passed as `files` is written: mounting a
+// store is not a licence to reshape it.
+function seedInto(store,files){
+  // Only the lookup is allowed to fail meaninglessly here. Widening the catch
+  // to cover the write would report a read-only store as EEXIST — the wrong
+  // reason, at the point where the right one is the only useful thing.
+  const present=(path)=>{ try { store.statSync(path); return true; } catch { return false; } };
+  for(const [path,content] of Object.entries(files||{})){
     const abs=normalize(path.startsWith('/')?path:'/'+path);
-    const data=typeof content==='string'?strBytes(content):content;
-    fs[abs]={type:'reg',data};
-    // ensure parent dirs + child links
-    const segs=abs.split('/').filter(Boolean); let cur='';
-    for(let i=0;i<segs.length;i++){ const parent=cur||'/'; cur=(cur==='/'?'':cur)+'/'+segs[i]; if(i<segs.length-1){ if(!fs[cur])fs[cur]={type:'dir',children:{}}; if(!fs[parent].children)fs[parent].children={}; fs[parent].children[segs[i]]={type:'dir'}; } else { if(!fs[parent].children)fs[parent].children={}; fs[parent].children[segs[i]]={type:'reg'}; } }
+    const segs=abs.split('/').filter(Boolean);
+    let dir='';
+    for(let i=0;i<segs.length-1;i++){
+      dir=`${dir}/${segs[i]}`;
+      if(!present(dir)) store.mkdirSync(dir,{});
+    }
+    if(!present(abs)) store.createFileSync(abs,{});
+    const bytes=bytesOf(content);
+    if(bytes.length) store.writeSync(abs,bytes,0);
+    store.touchSync(abs,{size:bytes.length});
   }
-  return fs;
 }

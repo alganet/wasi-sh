@@ -61,6 +61,10 @@ self.addEventListener('message', async (e) => {
     const post = (channel) => (b) => self.postMessage({ type: 'out', channel, bytes: b }, [b.buffer]);
     const shim = new WasiShim({
       args, env, files,
+      // A store is a live object, so like `builtins` it can only be registered
+      // from inside the worker — structured clone would strip its methods.
+      // serve({ async fs() {...} }) covers the ones that must be opened first.
+      fs: typeof config.fs === 'function' ? await config.fs() : config.fs,
       stdout: post('stdout'),
       stderr: post('stderr'),
       input, builtins,

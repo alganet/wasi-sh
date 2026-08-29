@@ -22,6 +22,8 @@ export interface ShimInput {
   takeWinch?(): boolean;
 }
 
+import type { FileSystem } from './fs.mjs';
+
 export type Files = Record<string, string | Uint8Array>;
 
 /** The in-memory FS, as a host builtin sees it. Relative paths resolve against
@@ -99,10 +101,19 @@ export interface WasiShimOptions {
   args?: string[];
   env?: Record<string, string>;
   /**
-   * In-memory FS content, absolute paths. Writable inside the sandbox
-   * (copy-on-write; your buffers are never mutated, state dies with the run).
+   * FS content at absolute paths. With the default store this is an in-memory
+   * mount, writable inside the sandbox (copy-on-write; your buffers are never
+   * mutated, state dies with the run). With `fs`, these files are written into
+   * that store — the one thing a mount is allowed to change about it.
    */
   files?: Files;
+  /**
+   * The filesystem this shell runs on (see `wasi-sh/fs`). Omitted, it gets
+   * memoryFs(files) — a sealed sandbox, exactly as before. A store is
+   * injected, never ambient: a read-only store is a read-only shell, with
+   * nothing shell-side to bypass it. /dev/null stays the shim's either way.
+   */
+  fs?: FileSystem;
   stdout?: (bytes: Uint8Array) => void;
   stderr?: (bytes: Uint8Array) => void;
   input?: ShimInput;

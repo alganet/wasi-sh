@@ -1,4 +1,5 @@
 import type { Files, HostBuiltins, BuiltinMap } from './shim.mjs';
+import type { FileSystem } from './fs.mjs';
 
 export type WasmSource =
   | URL
@@ -20,6 +21,15 @@ export interface RunOptions {
   /** Fixed stdin content; the guest reads it, then EOF. */
   stdin?: string | Uint8Array;
   files?: Files;
+  /**
+   * The filesystem to run on; omitted, an in-memory store seeded with `files`.
+   * A store is a live object, so this needs inline:true — a Worker run
+   * registers one with serve({ fs }) instead.
+   *
+   * `files` are written into it, and so is `script`, which is mounted at
+   * /main.sh — worth knowing when the store is a real directory.
+   */
+  fs?: FileSystem;
   /** Merged over PATH=/ HOME=/ TERM=xterm-256color LANG=C.UTF-8. */
   env?: Record<string, string>;
   /** Defaults to the bundled busybox.wasm. */
