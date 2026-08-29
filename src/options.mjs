@@ -120,7 +120,9 @@ export async function resolveBuiltins(spec) {
 // so the common one-verb-one-function shape ignores the second argument. An
 // object that ALREADY has request() is passed through untouched — that is the
 // extension point for a dynamic namespace, a proxy to another port, or an
-// allowlist wrapper around one.
+// allowlist wrapper around one. A map with a verb literally named `request`
+// and nothing else is read as a port; one with other verbs beside it is
+// refused, because the two shapes swap their handler's arguments.
 //
 // hasOwn for the same reason hostBuiltins uses it: a bare property lookup would
 // make `toString` and `constructor` reachable verbs.
@@ -130,7 +132,24 @@ export async function resolveBuiltins(spec) {
 // answering with silence would look like a verb that ran and had nothing to say.
 export function hostPort(spec) {
   if (!spec) return undefined;
-  if (typeof spec.request === 'function') return spec;
+  if (typeof spec.request === 'function') {
+    // `request` is a plausible verb name, and a map containing one is
+    // indistinguishable from a port — while the two call the handler with the
+    // SAME two arguments in the OPPOSITE order, which is a bug that looks like
+    // working code. When there are other verbs beside it there is no honest
+    // guess to make, so say so rather than pick.
+    const others = Object.keys(spec).filter((k) => k !== 'request' && typeof spec[k] === 'function');
+    if (others.length) {
+      throw new Error(
+        `host: this object has a request() and ${others.length} other function-valued `
+        + `key${others.length > 1 ? 's' : ''} (${others.join(', ')}), so it reads as both a port `
+        + 'and a verb map — and their handlers take (verb, payload) and (payload, verb) '
+        + 'respectively. Say which: pass a port whose request() dispatches the map itself, '
+        + 'or rename the verb.'
+      );
+    }
+    return spec;
+  }
   return {
     request(verb, payload) {
       if (!Object.hasOwn(spec, verb) || typeof spec[verb] !== 'function') throw new Error('no such verb');

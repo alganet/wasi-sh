@@ -114,7 +114,14 @@ export interface HostBuiltins {
  */
 export type HostVerb = (payload: Uint8Array, verb: string) => Uint8Array | ArrayBuffer | ArrayBufferView | string | null | void;
 
-/** A verb → handler map, the 95% case. An unregistered verb fails the write. */
+/**
+ * A verb → handler map, the 95% case. An unregistered verb fails the write.
+ *
+ * A map is told from a `HostPort` by its `request` method, so a verb literally
+ * named `request` is ambiguous: alone it is read as a port, and alongside other
+ * verbs it is refused rather than guessed at — the two shapes hand their
+ * handler the same two arguments in the opposite order.
+ */
 export type HostVerbMap = Record<string, HostVerb>;
 
 /**
