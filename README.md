@@ -354,11 +354,9 @@ needs no shared memory, no `Atomics.wait` and no cross-origin isolation. Async
 setup goes in the factory form, which is awaited once before the shell starts.
 
 A verb that throws, returns a promise, or answers with something that is not
-bytes fails that one write and says why on stderr; the shell lives. Whether the
-failure reaches `$?` is the writer's business rather than the port's — `echo`
-is an ash builtin and checks its write, while `printf` goes through buffered
-stdio and never looks. **The reliable signal is the response**: a failed
-request leaves nothing to read.
+bytes fails that one write and says why on stderr; the shell lives. The failure
+reaches `$?` — `echo verb > /dev/host || handle_it` works — and a failed
+request leaves nothing to read, so a script can test either.
 
 In a browser, register the port in the worker exactly as with builtins — a
 capability object cannot be structured-cloned either:

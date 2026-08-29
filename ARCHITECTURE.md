@@ -471,12 +471,16 @@ bytes fails one write with `EIO`. Two details are specific to a device:
   guest's linear memory, which `memory.grow` can detach and the guest overwrites
   immediately; a response may come from a handler's reused scratch buffer.
 
-**Whether a failure reaches `$?` is the writer's business, not the port's.**
-`echo` is an ash builtin and checks its write, so `echo verb > /dev/host` fails
-properly; `printf` is an applet writing through buffered stdio and never looks,
-so its status says 0 while the diagnostic still lands and the response is empty.
-The reliable signal is the response — the same stdio-owns-the-buffer family as
-a short-reading applet leaving bytes behind in a pipeline.
+**A device sees one write, never a scatter.** `fd_write` gathers iovecs and,
+when a later buffer fails after an earlier one landed, reports a *short write* —
+which asks the caller to send the remainder again. That protocol assumes the
+bytes it disclaims were never acted on, and a device has already acted: the
+retry would run a verb the port had just run. So the iovecs are joined and a
+device write is one call with one result, the way a character device's
+`write(2)` reads to the program making it. That is also what makes the failure
+reach `$?` from a buffered writer, whose flush is a two-iovec `writev` of the
+`FILE` buffer plus the caller's bytes: `echo verb > /dev/host || handle_it`
+works, and so does the same line with `printf`.
 
 **Devices got two capabilities for this**, both general: a device may refuse an
 open, and a device write may fail instead of every one being reported as

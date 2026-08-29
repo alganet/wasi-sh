@@ -272,6 +272,36 @@ test('a failing request ends the write; later lines in it never run', () => {
   assert.deepEqual(ran, ['first', 'bad', 'after']);
 });
 
+// The short-write protocol asks the caller to send the rest again, and a device
+// has already ACTED on what it took. A scatter whose later buffer failed would
+// come back and run a verb the port had already run.
+test('a scattered write is one device write, so nothing is dispatched twice', () => {
+  const ran = [];
+  const t = makeShim({ request: (v) => { ran.push(v); if (v === 'bad') throw new Error('x'); return ''; } });
+  const fd = openHost(t);
+  const first = enc.encode('a\n'), second = enc.encode('c\nbad\n');
+  t.bytes().set(first, 0x1000);
+  t.bytes().set(second, 0x1100);
+  t.view().setUint32(0x600, 0x1000, true); t.view().setUint32(0x604, first.length, true);
+  t.view().setUint32(0x608, 0x1100, true); t.view().setUint32(0x60c, second.length, true);
+  const errno = t.p1.fd_write(fd, 0x600, 2, 0x700);
+  assert.equal(errno, EIO, 'the whole call failed, so there is nothing to retry');
+  assert.equal(t.view().getUint32(0x700, true), 0, 'and no partial count inviting one');
+  assert.deepEqual(ran, ['a', 'c', 'bad']);
+});
+
+test('a scattered write that succeeds reports every byte', () => {
+  const t = makeShim({ request: () => '' });
+  const fd = openHost(t);
+  const first = enc.encode('a b'), second = enc.encode('c\n');
+  t.bytes().set(first, 0x1000);
+  t.bytes().set(second, 0x1100);
+  t.view().setUint32(0x600, 0x1000, true); t.view().setUint32(0x604, first.length, true);
+  t.view().setUint32(0x608, 0x1100, true); t.view().setUint32(0x60c, second.length, true);
+  assert.equal(t.p1.fd_write(fd, 0x600, 2, 0x700), 0);
+  assert.equal(t.view().getUint32(0x700, true), 5, 'a verb split across iovecs is still one request');
+});
+
 // fd 2 can be redirected onto this very device; a diagnostic written through
 // writeFd(2) would re-enter the port mid-dispatch. The sink cannot be
 // redirected, which is why it is the one used.
@@ -321,22 +351,22 @@ test('an unregistered verb fails the script, not silently', async () => {
   );
   assert.match(r.stdout, /refused/);
   assert.match(r.stderr, /\/dev\/host: nope: no such verb/);
-  assert.match(r.stderr, /write error/, 'the shell reports the failed write too');
+  assert.match(r.stderr, /write error/, 'and the shell reports the failed write');
 });
 
-// Whether the write's STATUS carries the failure is the writer's business, not
-// the port's: `echo` is an ash builtin and checks its write, while `printf` is a
-// busybox applet writing through buffered stdio and never looks. The errno
-// reaches the guest either way and the diagnostic always lands, so the reliable
-// signal is the RESPONSE — a failed request leaves nothing to read.
-test('a busybox applet may not check the write; the response still tells', async () => {
+// A buffered writer reaches the device through a two-iovec writev — the FILE's
+// buffer and the caller's bytes — so this is what a short write would break: on
+// a partial count stdio retries the remainder and loses the error along the way,
+// leaving a failed request reported as success.
+test('a failure reaches $? through a buffered writer too', async () => {
   const r = await sh(
-    "printf 'nope\\n' > /dev/host; echo \"status=$?\"\n"
+    "printf 'nope\\n' > /dev/host; echo \"printf=$?\"\n"
+    + 'echo nope > /dev/host; echo "echo=$?"\n'
     + 'echo "answer=[$(cat /dev/host)]"\n',
     { host: { yes: () => 'ok' } },
   );
-  assert.equal(r.stdout, 'status=0\nanswer=[]\n', 'printf`s stdio swallowed it');
-  assert.match(r.stderr, /no such verb/, 'but the port said why');
+  assert.equal(r.stdout, 'printf=1\necho=1\nanswer=[]\n');
+  assert.match(r.stderr, /no such verb/, 'and the port said why');
 });
 
 // Capabilities are injected, never ambient: the default port is nothing.
