@@ -439,6 +439,16 @@ two commands, so two opens — and a fork-free shell restores a redirection with
 `dup2`, which replaces an fd's record without `fd_close` ever seeing it. Nothing
 per-descriptor could survive between the two halves of a single exchange.
 
+Which makes the queue's lifetime the interesting question, and it is **one
+write, one answer**: a write drops whatever was still unread, and a write that
+fails drops what it had just produced. Both come from the same reasoning. An
+answer nobody read must not arrive prepended to somebody else's — for a
+capability port that is a leak sideways, not a surprise — and a write that
+reported that none of it happened must not leave evidence that some of it did,
+since the response is exactly the signal a script is told to trust when a
+buffered writer swallows the status. Side effects still cannot be taken back,
+which is why a failing line stops the batch rather than letting the rest run.
+
 **Security is a property of the port.** No `host` and the device is still there,
 refusing every open with `EPERM`: *"this session did not grant it"* and *"this
 build has no port"* are different answers, and only the second should be
