@@ -37,17 +37,30 @@
 // because that is what the ecosystem's stores throw. The shim translates to
 // WASI's numbering at its edge.
 
-/** Errors a store may throw, as Linux errno numbers. */
+/**
+ * Errors a store may throw, as LINUX errno numbers — every code the shim
+ * knows how to translate. Not a short list on purpose: a `.code` with no entry
+ * here would get a number that contradicts it.
+ */
 export const ERRNO = {
-  EPERM: 1, ENOENT: 2, EBADF: 9, EACCES: 13, EBUSY: 16, EEXIST: 17, ENOTDIR: 20,
-  EISDIR: 21, EINVAL: 22, ENOSPC: 28, EROFS: 30, ENOSYS: 38, ENOTEMPTY: 39,
+  EPERM: 1, ENOENT: 2, EIO: 5, EBADF: 9, EAGAIN: 11, ENOMEM: 12, EACCES: 13,
+  EBUSY: 16, EEXIST: 17, EXDEV: 18, ENOTDIR: 20, EISDIR: 21, EINVAL: 22,
+  ENFILE: 23, EMFILE: 24, EFBIG: 27, ENOSPC: 28, ESPIPE: 29, EROFS: 30,
+  EMLINK: 31, EPIPE: 32, ENAMETOOLONG: 36, ENOSYS: 38, ENOTEMPTY: 39, ELOOP: 40,
 };
 
-/** Build the error a store throws: `.code` is the name, `.errno` the number. */
+/**
+ * Build the error a store throws: `.code` is the name, `.errno` the number.
+ *
+ * An unknown code leaves `.errno` undefined rather than inventing one — a
+ * wrong number is worse than a missing one, since the shim translates by
+ * number and would report something plausible and false. It falls back to EIO
+ * for a code it does not recognize, which is at least true.
+ */
 export function fsError(code, path) {
   const err = new Error(path === undefined ? code : `${code}: ${path}`);
   err.code = code;
-  err.errno = ERRNO[code] ?? ERRNO.EINVAL;
+  err.errno = ERRNO[code];
   if (path !== undefined) err.path = path;
   return err;
 }

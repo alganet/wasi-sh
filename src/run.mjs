@@ -30,6 +30,7 @@ async function runInline(options) {
     args: argv,
     env: mergeEnv(options.env),
     files: { ...extraFiles, ...(options.files || {}) },
+    fs: options.fs,
     stdout: sink('stdout'),
     stderr: sink('stderr'),
     input: fixedInput(options.stdin),
@@ -68,6 +69,16 @@ async function runInWorker(options) {
   // Handlers are functions and postMessage structured-clones its payload, so
   // `builtins` cannot cross into a stock worker. Registering them inside a
   // custom worker module with serve() is the supported route.
+  // A store has methods and `builtins` are functions; structured clone keeps
+  // neither, so both have to be registered inside the worker with serve().
+  if (options.fs && !options.worker && !options.workerUrl) {
+    throw new Error(
+      'run({ fs }) needs a worker that registers the store: a filesystem cannot '
+      + 'be structured-cloned into a Worker. Either pass inline:true to run on '
+      + "the calling thread, or call serve({ fs }) from 'wasi-sh/worker' in a "
+      + 'worker module and pass it as workerUrl.'
+    );
+  }
   if (options.builtins && !options.worker && !options.workerUrl) {
     throw new Error(
       'run({ builtins }) needs a worker that registers them: handler functions '

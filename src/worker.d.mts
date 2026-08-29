@@ -9,6 +9,7 @@
  *           { type:'ready' } | { type:'exit', code } | { type:'error', msg }
  */
 import type { HostBuiltins, BuiltinMap } from './shim.mjs';
+import type { FileSystem } from './fs.mjs';
 
 export interface ServeOptions {
   /**
@@ -18,6 +19,14 @@ export interface ServeOptions {
    * OPFS). Handlers themselves must be synchronous.
    */
   builtins?: BuiltinMap | HostBuiltins | (() => BuiltinMap | HostBuiltins | Promise<BuiltinMap | HostBuiltins>);
+  /**
+   * The filesystem this worker's shell runs on; omitted, it gets the default
+   * in-memory store seeded with `files`. Like builtins, a store is a live
+   * object that cannot be structured-cloned into a Worker, so this is the only
+   * way one reaches a browser session. The factory form is awaited before the
+   * shell starts — where opening OPFS or asking for a directory handle goes.
+   */
+  fs?: FileSystem | (() => FileSystem | Promise<FileSystem>);
 }
 
 /**
