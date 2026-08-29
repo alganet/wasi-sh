@@ -202,7 +202,16 @@ export class WasiShim {
    * At least one of `read`/`write` is required; the missing half means what it
    * says (nothing to read, nothing that may be written). `write` returns an
    * errno to refuse a write, or nothing for success, and `open` refuses an
-   * open the same way.
+   * open the same way. `read` speaks that same vocabulary: bytes, or an errno
+   * — which is how a device that can block says EAGAIN, since an empty read
+   * already means EOF.
+   *
+   * `poll` is optional and its PRESENCE is the signal. Without it the device
+   * is readable the moment it is asked. With it, poll_oneoff asks before
+   * reporting readable — required of any device whose read can WAIT, because
+   * otherwise the wait lands in the read that follows and nothing there can
+   * end it. It must answer true at end-of-stream too, so the read behind it
+   * gets to report EOF.
    *
    * `owner` identifies the OPEN DESCRIPTION a call arrives through — fresh per
    * open, shared across dup/dup2 as POSIX shares a file offset. A device
@@ -210,8 +219,11 @@ export class WasiShim {
    * not can ignore it.
    */
   addDevice(path: string, device: {
-    read?(max: number, owner: object): Uint8Array;
+    read?(max: number, owner: object, nonblock: boolean): Uint8Array | number;
     write?(bytes: Uint8Array, owner: object): number | void;
     open?(): number | void;
+    /** True when a read would not block — including at end-of-stream. `ms`
+     *  null means park indefinitely, which is what an untimed guest poll does. */
+    poll?(ms: number | null): boolean;
   }): this;
 }
