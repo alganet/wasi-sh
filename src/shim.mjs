@@ -227,6 +227,10 @@ export class WasiShim {
         // pass straight through.)
         if(f.device){
           const b=bufs.length===1?bufs[0]:joinBytes(bufs);
+          // write(2) with nothing to write is a no-op, and the device must not
+          // hear about it: for the host port it would end an exchange that a
+          // real write is still in the middle of.
+          if(!b.length){ w.dv().setUint32(out,0,true); return 0; }
           const errno=w.writeFd(fd,b);
           w.dv().setUint32(out,errno?0:b.length,true);
           return errno;
@@ -484,8 +488,8 @@ export class WasiShim {
     // that may be written.
     this.devices.set(p,{
       ino:this.nextDevIno++,
-      read:typeof dev.read==='function'?(max)=>dev.read(max):()=>EMPTY,
-      write:typeof dev.write==='function'?(b)=>dev.write(b):()=>E.PERM,
+      read:typeof dev.read==='function'?(max,owner)=>dev.read(max,owner):()=>EMPTY,
+      write:typeof dev.write==='function'?(b,owner)=>dev.write(b,owner):()=>E.PERM,
       open:typeof dev.open==='function'?()=>dev.open():null,
     });
     return this;
@@ -585,7 +589,11 @@ export class WasiShim {
       }
       return { data, errno:0 };
     }
-    if(f.device) return { data:f.device.read(max), errno:0 };          // /dev/null EOF
+    // The offset cell identifies the OPEN DESCRIPTION — fresh per path_open,
+    // shared across dup/dup2 exactly as POSIX shares an offset. A device that
+    // holds per-exchange state (the host port does) needs to know which open
+    // it is being spoken to through; one that does not can ignore it.
+    if(f.device) return { data:f.device.read(max,this.pos(f)), errno:0 };   // /dev/null EOF
     if(f.type==='pipe'){
       const pi=this.pipes[f.pipe];
       if(!pi) return { data:EMPTY, errno:0 };
@@ -637,7 +645,7 @@ export class WasiShim {
     // and EIO when a verb fails. /dev/null returns nothing, which is 0.
     // Reporting those bytes as written would make a failed request look like a
     // delivered one.
-    else if(f.device) return f.device.write(b)||0;
+    else if(f.device) return f.device.write(b,this.pos(f))||0;
     else if(f.type==='pipe'){ const pi=this.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
     else if(f.type==='file'){
       const p=this.pos(f);
@@ -743,6 +751,7 @@ export class WasiShim {
     let pending=EMPTY;          // a request line still waiting for its newline
     let response=[];            // answers not yet read back
     let responseLen=0;
+    let writer=null;            // the open description the pending exchange belongs to
     // Diagnostics go to the shim's stderr SINK, never through writeFd(2). fd 2
     // can be redirected onto this very device (`cmd > /dev/host 2>/dev/host`),
     // and an error written there would re-enter the port in the middle of a
@@ -795,15 +804,24 @@ export class WasiShim {
         responseLen-=take;
         return out;
       },
-      write(b){
+      write(b,owner){
         if(!w.host) return E.PERM;
-        // The device answers the MOST RECENT request. Anything still queued
-        // from an earlier one is dropped here rather than prepended to this
-        // answer, so `echo verb > /dev/host; cat /dev/host` means the same
-        // thing whatever ran before it — and an answer nobody read cannot
-        // arrive sideways in an unrelated `cat`, which for a capability port
-        // is a leak and not merely a surprise.
-        response=[]; responseLen=0;
+        // A NEW OPEN is a new exchange, and everything from the last one goes:
+        // a queued answer nobody read, and a half-written request line. The
+        // answer matters most — `echo verb > /dev/host; cat /dev/host` has to
+        // mean the same thing whatever ran before it, and for a capability
+        // port an unread answer surfacing in an unrelated `cat` is a leak and
+        // not merely a surprise. The line matters too, because merging a
+        // previous command's fragment into this one fabricates a request
+        // neither wrote.
+        //
+        // Keyed on the open description rather than on the write, because one
+        // batch legitimately arrives as many writes — `cat requests.txt >
+        // /dev/host` is a single redirection whose chunks all belong together,
+        // which is the same reason `pending` exists at all. The offset cell is
+        // that identity: POSIX shares it across dup/dup2 and path_open makes a
+        // fresh one per open, which is exactly the boundary wanted here.
+        if(owner!==writer){ writer=owner; pending=EMPTY; response=[]; responseLen=0; }
         const buf=pending.length?concatBytes(pending,b):b;
         let start=0, errno=0;
         for(;;){
@@ -818,7 +836,10 @@ export class WasiShim {
           if(errno) break;
         }
         pending=(!errno&&start<buf.length)?buf.slice(start):EMPTY;
-        if(pending.length>HOST_LINE_MAX){ pending=EMPTY; return E.INVAL; }
+        // Sets errno rather than returning: an over-long line is a failed
+        // write like any other, and returning here would step over the clear
+        // below and leave this write's earlier answers readable.
+        if(pending.length>HOST_LINE_MAX){ pending=EMPTY; errno=E.INVAL; }
         // A failed write leaves NOTHING to read. It told the guest that none
         // of this happened, and answers to the lines that did run would say
         // otherwise — while the response is precisely the signal a script is

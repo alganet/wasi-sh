@@ -203,6 +203,40 @@ test('a failed write leaves nothing to read, whatever ran inside it', () => {
   assert.equal(readFd(t, openHost(t)).n, 0, 'the write said none of it happened');
 });
 
+test('an over-long line fails the write, and clears it like any other failure', () => {
+  const t = makeShim({ request: () => 'LEAKED' });
+  const fd = openHost(t);
+  assert.equal(writeFd(t, fd, 'ping\n').errno, 0);
+  const chunk = new Uint8Array(60000).fill(0x41);
+  let errno = 0;
+  for (let i = 0; i < 40 && !errno; i++) errno = writeFd(t, fd, chunk).errno;
+  assert.equal(errno, EINVAL);
+  assert.equal(readFd(t, openHost(t)).n, 0, 'a failed write is a failed write');
+});
+
+// One batch legitimately arrives as many writes — `cat requests.txt >
+// /dev/host` is a single redirection whose chunks all belong together — which
+// is the same reason a partial line is held at all.
+test('a batch spanning several writes through one open keeps every answer', () => {
+  const t = makeShim({ request: (v) => `[${v}]` });
+  const fd = openHost(t);
+  for (const chunk of ['a\nb\n', 'c\nd', '\ne\n']) assert.equal(writeFd(t, fd, chunk).errno, 0);
+  assert.equal(readFd(t, openHost(t)).text, '[a][b][c][d][e]');
+});
+
+// write(2) with nothing to write is a no-op; it must not end an exchange a real
+// write is still in the middle of.
+test('an empty write is a no-op, not the end of an exchange', () => {
+  const t = makeShim({ request: () => 'answer' });
+  const fd = openHost(t);
+  writeFd(t, fd, 'ask\n');
+  t.view().setUint32(0x600, 0x1000, true);
+  t.view().setUint32(0x604, 0, true);
+  assert.equal(t.p1.fd_write(fd, 0x600, 0, 0x608), 0, 'no iovecs at all');
+  assert.equal(t.p1.fd_write(fd, 0x600, 1, 0x608), 0, 'one empty iovec');
+  assert.equal(readFd(t, openHost(t)).text, 'answer', 'the answer is still there');
+});
+
 test('a long response survives being read in pieces', () => {
   const body = 'x'.repeat(700);
   const t = makeShim({ request: () => body });

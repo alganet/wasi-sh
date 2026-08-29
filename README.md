@@ -331,10 +331,10 @@ a payload — and the answer is read back from the same name. A verb answers wit
 a `Uint8Array`, a string, or nothing; the response is raw bytes, so the verb
 decides its own format.
 
-The device holds **the answer to the most recent write**, so `write; read` means
-the same thing whatever the command before it did. A write of several lines is
-one request batch and their answers concatenate; a write that fails leaves
-nothing to read at all.
+Each **open** is one exchange: a redirection's writes all belong together and
+their answers concatenate, however many `write(2)`s they arrive as, while the
+next command starts clean — so `write; read` means the same thing whatever ran
+before it. A write that fails leaves nothing to read at all.
 
 **Capabilities are injected, never ambient.** With no `host` the device is
 still there and every open is `EPERM`, so a script can tell *"this session did
