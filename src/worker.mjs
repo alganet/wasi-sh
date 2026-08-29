@@ -5,11 +5,12 @@
 // Two ways in:
 //   default   run()/spawn() point a plain `new Worker(...)` at this module and
 //             get a shell with no host builtins.
-//   serve()   a CUSTOM worker module imports it to register host builtins.
-//             Handlers are FUNCTIONS and postMessage structured-clones its
-//             payload, so registering them HERE, inside the worker, is the only
-//             way `builtins` can reach a browser session. Point run()/spawn()
-//             at your module with `workerUrl`.
+//   serve()   a CUSTOM worker module imports it to register host builtins, a
+//             filesystem, or the host port. Handlers are FUNCTIONS and
+//             postMessage structured-clones its payload, so registering them
+//             HERE, inside the worker, is the only way `builtins`, `fs` and
+//             `host` can reach a browser session. Point run()/spawn() at your
+//             module with `workerUrl`.
 //
 // serve() must be called SYNCHRONOUSLY at module evaluation, before any
 // top-level await. A task can never interleave with synchronous script
@@ -25,7 +26,7 @@
 //                  { type:'exit', code } | { type:'error', msg }
 import { WasiShim, WasiExit } from './shim.mjs';
 import { RingReader } from './ring.mjs';
-import { fixedInput, resolveBuiltins } from './options.mjs';
+import { fixedInput, resolveBuiltins, resolveHost } from './options.mjs';
 
 let config = {};
 let started = false;
@@ -52,9 +53,12 @@ self.addEventListener('message', async (e) => {
     const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
     // Builtin setup and wasm compilation are independent; overlapping them
     // hides an interpreter-sized init behind the compile.
-    const [builtins, compiled] = await Promise.all([
+    const [builtins, host, compiled] = await Promise.all([
       resolveBuiltins(config.builtins).catch((ex) => {
         throw new Error(`serve({ builtins }): setup failed: ${(ex && ex.message) || ex}`);
+      }),
+      resolveHost(config.host).catch((ex) => {
+        throw new Error(`serve({ host }): setup failed: ${(ex && ex.message) || ex}`);
       }),
       module || WebAssembly.compile(wasmBytes),
     ]);
@@ -67,7 +71,7 @@ self.addEventListener('message', async (e) => {
       fs: typeof config.fs === 'function' ? await config.fs() : config.fs,
       stdout: post('stdout'),
       stderr: post('stderr'),
-      input, builtins,
+      input, builtins, host,
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);

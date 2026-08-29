@@ -114,6 +114,39 @@ export async function resolveBuiltins(spec) {
   return hostBuiltins(typeof spec === 'function' ? await spec() : spec);
 }
 
+// Normalize `host` into the shim's port contract:
+//   request(verb, payload) -> bytes | string | null    execute it, synchronously
+// A plain { verb: handler } map is the 95% case; handlers get (payload, verb)
+// so the common one-verb-one-function shape ignores the second argument. An
+// object that ALREADY has request() is passed through untouched — that is the
+// extension point for a dynamic namespace, a proxy to another port, or an
+// allowlist wrapper around one.
+//
+// hasOwn for the same reason hostBuiltins uses it: a bare property lookup would
+// make `toString` and `constructor` reachable verbs.
+//
+// An unregistered verb THROWS, which the shim reports as a failed write naming
+// the verb — the map form has no other way to say "no such capability", and
+// answering with silence would look like a verb that ran and had nothing to say.
+export function hostPort(spec) {
+  if (!spec) return undefined;
+  if (typeof spec.request === 'function') return spec;
+  return {
+    request(verb, payload) {
+      if (!Object.hasOwn(spec, verb) || typeof spec[verb] !== 'function') throw new Error('no such verb');
+      return spec[verb](payload, verb);
+    },
+  };
+}
+
+// The public `host` option: a verb map, a port, or a factory returning either.
+// The factory is awaited before the shell starts, which is where async setup
+// belongs — every verb itself must be synchronous.
+export async function resolveHost(spec) {
+  if (!spec) return undefined;
+  return hostPort(typeof spec === 'function' ? await spec() : spec);
+}
+
 // The WasiShim input contract over a fixed byte buffer: drain, then EOF.
 // This is the whole of run()'s stdin story — nothing ever blocks on a user.
 export function fixedInput(data) {

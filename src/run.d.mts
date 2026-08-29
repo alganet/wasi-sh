@@ -1,4 +1,4 @@
-import type { Files, HostBuiltins, BuiltinMap } from './shim.mjs';
+import type { Files, HostBuiltins, BuiltinMap, HostPort, HostVerbMap } from './shim.mjs';
 import type { FileSystem } from './fs.mjs';
 
 export type WasmSource =
@@ -54,6 +54,17 @@ export interface RunOptions {
    * to a stock worker throws and says so.
    */
   builtins?: BuiltinMap | HostBuiltins | (() => BuiltinMap | HostBuiltins | Promise<BuiltinMap | HostBuiltins>);
+  /**
+   * The host port — what this script may reach outside the sandbox, as verbs
+   * on /dev/host. A verb → handler map, a HostPort, or a factory (awaited
+   * once) returning either. Omitted, the device is there and every open is
+   * EPERM.
+   *
+   * Like `builtins`, it works directly only with inline:true; a capability
+   * object cannot be structured-cloned into a Worker, so in a browser register
+   * it with serve({ host }) inside a worker module and pass it as `workerUrl`.
+   */
+  host?: HostVerbMap | HostPort | (() => HostVerbMap | HostPort | Promise<HostVerbMap | HostPort>);
 }
 
 export interface RunResult {

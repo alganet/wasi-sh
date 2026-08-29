@@ -102,6 +102,31 @@ export interface HostBuiltins {
   run(ctx: BuiltinContext): number;
 }
 
+/**
+ * One host verb. Gets the request's payload bytes (empty when the request line
+ * carried none) and the verb that selected it; answers with the response bytes,
+ * or nothing.
+ *
+ * MUST be synchronous, for the same reason a builtin must: the guest is a wasm
+ * stack frame below the call and there is nothing to await into. Returning a
+ * Promise fails the write and says so. Do async setup once, up front — see
+ * serve({ async host() {...} }).
+ */
+export type HostVerb = (payload: Uint8Array, verb: string) => Uint8Array | ArrayBuffer | ArrayBufferView | string | null | void;
+
+/** A verb → handler map, the 95% case. An unregistered verb fails the write. */
+export type HostVerbMap = Record<string, HostVerb>;
+
+/**
+ * The resolved port the shim consumes. Implement it directly instead of passing
+ * a map when the namespace is dynamic, or to wrap another port in an allowlist.
+ *
+ * Throwing is contained: the write fails with EIO and the shell survives.
+ */
+export interface HostPort {
+  request(verb: string, payload: Uint8Array): Uint8Array | ArrayBuffer | ArrayBufferView | string | null | void;
+}
+
 export interface WasiShimOptions {
   /** Full argv; busybox is a multicall binary, argv[0] selects the applet. */
   args?: string[];
@@ -129,6 +154,19 @@ export interface WasiShimOptions {
    * is a plain 127 "not found".
    */
   builtins?: HostBuiltins;
+  /**
+   * The host port: what a script can reach outside the sandbox, as verbs on
+   * /dev/host. A request is a line written there — a verb, optionally a space
+   * and a payload — and the answer is read back from the same name:
+   *
+   *     printf 'clipboard.read\n' > /dev/host
+   *     paste=$(cat /dev/host)
+   *
+   * Capabilities are injected, never ambient: with no port the device is still
+   * there and every open is EPERM, so a script can tell "not granted" from
+   * "no such thing".
+   */
+  host?: HostPort;
 }
 
 /**
@@ -143,4 +181,17 @@ export class WasiShim {
   bindMemory(memory: WebAssembly.Memory): void;
   /** The import object for WebAssembly.instantiate. */
   imports(): WebAssembly.Imports;
+  /**
+   * Register a character device in the /dev overlay. The path must be under
+   * /dev — the only namespace the overlay owns — and the inode is assigned
+   * here, so listing, stat and open always answer for the same set of names.
+   *
+   * `write` returns an errno to refuse the write, or nothing for success;
+   * `open` refuses the open the same way.
+   */
+  addDevice(path: string, device: {
+    read(max: number): Uint8Array;
+    write?(bytes: Uint8Array): number | void;
+    open?(): number | void;
+  }): this;
 }
