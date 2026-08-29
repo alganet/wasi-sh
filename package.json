@@ -20,6 +20,7 @@
     "./shim": "./src/shim.mjs",
     "./worker": "./src/worker.mjs",
     "./ring": "./src/ring.mjs",
+    "./fs": "./src/fs.mjs",
     "./files": "./src/files.mjs",
     "./node": "./src/node.mjs",
     "./busybox.wasm": "./dist/busybox.wasm",
