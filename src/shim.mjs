@@ -58,7 +58,7 @@ const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
-const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
 // Stores speak LINUX errno; WASI numbers its own list alphabetically. The two
@@ -92,10 +92,13 @@ const DEV_DEV = 2n;
 const DEV_DIR_INO = 1;
 const DEV_NULL = { read:()=>EMPTY, write:()=>{} };
 
-// A request line held for its terminating newline cannot grow past this. It is
-// not a tuning knob: `yes > /dev/host` writes forever without ever completing
-// a request, and the buffer behind it would grow until the tab dies.
+// What one exchange may hold: a request line waiting for its terminating
+// newline, and answers waiting to be read. Neither is a tuning knob — both are
+// there because a script can write without bound and never read. `yes >
+// /dev/host` completes no request and grows the first; a loop of real requests
+// nobody reads grows the second. Either would run until the tab dies.
 const HOST_LINE_MAX = 1 << 20;
+const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
   constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host }) {
@@ -784,6 +787,10 @@ export class WasiShim {
       // Copied for the same reason writeFd copies: a handler is free to answer
       // out of a scratch buffer it reuses on the next verb.
       if(bytes.length){ response.push(bytes.slice()); responseLen+=bytes.length; }
+      // Answers nobody reads are the other half of the unbounded-growth
+      // problem the line cap covers. ENOSPC rather than EIO: the verb ran and
+      // did its work; there is nowhere left to put what it said.
+      if(responseLen>HOST_QUEUE_MAX) return E.NOSPC;
       return 0;
     };
     return {

@@ -175,6 +175,17 @@ test('an unterminated request line is capped', () => {
   assert.equal(writeFd(t, fd, 'ping\n').errno, 0, 'and the device still works afterwards');
 });
 
+// The other half of the unbounded-growth problem the line cap covers: a loop of
+// real requests whose answers nobody reads.
+test('answers nobody reads are capped too', () => {
+  const t = makeShim({ request: () => 'x'.repeat(65536) });
+  const fd = openHost(t);
+  let errno = 0;
+  for (let i = 0; i < 400 && !errno; i++) errno = writeFd(t, fd, 'ask\n').errno;
+  assert.equal(errno, 51 /* ENOSPC */, 'the verb ran; there was nowhere to put what it said');
+  assert.equal(readFd(t, openHost(t)).n, 0, 'and a failed write is still a failed write');
+});
+
 // ─── responses ───────────────────────────────────────────────────────────────
 
 test('a drained response reads EOF, so `cat` stops instead of hanging', () => {
@@ -435,7 +446,8 @@ test('a verb that throws costs one command, not the session', async () => {
 });
 
 // A capability object cannot be structured-cloned, so a stock Worker cannot be
-// handed one — and silently running without the port would be the worst answer.
+// handed one — and a session that looks right and reaches nothing is the worst
+// answer, because every /dev/host open would then be EPERM with no reason.
 test('run({ host }) into a stock worker refuses instead of dropping it', async () => {
   const { run } = await import('../src/run.mjs');
   await assert.rejects(
