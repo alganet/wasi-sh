@@ -217,7 +217,21 @@ export class WasiShim {
       // out of space, a revoked directory handle — and reporting those bytes
       // as written is silent data loss. Stop at the failure and report the
       // count that did land, exactly as a short write(2) does.
-      fd_write:(fd,iovs,n,out)=>{ if(!w.fds.get(fd)) return E.BADF; const bufs=w.iovecs(iovs,n); let total=0;
+      fd_write:(fd,iovs,n,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const bufs=w.iovecs(iovs,n);
+        // A DEVICE sees one write, never a gather. The short-write protocol
+        // below asks the caller to send the rest again, and a device has
+        // already ACTED on what it took — so a scatter whose later buffer
+        // failed would come back and run a verb the port had already run. A
+        // character device's write(2) is one call with one result; make it so
+        // by joining first. (Single-buffer writes, i.e. nearly all of them,
+        // pass straight through.)
+        if(f.device){
+          const b=bufs.length===1?bufs[0]:joinBytes(bufs);
+          const errno=w.writeFd(fd,b);
+          w.dv().setUint32(out,errno?0:b.length,true);
+          return errno;
+        }
+        let total=0;
         for(const b of bufs){
           const errno=w.writeFd(fd,b);
           if(!errno){ total+=b.length; continue; }
@@ -882,6 +896,7 @@ export class WasiShim {
 function strBytes(s){ return ENC.encode(s); }
 function bytesOf(b){ return typeof b==='string'?strBytes(b):(b||EMPTY); }
 function concatBytes(a,b){ const out=new Uint8Array(a.length+b.length); out.set(a); out.set(b,a.length); return out; }
+function joinBytes(list){ let n=0; for(const b of list) n+=b.length; const out=new Uint8Array(n); let o=0; for(const b of list){ out.set(b,o); o+=b.length; } return out; }
 // What a host verb may answer with. `null` means "none of these" — reported to
 // the embedder rather than coerced, because every wrong shape here coerces to
 // something plausible: a number is truthy with no .length, an object stringifies
