@@ -141,11 +141,12 @@ export function hostPort(spec) {
     const others = Object.keys(spec).filter((k) => k !== 'request' && typeof spec[k] === 'function');
     if (others.length) {
       throw new Error(
-        `host: this object has a request() and ${others.length} other function-valued `
-        + `key${others.length > 1 ? 's' : ''} (${others.join(', ')}), so it reads as both a port `
-        + 'and a verb map — and their handlers take (verb, payload) and (payload, verb) '
-        + 'respectively. Say which: pass a port whose request() dispatches the map itself, '
-        + 'or rename the verb.'
+        `host: this object has a request() alongside ${others.join(', ')}, so it reads as both `
+        + 'a port and a verb map — and the two hand their handler (verb, payload) and '
+        + '(payload, verb) respectively, which is a bug that looks like working code. Say '
+        + 'which: if it is a verb MAP, rename the `request` verb or wrap it in a port whose '
+        + 'request() dispatches the map; if it is a PORT, request() must be the only '
+        + 'function it owns — put the rest on a prototype or close over them.'
       );
     }
     return spec;

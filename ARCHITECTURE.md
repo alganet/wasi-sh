@@ -440,14 +440,24 @@ two commands, so two opens — and a fork-free shell restores a redirection with
 per-descriptor could survive between the two halves of a single exchange.
 
 Which makes the queue's lifetime the interesting question, and it is **one
-write, one answer**: a write drops whatever was still unread, and a write that
-fails drops what it had just produced. Both come from the same reasoning. An
-answer nobody read must not arrive prepended to somebody else's — for a
-capability port that is a leak sideways, not a surprise — and a write that
-reported that none of it happened must not leave evidence that some of it did,
-since the response is exactly the signal a script is told to trust when a
-buffered writer swallows the status. Side effects still cannot be taken back,
-which is why a failing line stops the batch rather than letting the rest run.
+open, one exchange**. A new open drops whatever the last one left — a queued
+answer and a half-written line both — while writes through the same open
+accumulate. An answer nobody read must not arrive prepended to somebody else's,
+which for a capability port is a leak sideways rather than a surprise; and a
+fragment must not be merged into the next command's request, fabricating one
+neither wrote. But a batch legitimately arrives as many writes (`cat
+requests.txt > /dev/host` is one redirection), which is the same reason a
+partial line is held at all — so the boundary cannot be the write.
+
+The identity used is the **offset cell**: `path_open` makes a fresh one per
+open and `dup`/`dup2` share it, which is precisely POSIX's open file
+description. It was already there for file offsets and already means the right
+thing, so a device is simply handed it.
+
+A **failed** write also drops what it just produced, for a different reason: it
+told the guest that none of this happened, and the response is exactly the
+signal a script is asked to trust. Side effects cannot be taken back, which is
+why a failing line stops the batch rather than letting the rest run.
 
 **Security is a property of the port.** No `host` and the device is still there,
 refusing every open with `EPERM`: *"this session did not grant it"* and *"this

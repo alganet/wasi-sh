@@ -128,6 +128,11 @@ export type HostVerbMap = Record<string, HostVerb>;
  * The resolved port the shim consumes. Implement it directly instead of passing
  * a map when the namespace is dynamic, or to wrap another port in an allowlist.
  *
+ * `request` must be the only function the object OWNS — that is what tells a
+ * port from a `HostVerbMap` with a verb named `request`, and the two swap their
+ * handler's arguments. Helpers belong on a prototype (a class port is fine) or
+ * closed over; an object owning both is refused rather than guessed at.
+ *
  * Throwing is contained: the write fails with EIO and the shell survives.
  */
 export interface HostPort {
@@ -189,16 +194,24 @@ export class WasiShim {
   /** The import object for WebAssembly.instantiate. */
   imports(): WebAssembly.Imports;
   /**
-   * Register a character device in the /dev overlay. The path must be under
-   * /dev — the only namespace the overlay owns — and the inode is assigned
-   * here, so listing, stat and open always answer for the same set of names.
+   * Register a character device in the /dev overlay. The path must be a name
+   * directly under /dev — the only namespace the overlay owns, and flat
+   * because `ls /dev` lists basenames — and the inode is assigned here, so
+   * listing, stat and open always answer for the same set of names.
    *
-   * `write` returns an errno to refuse the write, or nothing for success;
-   * `open` refuses the open the same way.
+   * At least one of `read`/`write` is required; the missing half means what it
+   * says (nothing to read, nothing that may be written). `write` returns an
+   * errno to refuse a write, or nothing for success, and `open` refuses an
+   * open the same way.
+   *
+   * `owner` identifies the OPEN DESCRIPTION a call arrives through — fresh per
+   * open, shared across dup/dup2 as POSIX shares a file offset. A device
+   * holding per-exchange state uses it as that state's boundary; one that does
+   * not can ignore it.
    */
   addDevice(path: string, device: {
-    read(max: number): Uint8Array;
-    write?(bytes: Uint8Array): number | void;
+    read?(max: number, owner: object): Uint8Array;
+    write?(bytes: Uint8Array, owner: object): number | void;
     open?(): number | void;
   }): this;
 }
