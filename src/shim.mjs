@@ -37,6 +37,13 @@
 // ctx is { argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs }.
 // Absent, the shell behaves byte-for-byte as it did before.
 //
+// The `host` port is the fourth seam, and the one aimed outward — at the
+// browser rather than at the shell. One capability object, one virtual device,
+// verbs instead of per-feature plumbing:
+//   request(verb, payload) -> bytes    execute a verb, SYNCHRONOUSLY
+// Reached from a script as /dev/host (see hostDevice()); absent, the device is
+// there and every open is EPERM.
+//
 // Usage:
 //   const shim = new WasiShim({ args, env, files, stdout, stderr, input, builtins });
 //   const { instance } = await WebAssembly.instantiate(module, shim.imports());
@@ -85,14 +92,20 @@ const DEV_DEV = 2n;
 const DEV_DIR_INO = 1;
 const DEV_NULL = { read:()=>EMPTY, write:()=>{} };
 
+// A request line held for its terminating newline cannot grow past this. It is
+// not a tuning knob: `yes > /dev/host` writes forever without ever completing
+// a request, and the buffer behind it would grow until the tab dies.
+const HOST_LINE_MAX = 1 << 20;
+
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
     this.stderr = stderr || this.stdout;
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
     this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
+    this.host = host;                   // { request(verb, payload)->bytes } — see hostDevice()
     this.mem = null; this.view = null; this.u8 = null;
     // The filesystem, as a store (see fs.mjs). Passing one is how a session
     // reaches a real directory or a shared buffer; passing none keeps today's
@@ -111,6 +124,11 @@ export class WasiShim {
     this.devices = new Map();
     this.nextDevIno = DEV_DIR_INO + 1;
     this.addDevice('/dev/null', DEV_NULL);
+    // Registered whether or not a port was handed over: "this session did not
+    // grant it" (EPERM) and "this build has no port at all" (ENOENT) are
+    // different answers, and a script can only act on the difference if the
+    // name is there to be refused.
+    this.addDevice('/dev/host', this.hostDevice());
     // fd table. 0/1/2 std, 3 = preopen "/".
     this.fds = new Map();
     this.fds.set(0, { type:'stdin' });
@@ -173,6 +191,9 @@ export class WasiShim {
           try { st=w.store.createFileSync(path,{}); } catch(e) { return wasiErrno(e); }
         } else if((oflags&1)&&(oflags&4)) return E.EXIST;
         const device=w.devices.get(path);
+        // A device may refuse the open outright — the host port does, with
+        // EPERM, when the embedder handed over no capability object.
+        if(device&&device.open){ const e=device.open(); if(e) return e; }
         if(!device&&!isDir(st.mode)&&(oflags&8)){
           try { w.store.touchSync(path,{size:0}); } catch(e) { return wasiErrno(e); }
         }
@@ -581,7 +602,11 @@ export class WasiShim {
     if(!f) return E.BADF;
     if(f.type==='stdout') this.stdout(b.slice());
     else if(f.type==='stderr') this.stderr(b.slice());
-    else if(f.device){ f.device.write(b); }
+    // A device can refuse: the host port answers EPERM with nothing behind it
+    // and EIO when a verb fails. /dev/null returns nothing, which is 0.
+    // Reporting those bytes as written would make a failed request look like a
+    // delivered one.
+    else if(f.device) return f.device.write(b)||0;
     else if(f.type==='pipe'){ const pi=this.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
     else if(f.type==='file'){
       const p=this.pos(f);
@@ -661,6 +686,105 @@ export class WasiShim {
       remove(p){ const path=abs(p); const st=w.statAt(path); return st?w.removeNode(path,isDir(st.mode))===0:false; },
     };
   }
+  // ---- the host port: /dev/host ----
+  // One capability object, one virtual device, verbs instead of per-feature
+  // plumbing. A request is a LINE written to /dev/host — a verb, optionally a
+  // space and a payload — and the answer is read back from the same name:
+  //
+  //   printf 'clipboard.read\n' > /dev/host
+  //   paste=$(cat /dev/host)
+  //
+  // Line framing rather than write boundaries, because a write boundary is not
+  // one: stdio splits a large payload at its buffer size and the guest's own
+  // `printf` decides where. A blank line is nothing; a line with no verb is a
+  // malformed request and fails the write.
+  //
+  // The buffers belong to the SHIM, not to the fd. Those are two commands, two
+  // opens and two closes — and a fork-free shell restores a redirection with
+  // dup2, so a device fd frequently vanishes without fd_close ever seeing it.
+  // Nothing here can be per-descriptor and survive.
+  //
+  // Security is a property of the port: no `host` and every capability is
+  // absent, refused at open. Hand over one implementing only `clipboard.*` and
+  // that is the whole of what a script can reach.
+  hostDevice(){
+    const w=this;
+    let pending=EMPTY;          // a request line still waiting for its newline
+    let response=[];            // answers not yet read back
+    let responseLen=0;
+    // Diagnostics go to the shim's stderr SINK, never through writeFd(2). fd 2
+    // can be redirected onto this very device (`cmd > /dev/host 2>/dev/host`),
+    // and an error written there would re-enter the port in the middle of a
+    // dispatch. The sink cannot be redirected, so there is no reentrancy to
+    // guard against in the first place.
+    const complain=(verb,msg)=>{ w.stderr(strBytes(`/dev/host: ${verb}: ${msg}\n`)); };
+    const dispatch=(line)=>{
+      if(!line.length) return 0;                       // a blank line is not a request
+      let sp=line.indexOf(0x20);
+      if(sp<0) sp=line.length;
+      const verb=DEC.decode(line.subarray(0,sp));
+      if(!verb){ complain('','a request line must start with a verb'); return E.INVAL; }
+      // Copied, not viewed: `line` is a slice of the guest's linear memory and
+      // a handler that retains its payload would be reading whatever the guest
+      // put there next — or nothing at all, once memory.grow detaches it.
+      const payload=line.slice(Math.min(sp+1,line.length));
+      let out;
+      // Contained exactly as a host builtin's throw is: a JS exception out of a
+      // wasm import unwinds the entire guest stack and the instance is dead.
+      // A broken verb costs one write.
+      try { out=w.host.request(verb,payload); }
+      catch(e){ complain(verb,(e&&e.message)||e); return E.IO; }
+      if(out&&typeof out.then==='function'){
+        out.catch(()=>{});      // nobody owns this rejection
+        complain(verb,'the port returned a Promise; a host verb must be synchronous, because the guest is a wasm frame below this call and there is nothing to await into (do async setup once, in serve({ async host() {…} }))');
+        return E.IO;
+      }
+      const bytes=responseBytes(out);
+      if(bytes===null){ complain(verb,'the port answered with something that is not bytes (expected a Uint8Array, a string, or nothing)'); return E.IO; }
+      // Copied for the same reason writeFd copies: a handler is free to answer
+      // out of a scratch buffer it reuses on the next verb.
+      if(bytes.length){ response.push(bytes.slice()); responseLen+=bytes.length; }
+      return 0;
+    };
+    return {
+      // Refused at OPEN, not at the first read: `cat /dev/host` has to say
+      // "Permission denied" where a script can see it, rather than hand back a
+      // silent EOF that reads as an empty answer.
+      open:()=> w.host?0:E.PERM,
+      read(max){
+        if(!responseLen) return EMPTY;                 // drained: EOF, so `cat` stops
+        const take=Math.min(max,responseLen);
+        const out=new Uint8Array(take);
+        let off=0;
+        while(off<take){
+          const c=response[0], n=Math.min(take-off,c.length);
+          out.set(c.subarray(0,n),off); off+=n;
+          if(n===c.length) response.shift(); else response[0]=c.subarray(n);
+        }
+        responseLen-=take;
+        return out;
+      },
+      write(b){
+        if(!w.host) return E.PERM;
+        const buf=pending.length?concatBytes(pending,b):b;
+        let start=0, errno=0;
+        for(;;){
+          const nl=buf.indexOf(0x0a,start);
+          if(nl<0) break;
+          errno=dispatch(buf.subarray(start,nl));
+          start=nl+1;
+          // Stop at the first failure and drop the rest of this write. WASI has
+          // one result, so an errno here fails the whole write(2) — dispatching
+          // the remaining lines anyway would run requests the guest was just
+          // told never happened.
+          if(errno) break;
+        }
+        pending=(!errno&&start<buf.length)?buf.slice(start):EMPTY;
+        if(pending.length>HOST_LINE_MAX){ pending=EMPTY; return E.INVAL; }
+        return errno;
+      },
+    };
+  }
   // Drop a pipe's buffers once no fd references it (close/dup2 both funnel here).
   gcPipe(idx){
     for(const f of this.fds.values()) if(f.type==='pipe'&&f.pipe===idx) return;
@@ -726,6 +850,20 @@ export class WasiShim {
 
 function strBytes(s){ return ENC.encode(s); }
 function bytesOf(b){ return typeof b==='string'?strBytes(b):(b||EMPTY); }
+function concatBytes(a,b){ const out=new Uint8Array(a.length+b.length); out.set(a); out.set(b,a.length); return out; }
+// What a host verb may answer with. `null` means "none of these" — reported to
+// the embedder rather than coerced, because every wrong shape here coerces to
+// something plausible: a number is truthy with no .length, an object stringifies
+// to [object Object], and both would reach the script as a silently empty or
+// nonsensical response.
+function responseBytes(out){
+  if(out==null) return EMPTY;
+  if(typeof out==='string') return strBytes(out);
+  if(out instanceof Uint8Array) return out;
+  if(out instanceof ArrayBuffer) return new Uint8Array(out);
+  if(ArrayBuffer.isView(out)) return new Uint8Array(out.buffer,out.byteOffset,out.byteLength);
+  return null;
+}
 function envObj(list){ const o={}; for(const kv of list){ const i=kv.indexOf('='); if(i>0) o[kv.slice(0,i)]=kv.slice(i+1); } return o; }
 function parentOf(p){ const s=p.lastIndexOf('/'); return s>0?p.slice(0,s):'/'; }
 function ownsDevPath(p){ return p==='/dev'||p.startsWith('/dev/'); }
