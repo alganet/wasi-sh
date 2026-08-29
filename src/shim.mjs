@@ -74,8 +74,15 @@ const wasiErrno = (err) => WASI_ERRNO[err && err.code] ?? E.IO;
 // must not mean writing device nodes into it, and a read-only store must not
 // lose /dev/null. They shadow the store's own /dev if it has one, and they sit
 // on a different st_dev so their inodes cannot collide with its.
+//
+// One registration, one source of truth. The inode used to come from a
+// hard-coded table beside the map `ls /dev` enumerates, so the two could
+// disagree about what exists — and a device added to the map alone would LIST
+// but never OPEN, because deviceStat() is where every path op starts. Nothing
+// warns; the name is simply there and unusable. addDevice() is the only way in
+// now, and it hands out the inode itself.
 const DEV_DEV = 2n;
-const DEV_INO = { '/dev':1, '/dev/null':2 };
+const DEV_DIR_INO = 1;
 const DEV_NULL = { read:()=>EMPTY, write:()=>{} };
 
 export class WasiShim {
@@ -100,8 +107,10 @@ export class WasiShim {
     }
     this.store = fs || memoryFs(files);
     if (fs) seedInto(this.store, files);
-    this.devices = new Map([['/dev/null', DEV_NULL]]);
     this.bootMs = Date.now();
+    this.devices = new Map();
+    this.nextDevIno = DEV_DIR_INO + 1;
+    this.addDevice('/dev/null', DEV_NULL);
     // fd table. 0/1/2 std, 3 = preopen "/".
     this.fds = new Map();
     this.fds.set(0, { type:'stdin' });
@@ -418,11 +427,23 @@ export class WasiShim {
   // own /dev is shadowed entirely rather than half-visible, so nothing can be
   // written to a name that `ls /dev` will never show.
   ownsPath(path){ return ownsDevPath(path); }
+  // Register a character device in the /dev overlay:
+  //   read(max)      -> bytes            write(bytes) -> errno | undefined
+  // The inode is assigned HERE, which is the whole point — a device is one
+  // entry in one map, so `ls /dev`, stat and open cannot describe different
+  // sets of names.
+  addDevice(path,dev){
+    const p=normalize(path);
+    if(!ownsDevPath(p)) throw new Error(`addDevice: '${p}' is not under /dev, which is the only namespace the overlay owns`);
+    this.devices.set(p,{ ...dev, ino:this.nextDevIno++ });
+    return this;
+  }
   deviceStat(path){
-    const ino=DEV_INO[path];
-    if(ino===undefined) return null;
-    const dir=path==='/dev';
-    if(!dir&&!this.devices.has(path)) return null;
+    if(path==='/dev') return this.devNode(DEV_DIR_INO,true);
+    const dev=this.devices.get(path);
+    return dev?this.devNode(dev.ino,false):null;
+  }
+  devNode(ino,dir){
     const t=this.bootMs;
     return { ino, nlink:1, size:0, mode:(dir?S_IFDIR|0o755:S_IFCHR|0o666), uid:0, gid:0,
       atimeMs:t, mtimeMs:t, ctimeMs:t, device:true };

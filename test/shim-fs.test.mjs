@@ -179,6 +179,33 @@ test('devices are on their own st_dev, so their inodes cannot collide', () => {
   assert.notEqual(devnull.dev, file.dev, 'a device inode is never a store inode');
 });
 
+// The inode used to live in a hard-coded table beside the map `ls /dev`
+// enumerates. A device registered in one and not the other listed but could
+// never be opened — stat is where every path op begins — and nothing warned.
+test('a registered device lists, stats and opens, all from one map', () => {
+  const t = makeShim();
+  t.shim.addDevice('/dev/probe', { read: () => enc.encode('probe'), write: () => {} });
+  const devFd = openPath(t, '/dev');
+  const names = [];
+  for (let cookie = 0n; ; cookie++) {
+    t.p1.fd_readdir(devFd, 0x800, 256, cookie, 0x900);
+    if (t.view().getUint32(0x900, true) === 0) break;
+    const nlen = t.view().getUint32(0x800 + 16, true);
+    names.push(dec.decode(t.bytes().slice(0x800 + 24, 0x800 + 24 + nlen)));
+  }
+  assert.deepEqual(names, ['null', 'probe'], 'ls /dev');
+  const fd = openPath(t, '/dev/probe');
+  assert.equal(dec.decode(readFd(t, fd).data), 'probe', 'and it is the device that answers');
+  const probe = filestat(t, fd), devnull = filestat(t, openPath(t, '/dev/null'));
+  assert.equal(probe.filetype, 2, 'CHAR');
+  assert.notEqual(probe.ino, devnull.ino, 'every device gets its own inode');
+});
+
+test('addDevice refuses a name outside the namespace the overlay owns', () => {
+  const t = makeShim();
+  assert.throws(() => t.shim.addDevice('/tmp/nope', { read: () => new Uint8Array(0) }), /not under \/dev/);
+});
+
 test('the guest cannot remove or rename the device overlay', () => {
   const t = makeShim();
   assert.equal(pathOp(t, 'path_unlink_file', '/dev/null'), 63 /* EPERM */);
