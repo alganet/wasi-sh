@@ -450,13 +450,30 @@ export class WasiShim {
   ownsPath(path){ return ownsDevPath(path); }
   // Register a character device in the /dev overlay:
   //   read(max)      -> bytes            write(bytes) -> errno | undefined
+  //   open()         -> errno | 0        (refuse the open; the port's EPERM)
   // The inode is assigned HERE, which is the whole point — a device is one
   // entry in one map, so `ls /dev`, stat and open cannot describe different
   // sets of names.
   addDevice(path,dev){
     const p=normalize(path);
-    if(!ownsDevPath(p)) throw new Error(`addDevice: '${p}' is not under /dev, which is the only namespace the overlay owns`);
-    this.devices.set(p,{ ...dev, ino:this.nextDevIno++ });
+    // Directly under /dev, and flat. readdirAt('/dev') lists basenames, so
+    // '/dev/bus/usb' would show up as `usb` and then stat as ENOENT at
+    // /dev/usb — the exact list-versus-open divergence one registration point
+    // exists to make impossible.
+    if(parentOf(p)!=='/dev') throw new Error(`addDevice: '${p}' must be a name directly under /dev, the only namespace the overlay owns`);
+    if(typeof dev.read!=='function'&&typeof dev.write!=='function') throw new Error(`addDevice: '${p}' implements neither read nor write`);
+    // Bound calls, not a spread. {...dev} copies own enumerable properties
+    // only, so a class instance would arrive with no methods at all and the
+    // first read would throw out of a wasm import — which unwinds the entire
+    // guest stack and kills the shell over a missing function. The defaults
+    // say what a half-implemented device means: nothing to read, and nothing
+    // that may be written.
+    this.devices.set(p,{
+      ino:this.nextDevIno++,
+      read:typeof dev.read==='function'?(max)=>dev.read(max):()=>EMPTY,
+      write:typeof dev.write==='function'?(b)=>dev.write(b):()=>E.PERM,
+      open:typeof dev.open==='function'?()=>dev.open():null,
+    });
     return this;
   }
   deviceStat(path){

@@ -203,7 +203,24 @@ test('a registered device lists, stats and opens, all from one map', () => {
 
 test('addDevice refuses a name outside the namespace the overlay owns', () => {
   const t = makeShim();
-  assert.throws(() => t.shim.addDevice('/tmp/nope', { read: () => new Uint8Array(0) }), /not under \/dev/);
+  const dev = { read: () => new Uint8Array(0) };
+  assert.throws(() => t.shim.addDevice('/tmp/nope', dev), /directly under \/dev/);
+  // readdirAt('/dev') lists basenames, so a nested name would show up as `usb`
+  // and stat as ENOENT at /dev/usb — the divergence one registration removes.
+  assert.throws(() => t.shim.addDevice('/dev/bus/usb', dev), /directly under \/dev/);
+  assert.throws(() => t.shim.addDevice('/dev/mute', {}), /neither read nor write/);
+});
+
+// {...dev} keeps own enumerable properties only, so a class-instance device
+// would arrive with no methods and the first use would throw out of a wasm
+// import — which unwinds the whole guest stack over a missing function.
+test('a device may be a class instance, and a half-written one still refuses', () => {
+  const t = makeShim();
+  class Clock { constructor(text) { this.text = text; } read() { return enc.encode(this.text); } }
+  t.shim.addDevice('/dev/clock', new Clock('tick'));
+  assert.equal(dec.decode(readFd(t, openPath(t, '/dev/clock')).data), 'tick', 'methods survived registration');
+  t.shim.addDevice('/dev/ro', { read: () => new Uint8Array(0) });
+  assert.equal(writeFd(t, openPath(t, '/dev/ro'), 'x').errno, 63 /* EPERM */, 'no write means read-only, not a crash');
 });
 
 test('the guest cannot remove or rename the device overlay', () => {
