@@ -34,6 +34,21 @@ export async function spawn(options = {}) {
       'needs neither.'
     );
   }
+  // Live objects — handler functions, a store, a capability port — cannot be
+  // structured-cloned, so there is no `builtins`/`fs`/`host` option here: they
+  // are registered inside the worker with serve(). Accepting one and dropping
+  // it silently would hand back a session that looks right and reaches
+  // nothing, which is the failure a capability is least able to report — every
+  // /dev/host open would be EPERM with no reason given. run() already refuses
+  // the same way.
+  for (const name of ['builtins', 'fs', 'host']) {
+    if (!options[name]) continue;
+    throw new Error(
+      `spawn({ ${name} }) is not supported: a live object cannot be structured-cloned into `
+      + `a Worker. Call serve({ ${name} }) from 'wasi-sh/worker' at the top of a worker `
+      + 'module and pass it as workerUrl.'
+    );
+  }
   const { argv, extraFiles } = resolveArgv(options);
   const wasm = await resolveWasmForWorker(options.wasm);
   const sab = createStdinRing(options.stdinBufferSize ?? 65536);

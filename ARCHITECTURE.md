@@ -413,7 +413,7 @@ aimed *outward*, at the browser rather than at the shell. One capability
 object, one virtual device, verbs instead of a hook per feature:
 
 ```js
-spawn({ host: { request(verb, payloadBytes) { /* -> bytes */ } } })
+serve({ host: { request(verb, payloadBytes) { /* -> bytes */ } } })   // in the worker
 ```
 ```sh
 printf 'clipboard.read\n' > /dev/host
