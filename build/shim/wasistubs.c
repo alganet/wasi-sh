@@ -140,8 +140,17 @@ int __wrap_ioctl(int fd, unsigned long req, ...){
  * and --wrap poll routes every poll — including the one inside our ppoll.c — to
  * this wrapper, so the dispatch fires no matter which timed-wait path is used.
  * ash's handler only sets flags (no longjmp for non-INT signals), so invoking
- * it synchronously at poll return is safe. */
+ * it synchronously at poll return is safe.
+ *
+ * An UNTIMED poll is the idle shell: busybox polls with -1 rather than blocking
+ * in read() precisely so a signal can interrupt it, and the host honors that by
+ * parking in poll_oneoff and returning EINTR when a resize ends the park. That
+ * EINTR is ours to justify — it must not surface in a shell that never asked
+ * for WINCH, or an ordinary `read` would fail whenever the window changed. So
+ * the dispatch reports whether it reached a handler, and a wake that delivered
+ * nothing is retried here instead of being handed up. */
 #include <poll.h>
+#include <errno.h>
 extern int __host_winch(void);
 /* ash's signal_handler (what we captured) sets THREE things: gotsig[]/pending_sig
  * — which make dotrap run the WINCH trap, exactly what we want — and libbb's
@@ -152,17 +161,35 @@ extern int __host_winch(void);
  * here, bb_got_signal is ours to manage: clear it right after delivery, keeping
  * gotsig/pending_sig so the trap still fires at ash's next dotrap. */
 extern signed char bb_got_signal;   /* libbb `smallint` = signed char */
-static void winch_dispatch(void){
+/* Returns 1 when a resize was delivered to a handler — i.e. when the EINTR that
+ * carried us here has someone to be EINTR for. */
+static int winch_dispatch(void){
   if (__host_winch() && winch_handler) {
     winch_handler(SIGWINCH);
     bb_got_signal = 0;
+    return 1;
   }
+  return 0;
 }
 extern int __real_poll(struct pollfd *f, nfds_t n, int timeout);
 int __wrap_poll(struct pollfd *f, nfds_t n, int timeout){
-  int r = __real_poll(f, n, timeout);
-  winch_dispatch();
-  return r;
+  for (;;) {
+    int r = __real_poll(f, n, timeout);
+    int e = errno;                  /* read it BEFORE the dispatch: the handler
+                                     * we are about to call is arbitrary code. */
+    int delivered = winch_dispatch();
+    errno = e;
+    if (r >= 0 || e != EINTR) return r;
+    /* EINTR with a handler served: the caller wanted to know. Interactive line
+     * editing retries and keeps its half-typed line; `read` reports failure,
+     * which is what a trapped signal does to it on any other system. */
+    if (delivered) return r;
+    /* Nobody was listening. Re-park rather than failing the caller's read —
+     * but never re-arm a timed poll, whose deadline we would silently double.
+     * This cannot spin: the dispatch consumed the pending flag on its way
+     * through __host_winch(), so the next poll parks on an empty ring. */
+    if (timeout >= 0) return r;
+  }
 }
 
 /* ---- in-process applet support (see ARCHITECTURE.md) ---- */

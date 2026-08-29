@@ -142,14 +142,17 @@ export class RingReader {
   // within the wait rather than only when the timeout elapses.
   winchPending() { return Atomics.load(this.ctrl, IDX_WINCH) !== 0; }
 
-  // True when data is available, waiting up to `ms` for some to arrive. A
-  // pending winch also ends the wait (still returning not-readable) so a resize
-  // during a long `read -t` is delivered promptly — the guest's poll wrapper
-  // then runs and synthesizes the SIGWINCH — instead of only at the timeout.
+  // True when data is available, waiting up to `ms` for some to arrive — or
+  // FOREVER when `ms` is null, which is how a guest poll with no timeout parks.
+  // A pending winch also ends the wait (still returning not-readable) so a
+  // resize during a long `read -t` is delivered promptly — the guest's poll
+  // wrapper then runs and synthesizes the SIGWINCH — instead of only at the
+  // timeout. That break is the whole reason an untimed poll parks HERE rather
+  // than in readBlocking(): a resize can end a poll, and nothing ends a read.
   pollReadable(ms) {
     if (this.readable) return true;
     if (this.closed) return false;
-    if (ms > 0) this._waitFor(() => this.readable || this.closed || this.winchPending(), ms);
+    if (ms == null || ms > 0) this._waitFor(() => this.readable || this.closed || this.winchPending(), ms);
     return this.readable;
   }
 
@@ -202,6 +205,7 @@ export class RingReader {
       wait: (ms) => this.wait(ms),
       closed: () => this.closed,
       winsize: () => this.winsize(),
+      winchPending: () => this.winchPending(),
       takeWinch: () => this.takeWinch(),
     };
   }

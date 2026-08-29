@@ -21,10 +21,11 @@ const TWIN = `
   const { module, files, args, env, sab } = workerData;
   const dec = new TextDecoder();
   let out = '';
+  const emit = (b) => { const s = dec.decode(b); out += s; parentPort.postMessage({ type: 'out', text: s }); };
   const shim = new WasiShim({
     args, env, files,
-    stdout: (b) => { out += dec.decode(b); parentPort.postMessage({ type: 'out' }); },
-    stderr: (b) => { out += dec.decode(b); },
+    stdout: emit,
+    stderr: emit,
     input: new RingReader(sab).toInput(),
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
@@ -50,11 +51,17 @@ function spawnTwin(script, { env = {} } = {}) {
       ringUrl: new URL('../src/ring.mjs', import.meta.url).href,
     },
   });
+  // `live()` is output SO FAR: the winch tests below assert on what the guest
+  // has printed while it is still parked, which an exit-time snapshot cannot say.
+  let seen = '';
   const exited = new Promise((resolve, reject) => {
-    worker.on('message', (m) => { if (m.type === 'exit') { resolve(m); worker.terminate(); } });
+    worker.on('message', (m) => {
+      if (m.type === 'exit') { resolve(m); worker.terminate(); }
+      else if (m.type === 'out') seen += m.text;
+    });
     worker.on('error', reject);
   });
-  return { writer, exited };
+  return { writer, exited, live: () => seen };
 }
 
 const enc = new TextEncoder();
@@ -182,6 +189,50 @@ test('session.resize() synthesizes SIGWINCH and stty size reports live dims', as
   writer.resize(100, 40);                            // cols=100, rows=40
   const m = await exited;
   assert.match(m.out, /WINCH 40 100/, 'trap fired and `stty size` returned the live rows cols');
+});
+
+test('a resize reaches a shell parked in a BLOCKING read', async (t) => {
+  if (!WINCH_READY()) { t.skip('needs the winsize/winch build — run npm run build:wasm'); return; }
+  // The idle shell, and the case the timed tests above cannot see: `read` with
+  // no -t waits forever. It was delivered only when unrelated input arrived,
+  // because the guest sat in fd_read while winch_dispatch lives at poll — so
+  // the host now parks an untimed poll (where a resize can end the wait) and
+  // reports EINTR, instead of claiming readable and letting the read block.
+  const { writer, exited, live } = spawnTwin(
+    "trap 'echo GOT_WINCH' WINCH; read -r x; echo \"after=[$x]\""
+  );
+  await new Promise((res) => setTimeout(res, 300));   // reach the blocking read
+  const t0 = Date.now();
+  writer.resize(100, 40);
+  // Wait for the trap rather than sleeping a fixed span, so `wake` is the real
+  // delivery latency and not whatever the sleep was.
+  while (!/GOT_WINCH/.test(live()) && Date.now() - t0 < 2000) {
+    await new Promise((res) => setTimeout(res, 10));
+  }
+  const wake = Date.now() - t0;
+  const duringPark = live();
+  writer.write(enc.encode('done\n'));                 // let the guest finish
+  await exited;
+  assert.match(duringPark, /GOT_WINCH/, 'the trap fired while parked, with NO input written');
+  assert.ok(wake < 250, `delivered promptly (${wake}ms)`);
+});
+
+test('a resize does not disturb a read in a shell with no WINCH trap', async (t) => {
+  if (!WINCH_READY()) { t.skip('needs the winsize/winch build — run npm run build:wasm'); return; }
+  // The other half of the same change. An untimed poll woken by a resize
+  // returns EINTR, and `read` reports failure on EINTR — correct when a trap
+  // asked to be told, wrong for every shell that never mentioned WINCH. The
+  // guest's __wrap_poll re-parks when the dispatch reached no handler, so a
+  // plain `read` must be untouched by any number of resizes.
+  const { writer, exited, live } = spawnTwin('read -r x; echo "line=[$x]"');
+  await new Promise((res) => setTimeout(res, 250));
+  writer.resize(100, 40);
+  writer.resize(70, 20);
+  await new Promise((res) => setTimeout(res, 400));
+  assert.equal(live(), '', 'the read is still parked — no early return, no output');
+  writer.write(enc.encode('hello\n'));
+  const m = await exited;
+  assert.match(m.out, /line=\[hello\]/, 'the read got its line, whole, after two resizes');
 });
 
 test('repeated resizes each fire (bb_got_signal is cleared, no read -t spin)', async (t) => {
