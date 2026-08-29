@@ -75,6 +75,19 @@ test('hostPort: an object that already has request() passes through untouched', 
   assert.equal(hostPort(port), port, 'a dynamic namespace must not be wrapped');
 });
 
+// A map and a port read identically when the map has a verb named `request`,
+// and their handlers take the SAME two arguments in the OPPOSITE order — a bug
+// that looks like working code. With other verbs beside it there is no honest
+// guess, so it is refused.
+test('hostPort: an object that reads as both a port and a map is refused', () => {
+  assert.throws(
+    () => hostPort({ request: () => '', 'clipboard.read': () => '' }),
+    /reads as both a port and a verb map/,
+  );
+  const only = { request: () => 'x' };
+  assert.equal(hostPort(only), only, 'request alone is a port, as documented');
+});
+
 // Without hasOwn every Object.prototype member is a reachable verb, and
 // `toString` would dispatch into Object.prototype.
 test('hostPort: inherited properties are not verbs', () => {
