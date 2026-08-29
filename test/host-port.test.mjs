@@ -456,6 +456,13 @@ test('run({ host }) into a stock worker refuses instead of dropping it', async (
   );
 });
 
+test('spawn() refuses a live option rather than silently dropping it', async () => {
+  const { spawn } = await import('../src/spawn.mjs');
+  for (const [name, value] of [['host', { x: () => '' }], ['builtins', { x: () => 0 }], ['fs', {}]]) {
+    await assert.rejects(() => spawn({ command: 'true', [name]: value }), new RegExp(`serve\\(\\{ ${name} \\}\\)`), name);
+  }
+});
+
 // ─── the overlay still owns the name ─────────────────────────────────────────
 
 test('the guest cannot remove, rename or shadow the port', () => {
