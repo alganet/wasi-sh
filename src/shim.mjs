@@ -10,11 +10,17 @@
 // environment.
 //
 // The `input` contract:
-//   pollReadable(ms) -> bool     data available (waiting up to ms for some)
+//   pollReadable(ms) -> bool     data available (waiting up to ms for some;
+//                                ms null = wait indefinitely, which is what an
+//                                untimed guest poll does — see poll_oneoff)
 //   read(max)        -> bytes    non-blocking, possibly empty
 //   readBlocking?(max) -> bytes  park until data or EOF (worker threads only)
 //   wait?(ms)                    sleep for a poll timeout
 //   closed?()        -> bool     no more data will ever arrive (stdin EOF)
+//   winchPending?()  -> bool     a resize is queued (peek; takeWinch consumes).
+//                                Its presence is what tells poll_oneoff the
+//                                input can park indefinitely and be woken by
+//                                something other than bytes.
 //
 // The `fs` contract is a third seam of the same kind (see fs.mjs): a
 // path-addressed synchronous store in ZenFS's `FileSystem` shape. Everything
@@ -45,7 +51,7 @@ const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
-const E = { SUCCESS:0, BADF:8, EXIST:20, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
 // Stores speak LINUX errno; WASI numbers its own list alphabetically. The two
@@ -275,12 +281,30 @@ export class WasiShim {
           // A closed stdin is READABLE (POSIX: EOF wakes poll) — the caller
           // then reads and gets EOF instead of timing out forever.
           const closed = () => w.input && w.input.closed && w.input.closed();
+          // An UNTIMED poll has to park HERE, not in the read that follows it.
+          // busybox says why, right above both of its callers: "We must poll
+          // even if timeout is -1: we want to be interrupted if signal arrives"
+          // (libbb/read_key.c, shell/shell_common.c). Reporting readable and
+          // letting the guest block in read() instead put the wait somewhere no
+          // signal reaches — so a resize posted while the shell sat idle at its
+          // prompt was not delivered until the user typed something.
+          // Only an input that can be woken by a non-byte event (winchPending)
+          // can park indefinitely; for anything else null would never return.
+          const canPark = !!(w.input && w.input.winchPending);
+          // Zero when another subscription is already ready (poll returns now),
+          // and when an input that cannot park was going to be asked to.
+          const waitMs = (nev>0 || (timeoutMs==null && !canPark)) ? 0 : timeoutMs;
           // pollReadable(ms) does the timed wait; when it comes back empty the
           // timeout has fully elapsed — report the clock, do NOT wait again.
-          const ready = w.input && (w.input.pollReadable(timeoutMs==null?0:timeoutMs) || closed());
+          const ready = w.input && (w.input.pollReadable(waitMs) || closed());
           if(ready) emitRead(stdinUD);
           else if(timeoutMs!=null) emitClock(clockUD);
-          else emitRead(stdinUD); // blocking, no clock: report readable so caller reads (may EOF)
+          // Untimed and woken with nothing to read: a queued resize ended the
+          // wait. EINTR is what a real signal does to poll, and it is what the
+          // guest's __wrap_poll needs in order to run winch_dispatch and then
+          // decide whether a handler wanted it (see build/shim/wasistubs.c).
+          else if(nev===0 && canPark && w.input.winchPending()){ w.dv().setUint32(out,0,true); return E.INTR; }
+          else emitRead(stdinUD); // no reason to wait: let the caller read (may EOF)
         } else if(otherRead===null && timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
         w.dv().setUint32(out,nev,true); return 0; },
     };

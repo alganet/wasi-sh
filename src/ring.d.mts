@@ -26,13 +26,15 @@ export class RingWriter {
 
 /** The WasiShim `input` contract (see shim.d.mts). */
 export interface RingInput {
-  pollReadable(ms: number): boolean;
+  pollReadable(ms: number | null): boolean;
   read(max: number): Uint8Array;
   readBlocking(max: number): Uint8Array;
   wait(ms: number): void;
   closed(): boolean;
   /** Current terminal geometry (0 = unknown). */
   winsize(): Winsize;
+  /** Is a resize queued? A peek — takeWinch() is what consumes it. */
+  winchPending(): boolean;
   /** Consume the pending-winch flag (true once per resize burst). */
   takeWinch(): boolean;
 }
@@ -42,11 +44,13 @@ export class RingReader {
   readonly readable: boolean;
   readonly ended: boolean;
   readonly closed: boolean;
-  pollReadable(ms: number): boolean;
+  /** `ms` null parks indefinitely — an untimed guest poll. */
+  pollReadable(ms: number | null): boolean;
   read(max: number): Uint8Array;
   readBlocking(max: number): Uint8Array;
   wait(ms: number): void;
   winsize(): Winsize;
+  winchPending(): boolean;
   takeWinch(): boolean;
   toInput(): RingInput;
 }

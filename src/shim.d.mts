@@ -6,8 +6,10 @@ export class WasiExit extends Error {
 
 /** Pluggable stdin. Only pollReadable/read are required. */
 export interface ShimInput {
-  /** Data available? May wait up to `ms` for some to arrive. */
-  pollReadable(ms: number): boolean;
+  /** Data available? May wait up to `ms` for some to arrive; `ms` null waits
+   *  indefinitely, which is what an untimed guest poll does. Only an input
+   *  offering winchPending is ever asked to wait indefinitely. */
+  pollReadable(ms: number | null): boolean;
   /** Non-blocking read of up to `max` bytes (possibly empty). */
   read(max: number): Uint8Array;
   /** Park until data or EOF (worker threads only). */
@@ -18,6 +20,10 @@ export interface ShimInput {
   closed?(): boolean;
   /** Current terminal geometry (0 = unknown); backs ioctl(TIOCGWINSZ). */
   winsize?(): { rows: number; cols: number };
+  /** Is a resize queued? A peek, and the marker that this input can be woken
+   *  by something other than bytes — poll_oneoff parks indefinitely only when
+   *  it is present. */
+  winchPending?(): boolean;
   /** Consume a pending resize; backs the guest's synthesized SIGWINCH. */
   takeWinch?(): boolean;
 }
