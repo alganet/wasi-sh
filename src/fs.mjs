@@ -53,9 +53,10 @@ export const ERRNO = {
  * Build the error a store throws: `.code` is the name, `.errno` the number.
  *
  * An unknown code leaves `.errno` undefined rather than inventing one — a
- * wrong number is worse than a missing one, since the shim translates by
- * number and would report something plausible and false. It falls back to EIO
- * for a code it does not recognize, which is at least true.
+ * wrong number is worse than a missing one, since a caller reading `.errno`
+ * would get something plausible and false. Nothing is lost by it: the shim
+ * translates by `.code`, not by `.errno`, and falls back to EIO for a name it
+ * does not recognize, which is at least true.
  */
 export function fsError(code, path) {
   const err = new Error(path === undefined ? code : `${code}: ${path}`);
