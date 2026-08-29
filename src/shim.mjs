@@ -783,6 +783,13 @@ export class WasiShim {
       },
       write(b){
         if(!w.host) return E.PERM;
+        // The device answers the MOST RECENT request. Anything still queued
+        // from an earlier one is dropped here rather than prepended to this
+        // answer, so `echo verb > /dev/host; cat /dev/host` means the same
+        // thing whatever ran before it — and an answer nobody read cannot
+        // arrive sideways in an unrelated `cat`, which for a capability port
+        // is a leak and not merely a surprise.
+        response=[]; responseLen=0;
         const buf=pending.length?concatBytes(pending,b):b;
         let start=0, errno=0;
         for(;;){
@@ -798,6 +805,13 @@ export class WasiShim {
         }
         pending=(!errno&&start<buf.length)?buf.slice(start):EMPTY;
         if(pending.length>HOST_LINE_MAX){ pending=EMPTY; return E.INVAL; }
+        // A failed write leaves NOTHING to read. It told the guest that none
+        // of this happened, and answers to the lines that did run would say
+        // otherwise — while the response is precisely the signal a script is
+        // told to trust, because a buffered writer may not check the status.
+        // The side effects of a dispatched verb cannot be taken back; that is
+        // what the stop-at-the-first-failure rule above is for.
+        if(errno){ response=[]; responseLen=0; }
         return errno;
       },
     };

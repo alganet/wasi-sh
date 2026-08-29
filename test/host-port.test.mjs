@@ -175,6 +175,21 @@ test('a drained response reads EOF, so `cat` stops instead of hanging', () => {
   assert.equal(eof.n, 0, 'EOF');
 });
 
+// An answer nobody read must not arrive prepended to somebody else's. For a
+// capability port that is a leak sideways, not merely a surprise: the answer to
+// `secret.read` would surface in an unrelated `cat /dev/host`.
+test('a new request discards an answer nobody read', () => {
+  const t = makeShim({ request: (v) => (v === 'secret' ? 'SECRET' : 'ok') });
+  writeFd(t, openHost(t), 'secret\n');           // the answer is never read
+  assert.equal(verb(t, 'ping\n'), 'ok', 'only the most recent request is answered');
+});
+
+test('a failed write leaves nothing to read, whatever ran inside it', () => {
+  const t = makeShim({ request: (v) => { if (v === 'bad') throw new Error('x'); return 'LEAKED'; } });
+  assert.equal(writeFd(t, openHost(t), 'good\nbad\n').errno, EIO);
+  assert.equal(readFd(t, openHost(t)).n, 0, 'the write said none of it happened');
+});
+
 test('a long response survives being read in pieces', () => {
   const body = 'x'.repeat(700);
   const t = makeShim({ request: () => body });
