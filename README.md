@@ -315,16 +315,23 @@ it, whatever you decide to hand over. One capability object, one virtual
 device, verbs instead of an option per feature:
 
 ```js
+let clipboard = 'whatever the page last staged';
+
 const { stdout } = await run({
   inline: true,
-  script: "printf 'clipboard.read\\n' > /dev/host\n"
+  script: "echo clipboard.read > /dev/host\n"
         + 'echo "pasted: $(cat /dev/host)"\n',
   host: {
-    'clipboard.read': () => navigator.clipboard.readText(),   // …if it were sync
-    'clipboard.write': (payload) => { stash(payload); },
+    'clipboard.read': () => clipboard,
+    'clipboard.write': (payload) => { clipboard = new TextDecoder().decode(payload); },
   },
 });
+// stdout === 'pasted: whatever the page last staged\n'
 ```
+
+A verb is **synchronous**, so an async browser API is staged by the page
+rather than awaited inside one — read `navigator.clipboard.readText()` when the
+user grants it and keep the value where the verb can reach it.
 
 A request is a **line** written to `/dev/host` — a verb, optionally a space and
 a payload — and the answer is read back from the same name. A verb answers with
@@ -347,11 +354,12 @@ if ! cat /dev/host >/dev/null 2>&1; then echo "no port here"; fi
 Hand over an object implementing only `clipboard.*` and that is the entire
 surface a script can reach. There is nothing shell-side to widen it.
 
-**Verbs must be synchronous**, for the same reason builtins must: the guest is
-a wasm stack frame below the call. That is not the restriction it sounds like —
-the port is *outbound* only, and outbound synchronous is the direction that
-needs no shared memory, no `Atomics.wait` and no cross-origin isolation. Async
-setup goes in the factory form, which is awaited once before the shell starts.
+The synchronous rule is the same one builtins have, and for the same reason:
+the guest is a wasm stack frame below the call. That is not the restriction it
+sounds like — the port is *outbound* only, and outbound synchronous is the
+direction that needs no shared memory, no `Atomics.wait` and no cross-origin
+isolation. Async setup goes in the factory form, awaited once before the shell
+starts.
 
 A verb that throws, returns a promise, or answers with something that is not
 bytes fails that one write and says why on stderr; the shell lives. The failure
