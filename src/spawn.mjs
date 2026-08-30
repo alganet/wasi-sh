@@ -6,6 +6,7 @@
 //   session.write(data)       keystrokes in (strings are UTF-8-encoded)
 //   session.onOutput(fn)      raw output bytes out (fn(bytes, channel))
 //   session.end()             stdin EOF
+//   session.interrupt()       cooperative ^C into whatever is running
 //   session.terminate()       hard-kill the worker
 //   session.post(request)     hand the RUNNING guest a host request (opt-in,
 //                             via requestBufferSize; read at /dev/hostreq)
@@ -187,6 +188,22 @@ export class Session {
 
   // Signal stdin EOF: the guest drains buffered input, then reads EOF.
   end() { this._ring.end(); }
+
+  // Deliver a cooperative interrupt — the ^C a wasm guest cannot be sent.
+  // There are no signals here, so a long-running command holds the worker, and
+  // terminate() was the only way out — which kills the filesystem and every
+  // warm instance with it, in a session the user was working in.
+  //
+  // Cooperative, and that word is the whole contract: this raises a count in
+  // shared memory and wakes the guest. What it cancels is whatever chose to
+  // look — a host builtin polling ctx.interrupted() at its own safe points, a
+  // language runtime with an interrupt hook. Nothing that ignores it is
+  // stopped, and terminate() is still the answer when nothing looks.
+  //
+  // Bind it to ^C only while a command is running: at the prompt the byte
+  // belongs to the shell's own line editing, so a terminal that swallows 0x03
+  // unconditionally takes it away from the guest.
+  interrupt() { this._ring.interrupt(); }
 
   // Report a terminal resize (cols × rows). Stores the live geometry and
   // synthesizes a SIGWINCH in the guest: a shell with `trap ... WINCH` runs

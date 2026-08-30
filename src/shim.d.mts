@@ -26,6 +26,13 @@ export interface ShimInput {
   winchPending?(): boolean;
   /** Consume a pending resize; backs the guest's synthesized SIGWINCH. */
   takeWinch?(): boolean;
+  /**
+   * Cooperative interrupts posted so far — a monotonic count, not a flag, so
+   * there is nothing to consume. Work in flight reads it once at entry and
+   * compares; absent, ctx.interrupted() is permanently false. Backs
+   * Session.interrupt().
+   */
+  interruptCount?(): number;
 }
 
 /**
@@ -69,7 +76,8 @@ export interface BuiltinContext {
   /**
    * Read up to `max` bytes of stdin. Empty means EOF. Blocking — on an
    * interactive session with a live stdin ring this PARKS the whole session
-   * until the embedder writes or calls end(); there is no ^C.
+   * until the embedder writes or calls end(). Session.interrupt() does not end
+   * it: the wait wakes, but no bytes have appeared, so the read parks again.
    */
   stdin(max?: number): Uint8Array;
   /**
@@ -84,6 +92,17 @@ export interface BuiltinContext {
   /** Write to fd 2 — likewise, and it can be refused for the same reasons. */
   stderr(data: string | Uint8Array): void;
   fs: HostFs;
+  /**
+   * Has a cooperative interrupt (Session.interrupt()) landed since this
+   * command started? Poll it at your own safe points and bail out; nothing can
+   * unwind the handler from outside, because it runs on the guest's own stack.
+   * Return 130 (128 + SIGINT) so `$?` reads as a shell script expects.
+   *
+   * Scoped to this invocation, so a ^C typed at the prompt before the command
+   * ran does not cancel it. Always false when the session has no interrupt
+   * channel — run(), or a fixed stdin.
+   */
+  interrupted(): boolean;
 }
 
 /**

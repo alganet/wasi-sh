@@ -21,6 +21,11 @@
 //                                Its presence is what tells poll_oneoff the
 //                                input can park indefinitely and be woken by
 //                                something other than bytes.
+//   interruptCount?() -> int     cooperative interrupts posted so far. A count,
+//                                not a flag: work in flight reads it once at
+//                                entry and compares, so nothing has to consume
+//                                it and an interrupt posted while nothing is
+//                                running cannot cancel the next thing that is.
 //
 // The `fs` contract is a third seam of the same kind (see fs.mjs): a
 // path-addressed synchronous store in ZenFS's `FileSystem` shape. Everything
@@ -34,7 +39,8 @@
 //   lookup(name) -> bool         is this a host builtin? (must not run it —
 //                                find_command, `type` and `command -v` ask)
 //   run(ctx)     -> status       execute it, SYNCHRONOUSLY
-// ctx is { argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs }.
+// ctx is { argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs,
+// interrupted() }.
 // Absent, the shell behaves byte-for-byte as it did before.
 //
 // The `host` port is the fourth seam, and the one aimed outward — at the
@@ -461,6 +467,13 @@ export class WasiShim {
           const argv=w.cstrv(argvPtr,argc>0?argc:4096);
           const name=argv[0]||'';
           const cwd=w.cstr(cwdPtr)||'/';
+          // The interrupt baseline, read BEFORE the handler runs. A ^C posted
+          // while the shell sat at its prompt, or during the applet before
+          // this one, is already in the count — so comparing against it means
+          // "interrupted since this command started" and this command does not
+          // inherit somebody else's cancel. An input with no interrupt channel
+          // (run(), a fixed stdin) leaves interrupted() permanently false.
+          const intr0=(w.input&&w.input.interruptCount)?w.input.interruptCount():null;
           const ctx={
             argv, cwd,
             // The guest's LIVE environ (exports plus this command's VAR=x
@@ -481,6 +494,19 @@ export class WasiShim {
             stdout:(b)=>{ const e=w.writeFd(1,bytesOf(b)); if(e) throw new Error(`write to stdout failed: ${errnoName(e)}`); },
             stderr:(b)=>{ const e=w.writeFd(2,bytesOf(b)); if(e) throw new Error(`write to stderr failed: ${errnoName(e)}`); },
             fs:w.hostFs(cwd),
+            // Has a ^C landed since this command started? Cooperative and
+            // POLLED: the handler runs on the guest's own stack, so nothing
+            // can unwind it from outside and there is no safe point but the
+            // ones the handler itself chooses. A long loop checks it and
+            // returns 130 (128+SIGINT), which is what a shell script reads as
+            // "interrupted" in `$?`.
+            //
+            // It does NOT end a blocking ctx.stdin(): that read parks in
+            // Atomics.wait and an interrupt wakes the wait but does not make
+            // bytes appear, so the read parks again. A builtin that wants to
+            // be interruptible while waiting for input must read with its own
+            // timeout and check between attempts.
+            interrupted:()=> intr0!==null && w.input.interruptCount()!==intr0,
           };
           let status;
           try { status=w.builtins.run(ctx); }

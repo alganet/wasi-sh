@@ -202,3 +202,47 @@ test('toInput() exposes winsize()/takeWinch() for the shim', () => {
   assert.equal(input.takeWinch(), true);
   assert.equal(input.takeWinch(), false);
 });
+
+// ─── the cooperative interrupt ───────────────────────────────────────────────
+
+test('interrupt() is a COUNT, so there is nothing to consume and nothing to miss', () => {
+  const { w, r } = pair();
+  assert.equal(r.interruptCount(), 0);
+  w.interrupt();
+  assert.equal(r.interruptCount(), 1);
+  // Reading does not consume: the reader that compares against a baseline must
+  // keep seeing the same answer for as long as it keeps asking.
+  assert.equal(r.interruptCount(), 1);
+  w.interrupt();
+  w.interrupt();
+  assert.equal(r.interruptCount(), 3, 'a burst is three interrupts, not one flag');
+});
+
+test('an interrupt posted while nothing is running cannot cancel the next thing', () => {
+  // The whole reason this is a count rather than a flag. A ^C at the prompt
+  // raises it; the command typed afterwards takes its own baseline and is
+  // unaffected. A flag would have sat there waiting to kill it.
+  const { w, r } = pair();
+  w.interrupt();                          // ^C with nothing running
+  const base = r.interruptCount();        // the next command starts here
+  assert.equal(r.interruptCount() !== base, false, 'not interrupted');
+  w.interrupt();                          // ^C DURING that command
+  assert.equal(r.interruptCount() !== base, true, 'interrupted');
+});
+
+test('interrupt() bumps seq so a parked guest wakes', () => {
+  const { sab, w, r } = pair();
+  const ctrl = new Int32Array(sab, 0, 8);
+  const seq0 = Atomics.load(ctrl, 3);            // IDX_SEQ
+  w.interrupt();
+  assert.ok(Atomics.load(ctrl, 3) > seq0, 'seq advanced (would wake Atomics.wait)');
+  assert.equal(r.readable, false, 'an interrupt is not stdin input');
+});
+
+test('toInput() exposes interruptCount() for the shim', () => {
+  const { w, r } = pair();
+  const input = r.toInput();
+  assert.equal(input.interruptCount(), 0);
+  w.interrupt();
+  assert.equal(input.interruptCount(), 1);
+});
