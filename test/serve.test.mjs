@@ -150,6 +150,46 @@ test('the host-builtins example composes json and num in a pipeline', async (t) 
   assert.match(r.stderr, /no such path: nope/);
 });
 
+// Pins examples/host-port.html, the browser demo of BOTH directions of the
+// port. The page itself is only verifiable by hand, but its verbs are ordinary
+// functions and its dev-server loop is ordinary text — and the loop is read out
+// of the page rather than copied here, so the two cannot drift.
+test('the host-port example answers requests off its own filesystem', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const { readFile } = await import('node:fs/promises');
+  const page = await readFile(new URL('../examples/host-port.html', import.meta.url), 'utf8');
+  const script = /<script type="text\/plain" id="server-sh">([\s\S]*?)<\/script>/.exec(page);
+  assert.ok(script, 'the page still carries its server script where it says it does');
+
+  const self_ = fakeSelf();          // the example calls serve() at import time
+  const { host } = await import('../examples/host-port.worker.mjs');
+  const { serve } = await loadWorker();
+  serve({ host });
+  await self_.deliver({
+    module: wasm,
+    files: { '/main.sh': script[1].trim() },
+    args: ['busybox', 'sh', '/main.sh'],
+    env: { PATH: '/', HOME: '/', LC_ALL: 'C' },
+    stdin: new Uint8Array(0),
+    requests: new TextEncoder().encode(
+      'GET /\nGET /time\nPUT /write from the page\nGET /notes\nGET /nope\n'),
+  });
+
+  const r = collect(self_.posted);
+  const replies = self_.posted.filter((m) => m.type === 'response');
+  assert.equal(replies.length, 5, 'every request was answered, through the outbound half');
+  assert.deepEqual(replies.map((m) => m.status), [200, 200, 200, 200, 404]);
+  assert.match(replies[1].body, /^the page says \S/, 'a verb the SCRIPT called, answered by the page');
+  // The point of topology A: the guest serving requests owns the files, so a
+  // write by one request is simply there for the next one.
+  assert.equal(replies[3].body, '/srv/notes.txt says: from the page');
+  assert.match(replies[4].body, /no route for \/nope/);
+  assert.match(r.stdout, /server: listening\n/);
+  assert.match(r.stdout, /server: no more requests, stopping\n/, 'EOF is what ends the loop');
+  assert.equal(r.stderr, '');
+  assert.equal(r.exitCode, 0);
+});
+
 // A store is a live object, so like builtins it can only be registered from
 // inside the worker — structured clone would arrive with the methods stripped.
 // This is the only route by which a real filesystem (OPFS, a directory the

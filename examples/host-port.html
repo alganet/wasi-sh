@@ -1,0 +1,222 @@
+<!doctype html>
+<!-- wasi-sh use case D: the host port, both directions.
+
+     OUTBOUND is the guest calling out — a line written to /dev/host, an answer
+     read back from it. INBOUND is the host handing a request to a script that
+     is ALREADY RUNNING, read from /dev/hostreq. The two together make the
+     awkward case idiomatic: a dev server is a shell loop.
+
+     Inbound needs a SharedArrayBuffer, so this page needs cross-origin
+     isolation: serve with `npm run serve`, or on a static host add COOP/COEP
+     headers or a service-worker shim such as
+     https://github.com/gzuidhof/coi-serviceworker -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wasi-sh — the host port</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { margin-bottom: .2rem; }
+  pre { background: #0b0e14; color: #d8dee9; padding: 1rem; white-space: pre-wrap; overflow-x: auto; }
+  pre .err { color: #ff8c8c; }
+  #resp { min-height: 3rem; background: #101722; }
+  #resp b { color: #9cc4ff; }
+  #log { min-height: 6rem; font-size: 13px; }
+  #src { font-size: 13px; }
+  code { background: #eef1f5; padding: .1rem .3rem; border-radius: 3px; }
+  button { font: inherit; font-size: 14px; padding: .3rem .9rem; margin: .1rem .2rem .1rem 0; }
+  input[type=text] { font: inherit; padding: .3rem .5rem; width: 16rem; }
+  fieldset { border: 1px solid #d6dae1; border-radius: 6px; margin: 1rem 0; }
+  legend { font-size: 13px; color: #56606e; }
+  #status { font-size: 13px; color: #56606e; }
+</style>
+
+<h1>wasi-sh: the host port</h1>
+<p id="status">starting…</p>
+
+<p>The shell below is a <strong>dev server</strong>, and it is a shell script —
+the whole thing is at the bottom of this page. It parks in
+<code>read &lt;&amp;3</code> between requests, costing no CPU; a request posted
+from here wakes it in under a millisecond, and it answers with an ordinary
+outbound verb.</p>
+
+<p>This is the one direction <code>postMessage</code> cannot go. A live session
+is a single synchronous <code>_start()</code> frame, so the worker's event loop
+never turns while the shell runs: a message posted into it is not slow, it is
+<em>not delivered</em>. A request travels through shared memory the guest reads
+at its blocking point instead.</p>
+
+<fieldset>
+  <legend>inbound — <code>session.post()</code> → the parked loop</legend>
+  <p>
+    <button data-req="GET /">GET /</button>
+    <button data-req="GET /time">GET /time</button>
+    <button data-req="GET /notes">GET /notes</button>
+    <button data-req="GET /nope">GET /nope</button>
+  </p>
+  <p>
+    <input type="text" id="note" value="edited from the page" aria-label="text to write">
+    <button id="write">PUT /write</button>
+    — writes the shell's own filesystem, so the next <code>GET /notes</code>
+    sees it. One worker, one VFS, nothing to keep in sync.
+  </p>
+</fieldset>
+
+<p>the response, as the <code>respond</code> verb handed it back:</p>
+<pre id="resp"></pre>
+
+<p>and the shell's own stdout, so you can watch it park and wake:</p>
+<pre id="log"></pre>
+
+<p>
+  <button id="stop">endRequests() — EOF ends the loop</button>
+  <button id="restart">restart</button>
+  <button id="ungranted">restart without the grant</button>
+</p>
+
+<p><code>requestBufferSize</code> <strong>is</strong> the grant: without it
+<code>/dev/hostreq</code> is <code>EPERM</code>, the redirection fails and the
+loop refuses to start — a different thing from "nothing has arrived yet", and
+the script can tell them apart. Capabilities are injected, never ambient; the
+outbound half works the same way, with no <code>host</code> meaning every open
+of <code>/dev/host</code> is <code>EPERM</code>.</p>
+
+<p>The verbs live in
+<a href="host-port.worker.mjs"><code>examples/host-port.worker.mjs</code></a>:
+a capability object is a bag of functions, so it cannot be structured-cloned
+into a worker any more than host builtins can.</p>
+
+<p>the script this page runs:</p>
+<pre id="src"></pre>
+
+<!-- Not a template literal: `${req#* }` is shell parameter expansion, and a JS
+     template would try to interpolate it. text/plain is inert, and the page
+     shows the very bytes it runs. -->
+<script type="text/plain" id="server-sh">
+mkdir -p /srv
+echo 'the shell wrote this' > /srv/notes.txt
+
+# Every reply is one line: a status, a space, and a body. Framing is by line in
+# both directions, so a body with a newline in it has to be encoded (percent,
+# base64, JSON) or left somewhere else — the shell's own filesystem, say.
+# Decide it once, here, and the routes stay routes.
+reply() { printf 'respond %s %s\n' "$1" "$2" > /dev/host; }
+
+echo 'server: listening'
+
+# It parks in this read between requests and costs nothing while parked.
+# Opening the device is the grant check, which is why the failure is handled
+# where the loop starts rather than inside it.
+while read -r req <&3; do
+    rest=${req#* }                  # everything after the method
+    path=${rest%% *}
+    arg=${rest#"$path"}; arg=${arg# }
+
+    case "$path" in
+    /)      reply 200 "hello from a shell script — try /time, /notes, /nope" ;;
+    /time)  echo now > /dev/host     # outbound: ask the page for its clock
+            reply 200 "the page says $(cat /dev/host)" ;;
+    /notes) reply 200 "/srv/notes.txt says: $(cat /srv/notes.txt)" ;;
+    /write) echo "$arg" > /srv/notes.txt
+            reply 200 "wrote it — ask for /notes again" ;;
+    *)      reply 404 "no route for $path" ;;
+    esac
+
+    echo "server: $req"
+done 3< /dev/hostreq || {
+    echo 'server: no inbound channel was granted to this session' >&2
+    exit 1
+}
+
+# The only thing that ever ends the loop: end-of-stream, from endRequests().
+echo 'server: no more requests, stopping'
+</script>
+
+<script type="module">
+  import { spawn } from '../src/index.mjs';
+
+  const $ = (id) => document.getElementById(id);
+  const dec = new TextDecoder();
+  const SCRIPT = $('server-sh').textContent.trim();
+  $('src').textContent = SCRIPT;
+
+  let session = null;
+  let alive = false;
+
+  const say = (text, cls) => {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = text;
+    $('log').appendChild(span);
+    $('log').scrollTop = $('log').scrollHeight;
+  };
+
+  const showResponse = ({ status, body }) => {
+    const b = document.createElement('b');
+    b.textContent = `${status} `;
+    $('resp').replaceChildren(b, document.createTextNode(body));
+  };
+
+  async function start({ grant = true } = {}) {
+    session?.terminate();
+    session = null;
+    alive = false;
+    $('log').textContent = '';
+    $('resp').textContent = '';
+    $('status').textContent = 'starting…';
+    try {
+      session = await spawn({
+        script: SCRIPT,
+        // The grant, and the cap on unread requests: post() throws
+        // RingOverflowError when the guest is not consuming, which is the
+        // host's problem to size. Omit it and the loop refuses to start.
+        ...(grant ? { requestBufferSize: 65536 } : {}),
+        // The verbs live in the worker; the page just points at it. Passing
+        // `host` here instead would throw — functions do not survive
+        // structured clone.
+        workerUrl: new URL('./host-port.worker.mjs', import.meta.url),
+        onOutput: (bytes, channel) => say(dec.decode(bytes), channel === 'stderr' ? 'err' : ''),
+      });
+      // A reply arrives as an ordinary worker message: spawn() ignores types it
+      // does not know, so a worker module can talk to its own page alongside
+      // the session's traffic.
+      session.worker.addEventListener('message', (e) => {
+        if (e.data?.type === 'response') showResponse(e.data);
+      });
+      alive = true;
+      $('status').textContent = grant
+        ? 'running — the loop is parked, waiting to be asked'
+        : 'running without requestBufferSize — watch the loop refuse to start';
+      // `exited` always settles and is a promise, so this cannot lose a race
+      // against a shell that was already gone by the time spawn() resolved —
+      // which is exactly what the ungranted button produces.
+      const mine = session;
+      mine.exited.then((code) => {
+        if (session !== mine) return;
+        alive = false;
+        $('status').textContent = `the shell exited (${code}) — restart to ask it again`;
+      });
+    } catch (e) {
+      $('status').textContent = `could not start: ${e.message}`;
+    }
+  }
+
+  const request = (line) => {
+    if (!alive) { say('the shell is not running — restart first\n', 'err'); return; }
+    // A request is one LINE, so a newline in it is refused HERE — at the
+    // producer, where the page still holds it and can do something about it. A
+    // guest parked on a request has no write to fail and no $? to reach, so an
+    // error it could only learn by reading is one it could not act on.
+    try { session.post(line); }
+    catch (e) { say(`post() refused: ${e.message}\n`, 'err'); }
+  };
+
+  for (const el of document.querySelectorAll('button[data-req]')) {
+    el.onclick = () => request(el.dataset.req);
+  }
+  $('write').onclick = () => request(`PUT /write ${$('note').value}`);
+  $('stop').onclick = () => session?.endRequests();
+  $('restart').onclick = () => start();
+  $('ungranted').onclick = () => start({ grant: false });
+
+  start();
+</script>

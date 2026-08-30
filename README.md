@@ -436,6 +436,11 @@ await run({ inline: true, script, requests: ['GET /a.php', 'GET /b.php'] });
 the guest is a wasm frame below the call. Familiar from any blocking read, and
 worth knowing before a verb does something slow.
 
+Working example, both directions:
+[`examples/host-port.html`](examples/host-port.html) and its
+[worker](examples/host-port.worker.mjs) — a dev server that is a shell loop,
+driven from the page.
+
 ## API
 
 | import | what |
