@@ -7,16 +7,19 @@
 //   session.onOutput(fn)      raw output bytes out (fn(bytes, channel))
 //   session.end()             stdin EOF
 //   session.terminate()       hard-kill the worker
+//   session.post(request)     hand the RUNNING guest a host request (opt-in,
+//                             via requestBufferSize; read at /dev/hostreq)
+//   session.endRequests()     no more of them: the guest's loop ends
 // plus lifecycle: onExit/onError subscriptions and the `exited` promise.
 // A terminal is anything that feeds write() and renders onOutput — geometry
 // is just env: { COLUMNS, LINES }, passed by whoever owns the terminal.
-import { createStdinRing, RingWriter } from './ring.mjs';
+import { createRing, RingWriter, frameRequest } from './ring.mjs';
 import { resolveArgv, mergeEnv, resolveWasmForWorker } from './options.mjs';
 
 const ENC = new TextEncoder();
 
 // Options: { args | command | script, files, env, wasm,
-//            stdinBufferSize, worker, workerUrl,
+//            stdinBufferSize, requestBufferSize, worker, workerUrl,
 //            onOutput, onExit, onError }
 // Host builtins are registered INSIDE the worker with serve() — handler
 // functions cannot be structured-cloned — so there is no `builtins` option
@@ -49,15 +52,30 @@ export async function spawn(options = {}) {
       + 'module and pass it as workerUrl.'
     );
   }
+  // run()'s option, and here it would be a queue that is complete before the
+  // session starts — the one thing an interactive session is not. Silently
+  // ignoring it would hand back a session whose dev-server loop ended before
+  // the first keystroke, which looks exactly like a working one.
+  if (options.requests) {
+    throw new Error(
+      'spawn({ requests }) is not supported: a session is live, so its requests are too. '
+      + 'Grant the channel with requestBufferSize and hand each request over with '
+      + 'session.post(request) — run({ requests }) is the pre-staged form.'
+    );
+  }
   const { argv, extraFiles } = resolveArgv(options);
   const wasm = await resolveWasmForWorker(options.wasm);
-  const sab = createStdinRing(options.stdinBufferSize ?? 65536);
+  const sab = createRing(options.stdinBufferSize ?? 65536);
+  // Opt-in, and a size IS the grant — there is no second way to say the same
+  // thing. Without one the guest's /dev/hostreq is EPERM, so a dev-server loop
+  // refuses to start rather than parking on a request that can never arrive.
+  const reqSab = options.requestBufferSize > 0 ? createRing(options.requestBufferSize) : null;
   const worker = options.worker
     || (options.workerUrl
       ? new Worker(options.workerUrl, { type: 'module' })
       : new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' }));
   const ringWriter = new RingWriter(sab);
-  const session = new Session(worker, ringWriter, options.worker == null);
+  const session = new Session(worker, ringWriter, options.worker == null, reqSab && new RingWriter(reqSab));
   if (options.onOutput) session.onOutput(options.onOutput);
   if (options.onExit) session.onExit(options.onExit);
   if (options.onError) session.onError(options.onError);
@@ -79,6 +97,7 @@ export async function spawn(options = {}) {
     args: argv,
     env,
     sab,
+    reqSab,
   };
   worker.postMessage(msg, msg.wasmBytes ? [msg.wasmBytes.buffer] : []);
   // Bounded: a custom worker module that top-level-awaits before installing a
@@ -89,9 +108,10 @@ export async function spawn(options = {}) {
 }
 
 export class Session {
-  constructor(worker, ringWriter, ownsWorker) {
+  constructor(worker, ringWriter, ownsWorker, requestWriter) {
     this.worker = worker;
     this._ring = ringWriter;
+    this._requests = requestWriter || null;
     this._ownsWorker = ownsWorker;
     this._outputFns = new Set();
     this._exitFns = new Set();
@@ -168,6 +188,37 @@ export class Session {
   // resize handler (e.g. xterm's term.onResize). No-op if the guest doesn't
   // trap WINCH; the fresh size is still there for the next `stty size`.
   resize(cols, rows) { this._ring.resize(cols, rows); }
+
+  // Hand the RUNNING guest a host request, read at /dev/hostreq. This is the
+  // one direction postMessage cannot go: a live session is one synchronous
+  // _start() frame, so a message posted to it is not slow, it is not delivered
+  // — measured at +303ms posted, +3020ms handled, and only because the wait
+  // expired. The request goes through shared memory the guest reads at its
+  // blocking point, which wakes it in single-digit ms.
+  //
+  // Fire-and-forget: the answer comes back as an ordinary outbound verb on
+  // /dev/host, because a request the guest is still handling has nothing to
+  // return yet. One line per request, and both refusals happen here rather
+  // than at the guest — an embedded newline would forge a second request, and
+  // an overflowing ring is a guest that is not consuming, which is the host's
+  // problem to size.
+  post(request) {
+    if (!this._requests) {
+      throw new Error(
+        'session.post() needs the inbound channel, which this session was not granted: '
+        + 'pass spawn({ requestBufferSize: 65536 }). Granting it is what makes '
+        + '/dev/hostreq openable in the guest.'
+      );
+    }
+    return this._requests.write(frameRequest(request));
+  }
+
+  // No more requests are coming. The guest's read hits EOF, so
+  // `while read -r req <&3; do ...; done` ends and the script carries on —
+  // the only thing that ever ends that loop.
+  endRequests() {
+    if (this._requests) this._requests.end();
+  }
 
   // Hard-kill the worker (the guest gets no chance to exit cleanly).
   // Settles `exited` (and fires onExit) with 137, kill -9 style — a session
