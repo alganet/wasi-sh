@@ -49,6 +49,8 @@ export function createRing(dataBytes = 65536) {
 }
 export { createRing as createStdinRing };
 
+const ENC = new TextEncoder();
+
 // Frame one inbound request for the guest's /dev/hostreq. A request is a LINE
 // — the vocabulary the outbound half settled, for the same reason: a write
 // boundary is not a frame, because stdio splits where it likes.
@@ -62,7 +64,7 @@ export { createRing as createStdinRing };
 // them forged. An empty one would deliver a blank line, which the outbound half
 // already defines as not a request at all.
 export function frameRequest(request) {
-  const bytes = typeof request === 'string' ? new TextEncoder().encode(request)
+  const bytes = typeof request === 'string' ? ENC.encode(request)
     : (request instanceof Uint8Array ? request : new Uint8Array(request));
   if (!bytes.length) throw new Error('host request: empty. A request is a line with something on it; a blank line is not a request.');
   const nl = bytes.indexOf(0x0a);
@@ -79,24 +81,31 @@ export function frameRequest(request) {
   return out;
 }
 
+// Two channels share this ring, so an overflow has to name the one that
+// overflowed and the option that sizes it. "increase stdinBufferSize" is a
+// wrong answer for a host request, and a wrong answer costs more than none.
 export class RingOverflowError extends Error {
-  constructor(requested, free) {
+  constructor(requested, free, channel = 'stdin', sizeOption = 'stdinBufferSize') {
     super(
-      `stdin ring overflow: tried to write ${requested} bytes but only ${free} are free. ` +
-      `The guest is not consuming stdin fast enough (or at all); ` +
-      `increase stdinBufferSize or throttle writes.`
+      `${channel} ring overflow: tried to write ${requested} bytes but only ${free} are free. ` +
+      `The guest is not consuming ${channel} fast enough (or at all); ` +
+      `increase ${sizeOption} or throttle writes.`
     );
     this.name = 'RingOverflowError';
+    this.channel = channel;
   }
 }
 
 // Producer side. Lives on a thread that must never block (the main thread),
 // so overflow throws instead of waiting.
 export class RingWriter {
-  constructor(sab) {
+  // `channel`/`sizeOption` only ever appear in failures — see RingOverflowError.
+  constructor(sab, { channel = 'stdin', sizeOption = 'stdinBufferSize' } = {}) {
     this.ctrl = new Int32Array(sab, 0, CTRL_WORDS);
     this.data = new Uint8Array(sab, HEADER_BYTES);
     this.cap = sab.byteLength - HEADER_BYTES;
+    this.channel = channel;
+    this.sizeOption = sizeOption;
   }
   get capacity() { return this.cap; }
   get pending() { return Atomics.load(this.ctrl, IDX_HEAD) - Atomics.load(this.ctrl, IDX_TAIL); }
@@ -109,11 +118,11 @@ export class RingWriter {
 
   // Append bytes and wake the consumer. Returns the byte count written.
   write(bytes) {
-    if (this.ended) throw new Error('stdin ring already ended');
+    if (this.ended) throw new Error(`${this.channel} ring already ended`);
     const head = Atomics.load(this.ctrl, IDX_HEAD);
     const tail = Atomics.load(this.ctrl, IDX_TAIL);
     const free = this.cap - (head - tail);
-    if (bytes.length > free) throw new RingOverflowError(bytes.length, free);
+    if (bytes.length > free) throw new RingOverflowError(bytes.length, free, this.channel, this.sizeOption);
     for (let i = 0; i < bytes.length; i++) this.data[(head + i) % this.cap] = bytes[i];
     Atomics.store(this.ctrl, IDX_HEAD, head + bytes.length);
     this._wake();

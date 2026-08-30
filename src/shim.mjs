@@ -959,7 +959,10 @@ export class WasiShim {
       // Offered unconditionally, because its PRESENCE is what stops poll_oneoff
       // calling this fd readable and putting the wait in the read behind it.
       // True at end-of-stream too — the read is what reports EOF.
-      poll:(ms)=>{ const q=w.requests; if(!q) return true;
+      // Guarded like every other reach into an injected object: a channel
+      // missing a method would throw out of a wasm import, which unwinds the
+      // whole guest stack and kills the shell over a typo in an option.
+      poll:(ms)=>{ const q=w.requests; if(!q||!q.pollReadable) return true;
         return q.pollReadable(ms) || !!(q.closed&&q.closed()); },
       read(max,owner,nonblock){
         if(!w.requests) return E.PERM;
