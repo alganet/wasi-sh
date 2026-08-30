@@ -67,6 +67,7 @@ const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
+const errnoName = (n) => Object.keys(E).find((k) => E[k] === n) || String(n);
 const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
@@ -470,8 +471,15 @@ export class WasiShim {
             // Empty means EOF. The slice matters: readFd may hand back a view
             // into a caller-mounted buffer.
             stdin:(max=65536)=>w.readFd(0,max,false).data.slice(),
-            stdout:(b)=>{ w.writeFd(1,bytesOf(b)); },
-            stderr:(b)=>{ w.writeFd(2,bytesOf(b)); },
+            // writeFd answers an errno and this used to drop it, so a write
+            // a device REFUSED looked delivered — a builtin replying through
+            // /dev/host on a session with no port returned success with
+            // nothing sent. It throws now, which the containment below turns
+            // into a failed command and a non-zero $?: the two things a script
+            // can act on. Nothing else here can fail — a pipe with no reader
+            // buffers rather than EPIPE, fork-free.
+            stdout:(b)=>{ const e=w.writeFd(1,bytesOf(b)); if(e) throw new Error(`write to stdout failed: ${errnoName(e)}`); },
+            stderr:(b)=>{ const e=w.writeFd(2,bytesOf(b)); if(e) throw new Error(`write to stderr failed: ${errnoName(e)}`); },
             fs:w.hostFs(cwd),
           };
           let status;

@@ -72,9 +72,16 @@ export interface BuiltinContext {
    * until the embedder writes or calls end(); there is no ^C.
    */
   stdin(max?: number): Uint8Array;
-  /** Write to fd 1 — wherever the shell put it (pipe, file, terminal). */
+  /**
+   * Write to fd 1 — wherever the shell put it (pipe, file, terminal).
+   *
+   * THROWS if the write was refused, which only a device does (`/dev/host`
+   * with no port, or a verb that failed). Left uncaught it costs this command
+   * and gives the script a non-zero `$?` to act on, which is what a `cmd >
+   * /dev/host || fallback` needs.
+   */
   stdout(data: string | Uint8Array): void;
-  /** Write to fd 2 — likewise. */
+  /** Write to fd 2 — likewise, and it can be refused for the same reasons. */
   stderr(data: string | Uint8Array): void;
   fs: HostFs;
 }
