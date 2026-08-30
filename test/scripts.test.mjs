@@ -436,6 +436,22 @@ test('a host builtin composes in a pipeline', async (t) => {
   assert.equal(r.stdout, 'ABC-DEF', 'fd 1 was the pipe, not the terminal');
 });
 
+// A write that a DEVICE refused used to come back as success, so a builtin
+// replying through /dev/host on a session whose verb failed reported a reply it
+// had not sent. `cmd > /dev/host || fallback` is how a server loop says "answer
+// anyway", and it needs $? to be true.
+test('a host builtin learns that its write failed', async (t) => {
+  if (skipUnlessHostBuiltins(t)) return;
+  const r = await shb(
+    'reply > /dev/host; echo "status=$?"',
+    { reply: (ctx) => { ctx.stdout('answer\n'); return 0; } },
+    { host: { answer: () => { throw new Error('nowhere to put it'); } } },
+  );
+
+  assert.match(r.stdout, /^status=[1-9]/, 'a refused write is not a delivered one');
+  assert.match(r.stderr, /write to stdout failed: IO/);
+});
+
 test('a host builtin reads a pipe on stdin', async (t) => {
   if (skipUnlessHostBuiltins(t)) return;
   const r = await shb('printf "quiet\\n" | up');
