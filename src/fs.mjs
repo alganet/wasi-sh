@@ -391,3 +391,181 @@ export class MemoryFs {
 
   syncSync() {}   // nothing behind memory to flush
 }
+
+// ---------------------------------------------------------------------------
+// Persistence, as an adapter.
+//
+// The store contract is synchronous and every backend that outlives a tab is
+// asynchronous, so the two only meet through hydrate-and-flush: read the whole
+// tree into a synchronous cache before the guest starts, serve every call out
+// of the cache, and pipeline the writes back out. That is not our model — it is
+// ZenFS's `Async` mixin, which `@zenfs/dom`'s `WebAccessFS` already uses over
+// any `FileSystemDirectoryHandle`, so OPFS and a user-granted host folder are
+// one backend and neither is ours to write.
+//
+// What is ours is the seam, and it is three things the mixin leaves to the
+// embedder — each of which is silent when it is got wrong:
+//
+//   HYDRATION IS NOT AUTOMATIC. `WebAccess.create()` loads the index and NOT
+//   the cache; `ready()` is what fills it. A store handed over between the two
+//   answers ENOENT for every file that is really there — so the shell sees an
+//   empty project, and the first thing it writes shadows the real one.
+//
+//   A FAILED WRITE-BACK IS DROPPED. The mixin queues each write on a promise
+//   chain and `sync()` awaits it with `.catch(() => {})`. A quota that filled
+//   up or a folder permission that was revoked is therefore invisible: the
+//   guest's write returned, the cache agrees with itself, and the bytes are
+//   nowhere.
+//
+//   `syncSync()` CANNOT FLUSH ONE. It is the shim's one flush point — every
+//   `proc_exit` calls it — and against an async backend all it can reach is the
+//   cache. Nothing synchronous can await OPFS, so the honest answer is to
+//   report what already failed and let the embedder await the rest.
+// ---------------------------------------------------------------------------
+
+/** The sync half a session needs the moment it starts, before anything is awaited. */
+const REQUIRED_METHODS = [
+  'statSync', 'readdirSync', 'createFileSync', 'mkdirSync', 'rmdirSync', 'unlinkSync',
+  'renameSync', 'readSync', 'writeSync', 'touchSync',
+];
+
+/** The sync methods that leave a write-back queued behind them. */
+const QUEUEING_METHODS = [
+  'renameSync', 'createFileSync', 'unlinkSync', 'rmdirSync', 'mkdirSync', 'linkSync',
+  'writeSync', 'touchSync',
+];
+
+const PREPARED = Symbol.for('wasi-sh.persistentFs');
+
+export async function persistentFs(backing, options = {}) {
+  if (!backing || typeof backing !== 'object') {
+    throw new Error('persistentFs: expected a store, got ' + (backing === null ? 'null' : typeof backing));
+  }
+  const missing = REQUIRED_METHODS.filter((name) => typeof backing[name] !== 'function');
+  if (missing.length) {
+    throw new Error(
+      `persistentFs: this is not a store — it is missing ${missing.join(', ')}. The shape is `
+      + "ZenFS's synchronous `FileSystem` (see wasi-sh/fs); an ASYNC-only filesystem cannot be one, "
+      + 'because the guest is a wasm frame below every call and there is nothing to await into.'
+    );
+  }
+
+  // Hydration first, and reported by name: `ready()` rejecting is a permission
+  // that was not granted or a directory that went away, and the message the
+  // backend throws says nothing about when it was being asked.
+  if (typeof backing.ready === 'function') {
+    try { await backing.ready(); }
+    catch (err) {
+      throw new Error(`persistentFs: the store could not be hydrated: ${(err && err.message) || err}`, { cause: err });
+    }
+  }
+
+  // Preparing one store twice is not reachable through the documented shape,
+  // and the guard is a trap laid for the next edit rather than a bug that has
+  // fired: a second pass would stack a wrapper per call and report every
+  // failure twice. Re-hydrating above is free and stays outside it, since that
+  // is the half a caller might legitimately repeat.
+  if (backing[PREPARED]) return backing;
+  Object.defineProperty(backing, PREPARED, { value: true, enumerable: false, configurable: true });
+
+  // The latch. A failure is reported to `onError` the moment it is seen — the
+  // only timely report there is — and held for the next syncSync()/flush(), so
+  // a caller that reads neither still gets it on the shim's own flush path.
+  // Raising CLEARS it: repeating one stale error at every later exit would bury
+  // the next real one under it.
+  let latched = null;
+  const { onError } = options;
+  const reported = new WeakSet();
+  const record = (err) => {
+    // The queue is one promise chained with `finally`, so ONE failure rejects
+    // every link after it — a second look at the chain sees the same error
+    // again, for ever. Report each object once and the count means something.
+    if (err && typeof err === 'object') {
+      if (reported.has(err)) return;
+      reported.add(err);
+    }
+    // Which write it was comes from the error or not at all: watching the
+    // queue costs the call site, and inventing one would name the wrong file.
+    const at = err && err.path ? ` (${err.path})` : '';
+    const wrapped = new Error(`persistentFs: a write did not reach the store${at}: ${(err && err.message) || err}`, { cause: err });
+    if (err && err.code !== undefined) { wrapped.code = err.code; wrapped.errno = err.errno; }
+    latched = latched || wrapped;
+    if (onError) { try { onError(wrapped); } catch { /* a reporter that throws must not take the queue with it */ } }
+  };
+  const raise = () => { const err = latched; latched = null; if (err) throw err; };
+
+  // Watch the write-back queue. `_promise` is the ONE private thing this
+  // adapter reads, and it is read rather than replaced, because there is no
+  // public way to see a failure: `sync()` is the only verb that awaits the
+  // queue and it does so with `.catch(() => {})`.
+  //
+  // The queue is watched instead of the async METHODS being wrapped, and that
+  // is not a style choice — it was measured. The mixin detects its own
+  // recursion by reading the call stack for `<computed> [as write]`, which is
+  // the name of the slot it patched; taking that slot moves the marker onto the
+  // wrapper, the guard stops firing, and the write is applied to the cache a
+  // second time. `mkdir` then fails EEXIST against a directory it just made.
+  let watched = null;
+  const watch = () => {
+    const queue = backing._promise;
+    if (!queue || typeof queue.catch !== 'function' || queue === watched) return;
+    watched = queue;
+    queue.catch(record);
+  };
+
+  // A store with nothing asynchronous behind it queues nothing, so there is
+  // nothing to watch and its writes throw from the call itself. Wrapping every
+  // method to watch a queue that will never exist is pure cost, so don't.
+  if (backing._promise && typeof backing._promise.catch === 'function') {
+    for (const method of QUEUEING_METHODS) {
+      const original = backing[method];
+      if (typeof original !== 'function') continue;
+      // Named deliberately, and NOT `<name>Sync`: the mixin's recursion guard
+      // also matches a bare `writeSync ` anywhere in the stack, so a wrapper
+      // called `persistentFs__writeSync` would make it fire where it must not.
+      const named = `persistentFs__after_${method.slice(0, -4)}`;
+      backing[method] = {
+        [named]: (...args) => {
+          try { return original.apply(backing, args); }
+          finally { watch(); }
+        },
+      }[named];
+    }
+    watch();
+  }
+
+  /**
+   * Wait for every write so far to reach the backing store, and raise the
+   * first that did not.
+   *
+   * This is the verb `syncSync()` would be if anything synchronous could await
+   * OPFS. Call it where the answer is worth having — before a tab closes,
+   * around a checkpoint — not per write: the queue drains on its own, and each
+   * await costs a round trip through the backend.
+   */
+  Object.defineProperty(backing, 'flush', {
+    value: async function flush() {
+      if (typeof backing.sync === 'function') await backing.sync();
+      watch();
+      // One turn, so a rejection the line above only just attached to has been
+      // delivered. `sync()` swallows it, so without this the first flush after
+      // a failure reports nothing and the second reports it.
+      await Promise.resolve();
+      raise();
+    },
+    writable: true, configurable: true, enumerable: false,
+  });
+
+  // The shim calls this at every proc_exit and reports a throw as data loss on
+  // stderr, which is the right treatment and the only one available: it cannot
+  // wait for the backing store, so what it reports is what has ALREADY failed.
+  // The cache sync underneath stays, because a backend that is not async-backed
+  // has a real one to do.
+  const syncSync = backing.syncSync;
+  backing.syncSync = function persistentFs__flushPoint() {
+    if (typeof syncSync === 'function') syncSync.call(backing);
+    raise();
+  };
+
+  return backing;
+}

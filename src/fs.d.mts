@@ -122,3 +122,31 @@ export class MemoryFs implements FileSystem {
   touchSync(path: string, metadata: Partial<InodeLike>): void;
   syncSync(): void;
 }
+
+/** A store prepared by {@link persistentFs}: the same object, plus `flush()`. */
+export type PersistentFileSystem<T> = T & {
+  /**
+   * Wait for every write so far to reach the backing store, and raise the
+   * first that did not. The verb `syncSync()` would be if anything synchronous
+   * could await OPFS.
+   */
+  flush(): Promise<void>;
+};
+
+export interface PersistentOptions {
+  /** Called with each write-back failure, as it happens. */
+  onError?(error: FsError | Error): void;
+}
+
+/**
+ * Prepare a persistent store for a session: hydrate it, and give the writes
+ * behind it somewhere to report a failure.
+ *
+ * An adapter, not a backend — `backing` is the embedder's, typically
+ * `@zenfs/dom`'s `WebAccess` over an OPFS or user-granted directory handle.
+ * Returns the same object so a second guest still sees the class it was handed.
+ */
+export function persistentFs<T extends FileSystem>(
+  backing: T,
+  options?: PersistentOptions,
+): Promise<PersistentFileSystem<T>>;
