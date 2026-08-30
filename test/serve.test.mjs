@@ -17,22 +17,37 @@ before(async () => { wasm = await compileWasm(); });
 const HOSTB_READY = () => WebAssembly.Module.imports(wasm)
   .some((i) => i.module === 'env' && i.name === '__host_builtin_run');
 
-// A Worker global stand-in. Returns the module's message handler plus whatever
-// it posted back.
+// A Worker global stand-in: deliver a message, read back whatever was posted.
+// A LIST of handlers, not one: a serve() module may listen for messages of its
+// own (a SharedArrayBuffer for serve({ fs }) is the case that needs it), so
+// "who gets this message" is exactly what the last three cases below are about.
 function fakeSelf() {
   const posted = [];
-  let onMessage;
+  const handlers = [];
   globalThis.self = {
-    addEventListener(type, fn) { if (type === 'message') onMessage = fn; },
+    addEventListener(type, fn) { if (type === 'message') handlers.push(fn); },
     postMessage(m) { posted.push(m); },
   };
-  return { posted, deliver: (data) => onMessage({ data }) };
+  return {
+    posted,
+    deliver: (data) => Promise.all(handlers.map((fn) => fn({ data }))),
+  };
 }
 
 // Import worker.mjs fresh each time: `config`/`started` are module state, and a
 // cached module would leak one test's builtins into the next.
 async function loadWorker() {
   return import(`../src/worker.mjs?t=${Math.random()}`);
+}
+
+// The example worker modules import the CANONICAL src/worker.mjs and call
+// serve() on it at import time, so that instance registers a listener on
+// whichever `self` is live when they load. Give them a throwaway one: a
+// delivery reaching two shim instances starts two shells, and the second
+// example would then find the first's copy already started.
+async function loadExample(specifier) {
+  fakeSelf();
+  return import(specifier);
 }
 
 const dec = new TextDecoder();
@@ -122,8 +137,8 @@ test('serve() with no builtins is just the default worker', async () => {
 // browser, but its handlers are ordinary functions and can be checked here.
 test('the host-builtins example composes json and num in a pipeline', async (t) => {
   if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
-  const self_ = fakeSelf();          // the example calls serve() at import time
-  const { builtins } = await import('../examples/host-builtins.worker.mjs');
+  const { builtins } = await loadExample('../examples/host-builtins.worker.mjs');
+  const self_ = fakeSelf();
   const { serve } = await loadWorker();
   serve({ builtins });
   await self_.deliver({
@@ -161,8 +176,8 @@ test('the host-port example answers requests off its own filesystem', async (t) 
   const script = /<script type="text\/plain" id="server-sh">([\s\S]*?)<\/script>/.exec(page);
   assert.ok(script, 'the page still carries its server script where it says it does');
 
-  const self_ = fakeSelf();          // the example calls serve() at import time
-  const { host } = await import('../examples/host-port.worker.mjs');
+  const { host } = await loadExample('../examples/host-port.worker.mjs');
+  const self_ = fakeSelf();
   const { serve } = await loadWorker();
   serve({ host });
   await self_.deliver({
@@ -255,4 +270,92 @@ test('a request ring reaches it too, and an ended one ends the loop', async () =
 test('with neither transport the device is refused', async () => {
   const r = await runInWorker("{ read -r req <&3; } 3< /dev/hostreq 2>/dev/null || echo 'not granted'\n", {});
   assert.equal(r.stdout, 'not granted\n');
+});
+
+// ─── whose message is it ─────────────────────────────────────────────────────
+// A worker module has one `message` event and two things want it: this shim's
+// startup message, and whatever the module itself is waiting for. Until the
+// shim learned to tell them apart, the second could not exist — every message
+// was read as the startup message, which is what these three pin.
+
+test('a message carrying no wasm is left for the module’s own listener', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const self_ = fakeSelf();
+  const { serve } = await loadWorker();
+  serve({});
+  const seen = [];
+  self.addEventListener('message', (e) => { if (e.data.kind === 'mine') seen.push(e.data); });
+
+  await self_.deliver({ kind: 'mine', payload: 42 });
+  assert.deepEqual(seen, [{ kind: 'mine', payload: 42 }], 'the module’s listener got it');
+  assert.deepEqual(self_.posted, [], 'and the shim said nothing about a message that was not its own');
+
+  await self_.deliver({
+    module: wasm,
+    files: { '/main.sh': 'echo still-starts' },
+    args: ['busybox', 'sh', '/main.sh'],
+    env: { PATH: '/', HOME: '/', LC_ALL: 'C' },
+    stdin: new Uint8Array(0),
+  });
+  const r = collect(self_.posted);
+  assert.equal(r.stdout, 'still-starts\n', 'the real startup message still starts the shell');
+  assert.equal(r.exitCode, 0);
+});
+
+// The shape a shared filesystem arrives in, and the reason the case above
+// exists. A store is a live object, so it cannot be structured-cloned into a
+// worker any more than a builtin can — what crosses is the SharedArrayBuffer
+// behind it, as an ordinary message, and serve({ fs }) waits on it.
+test('serve({ fs }) can wait on a buffer the page posts', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const { memoryFs } = await import('../src/fs.mjs');
+  const self_ = fakeSelf();
+  const { serve } = await loadWorker();
+
+  let handOver;
+  const handed = new Promise((res) => { handOver = res; });
+  self.addEventListener('message', (e) => { if (e.data.type === 'store') handOver(e.data.sab); });
+  serve({
+    async fs() {
+      const sab = await handed;
+      return memoryFs({ '/shared.txt': new Uint8Array(sab).slice() });
+    },
+  });
+
+  const sab = new SharedArrayBuffer(6);
+  new Uint8Array(sab).set(new TextEncoder().encode('shared'));
+  await self_.deliver({ type: 'store', sab });
+  await self_.deliver({
+    module: wasm,
+    files: {},
+    args: ['busybox', 'sh', '-c', 'cat /shared.txt'],
+    env: { PATH: '/', HOME: '/', LC_ALL: 'C' },
+    stdin: new Uint8Array(0),
+  });
+  const r = collect(self_.posted);
+  assert.equal(r.stdout, 'shared');
+  // The half that decides whether this shape is usable at all: an error posted
+  // for the handoff rejects spawn()'s ready before the shell is even reached,
+  // so the session the page is waiting on never arrives.
+  assert.equal(r.error, undefined, 'the handoff was not reported as a failure');
+});
+
+test('a second startup message is refused, not started', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const self_ = fakeSelf();
+  const { serve } = await loadWorker();
+  serve({});
+  const startup = {
+    module: wasm,
+    files: { '/main.sh': 'echo once' },
+    args: ['busybox', 'sh', '/main.sh'],
+    env: { PATH: '/', HOME: '/', LC_ALL: 'C' },
+    stdin: new Uint8Array(0),
+  };
+  await self_.deliver(startup);
+  await self_.deliver(startup);
+  const r = collect(self_.posted);
+  assert.equal(r.stdout, 'once\n', 'one guest, one run');
+  assert.equal(self_.posted.filter((m) => m.type === 'exit').length, 1);
+  assert.match(r.error, /already has one/);
 });
