@@ -956,6 +956,13 @@ export class WasiShim {
         // which is the same reason `pending` exists at all. The offset cell is
         // that identity: POSIX shares it across dup/dup2 and path_open makes a
         // fresh one per open, which is exactly the boundary wanted here.
+        //
+        // A WRITE open, precisely — and there is no symmetric check in read(),
+        // deliberately. An exchange spans two opens by design (`echo verb >
+        // /dev/host` then `$(cat /dev/host)`), so the read that collects an
+        // answer and a later `cat` that finds one still sitting there are the
+        // same thing seen from here: a fresh open description reading. Nothing
+        // distinguishes them, which is why the boundary is the next request.
         if(owner!==writer){ writer=owner; pending=EMPTY; response=[]; responseLen=0; }
         const buf=pending.length?concatBytes(pending,b):b;
         let start=0, errno=0;
