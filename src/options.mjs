@@ -1,6 +1,7 @@
 // Internal option plumbing shared by run() and spawn(): argv/env/wasm
 // normalization and the fixed-stdin input adapter. Not a public subpath —
 // import from 'wasi-sh' (index) or 'wasi-sh/run' / 'wasi-sh/spawn' instead.
+import { frameRequest } from './ring.mjs';
 
 export const DEFAULT_ENV = {
   PATH: '/',
@@ -157,6 +158,35 @@ export function hostPort(spec) {
       return spec[verb](payload, verb);
     },
   };
+}
+
+// Pre-staged inbound requests, for run(): the whole channel, known up front.
+// Nothing can arrive DURING a run() — the guest holds the thread for its entire
+// life, which is the same reason spawn() exists — so the honest shape is a list
+// handed over before the shell starts, drained in order, then EOF. That is the
+// dev-server loop with a finite queue, and it is enough to write the loop
+// against; spawn()'s ring is what makes the queue live.
+//
+// Returns undefined for no list at all, which is what keeps /dev/hostreq EPERM:
+// an empty list is a granted channel with nothing in it (the loop runs zero
+// times), and no list is a session that can never be asked.
+export function toRequestBytes(list) {
+  if (list == null) return undefined;
+  const items = Array.isArray(list) ? list : [list];
+  const framed = items.map(frameRequest);
+  let total = 0;
+  for (const f of framed) total += f.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const f of framed) { out.set(f, off); off += f.length; }
+  return out;
+}
+
+// The shim's inbound channel over those bytes: drain, then EOF. fixedInput's
+// contract is already the read half of it — the inbound channel is stdin's
+// contract aimed the other way, so there is nothing else to implement.
+export function fixedRequests(bytes) {
+  return bytes === undefined ? undefined : fixedInput(bytes);
 }
 
 // The public `host` option: a verb map, a port, or a factory returning either.

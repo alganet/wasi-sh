@@ -41,6 +41,36 @@ export function createStdinRing(dataBytes = 65536) {
   return new SharedArrayBuffer(HEADER_BYTES + dataBytes);
 }
 
+// Frame one inbound request for the guest's /dev/hostreq. A request is a LINE
+// — the vocabulary the outbound half settled, for the same reason: a write
+// boundary is not a frame, because stdio splits where it likes.
+//
+// Both refusals happen HERE, at the producer, and that is the whole design of
+// inbound error reporting. A request arriving at a parked guest has no write to
+// fail and no `$?` to reach, so an error it could only learn by reading is one
+// it cannot act on. The host can: it is the one holding the request.
+//
+// A newline inside a request would silently become two requests, the second of
+// them forged. An empty one would deliver a blank line, which the outbound half
+// already defines as not a request at all.
+export function frameRequest(request) {
+  const bytes = typeof request === 'string' ? new TextEncoder().encode(request)
+    : (request instanceof Uint8Array ? request : new Uint8Array(request));
+  if (!bytes.length) throw new Error('host request: empty. A request is a line with something on it; a blank line is not a request.');
+  const nl = bytes.indexOf(0x0a);
+  if (nl >= 0) {
+    throw new Error(
+      `host request: contains a newline at byte ${nl}, and a request is one line — `
+      + 'delivering it would forge a second request out of the remainder. Encode the '
+      + 'payload (percent, base64, JSON) or pass a handle the guest fetches with a verb.'
+    );
+  }
+  const out = new Uint8Array(bytes.length + 1);
+  out.set(bytes);
+  out[bytes.length] = 0x0a;
+  return out;
+}
+
 export class RingOverflowError extends Error {
   constructor(requested, free) {
     super(

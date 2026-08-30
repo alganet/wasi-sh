@@ -47,8 +47,7 @@
 // The port runs both ways. Inbound — the HOST asking the GUEST — is `requests`,
 // an input-shaped channel of request lines read from /dev/hostreq, which is how
 // a dev server is an ordinary shell loop:
-//   exec 3< /dev/hostreq
-//   while read -r req <&3; do handle "$req"; done
+//   while read -r req <&3; do handle "$req"; done 3< /dev/hostreq
 // A running guest owns its worker, so nothing outside it can be delivered by
 // postMessage; the channel is shared memory the guest reads at a blocking
 // point. End-of-stream is EOF (the loop ends), and a session that can never
@@ -932,8 +931,11 @@ export class WasiShim {
   // Framing is the vocabulary the outbound half already settled: a request is a
   // LINE. So the whole of a dev server is
   //
-  //     exec 3< /dev/hostreq
-  //     while read -r req <&3; do handle "$req"; done
+  //     while read -r req <&3; do handle "$req"; done 3< /dev/hostreq
+  //
+  // Redirected on the LOOP rather than with `exec`, because a failed `exec`
+  // redirection ends a non-interactive shell outright — the refusal below is
+  // worth more when the script is still there to act on it.
   //
   // and the two things it has to be told, it is told in the shell's own terms:
   //

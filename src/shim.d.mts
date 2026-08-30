@@ -193,8 +193,7 @@ export interface WasiShimOptions {
    * this channel is shared memory the guest reads at a blocking point, which
    * makes a dev server an ordinary shell loop:
    *
-   *     exec 3< /dev/hostreq
-   *     while read -r req <&3; do handle "$req"; done
+   *     while read -r req <&3; do handle "$req"; done 3< /dev/hostreq
    *
    * Granted separately from `host` — a session may be able to ask the host
    * without being able to be asked. Absent, the device is there and every open

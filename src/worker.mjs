@@ -20,13 +20,15 @@
 // without them. serve() detects that and says so instead. Async setup belongs
 // inside builtins(), which is awaited before the module is instantiated.
 //
-// Startup message: { module | wasmBytes, files, args, env, sab? , stdin? }
+// Startup message: { module | wasmBytes, files, args, env, sab?, stdin?, requests? }
+// `requests` is the inbound host-port channel, pre-framed: bytes, so it crosses
+// structured clone exactly as stdin does. Nothing about it is a live object.
 // Outbound:        { type:'out', channel:'stdout'|'stderr', bytes }
 //                  { type:'ready' } after instantiation, before _start()
 //                  { type:'exit', code } | { type:'error', msg }
 import { WasiShim, WasiExit } from './shim.mjs';
 import { RingReader } from './ring.mjs';
-import { fixedInput, resolveBuiltins, resolveHost } from './options.mjs';
+import { fixedInput, fixedRequests, resolveBuiltins, resolveHost } from './options.mjs';
 
 let config = {};
 let started = false;
@@ -48,7 +50,7 @@ export function serve(options = {}) {
 
 self.addEventListener('message', async (e) => {
   started = true;
-  const { module, wasmBytes, files, args, env, sab, stdin } = e.data;
+  const { module, wasmBytes, files, args, env, sab, stdin, requests } = e.data;
   try {
     const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
     // Builtin setup and wasm compilation are independent; overlapping them
@@ -72,6 +74,7 @@ self.addEventListener('message', async (e) => {
       stdout: post('stdout'),
       stderr: post('stderr'),
       input, builtins, host,
+      requests: fixedRequests(requests),
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);
