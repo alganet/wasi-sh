@@ -44,6 +44,16 @@
 // Reached from a script as /dev/host (see hostDevice()); absent, the device is
 // there and every open is EPERM.
 //
+// The port runs both ways. Inbound — the HOST asking the GUEST — is `requests`,
+// an input-shaped channel of request lines read from /dev/hostreq, which is how
+// a dev server is an ordinary shell loop:
+//   exec 3< /dev/hostreq
+//   while read -r req <&3; do handle "$req"; done
+// A running guest owns its worker, so nothing outside it can be delivered by
+// postMessage; the channel is shared memory the guest reads at a blocking
+// point. End-of-stream is EOF (the loop ends), and a session that can never
+// receive requests refuses the open (the loop never starts).
+//
 // Usage:
 //   const shim = new WasiShim({ args, env, files, stdout, stderr, input, builtins });
 //   const { instance } = await WebAssembly.instantiate(module, shim.imports());
@@ -107,7 +117,7 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, requests }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
@@ -115,6 +125,7 @@ export class WasiShim {
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
     this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
     this.host = host;                   // { request(verb, payload)->bytes } — see hostDevice()
+    this.requests = requests;           // inbound: an `input`-shaped channel of request lines
     this.mem = null; this.view = null; this.u8 = null;
     // The filesystem, as a store (see fs.mjs). Passing one is how a session
     // reaches a real directory or a shared buffer; passing none keeps today's
@@ -138,6 +149,12 @@ export class WasiShim {
     // different answers, and a script can only act on the difference if the
     // name is there to be refused.
     this.addDevice('/dev/host', this.hostDevice());
+    // Registered on the same terms, and granted separately: a session may be
+    // able to ask the host without being able to be asked, and the two are not
+    // the same capability. Without a channel the name is there and every open
+    // is EPERM, so a dev-server loop refuses to start instead of parking on a
+    // request that can never arrive.
+    this.addDevice('/dev/hostreq', this.requestDevice());
     // fd table. 0/1/2 std, 3 = preopen "/".
     this.fds = new Map();
     this.fds.set(0, { type:'stdin' });
@@ -613,23 +630,28 @@ export class WasiShim {
   // take the blocking path even while `read -t` has fd 0 flagged O_NONBLOCK.
   // `data` may be a view into an FS node or into whatever input.read() returned
   // — copy it before retaining (ctx.stdin does).
+  // Read from an `input`-shaped source: stdin, or the inbound request channel,
+  // which is the same contract aimed the other way. Returns { data, errno } as
+  // readFd does.
+  //
+  // No data. A BLOCKING read must wait — else `while read` sees failure and the
+  // loop ends one line early. A NON-blocking read gets EAGAIN so `read -t`
+  // timeout logic runs. A CLOSED source reads 0 bytes with SUCCESS — true EOF,
+  // which is what ends the loop.
+  readInput(src,max,nonblock){
+    let data=src?src.read(max):EMPTY;
+    if(data.length===0){
+      if(!nonblock && src && src.readBlocking){ data=src.readBlocking(max); }
+      if(data.length===0){
+        return { data:EMPTY, errno:(src && src.closed && src.closed()) ? 0 : E.AGAIN };
+      }
+    }
+    return { data, errno:0 };
+  }
   readFd(fd,max,nonblock){
     const f=this.fds.get(fd);
     if(!f) return { data:EMPTY, errno:E.BADF };
-    if(f.type==='stdin'){
-      let data=this.input?this.input.read(max):EMPTY;
-      if(data.length===0){
-        // No data. A BLOCKING read must wait for input — else `while read`
-        // sees failure and the app exits. A NON-blocking read gets EAGAIN
-        // so `read -t` timeout logic runs. A CLOSED stdin reads 0 bytes
-        // with SUCCESS — true EOF, so `while read` loops terminate.
-        if(!nonblock && this.input && this.input.readBlocking){ data=this.input.readBlocking(max); }
-        if(data.length===0){
-          return { data:EMPTY, errno:(this.input && this.input.closed && this.input.closed()) ? 0 : E.AGAIN };
-        }
-      }
-      return { data, errno:0 };
-    }
+    if(f.type==='stdin') return this.readInput(this.input,max,nonblock);
     // The offset cell identifies the OPEN DESCRIPTION — fresh per path_open,
     // shared across dup/dup2 exactly as POSIX shares an offset. A device that
     // holds per-exchange state (the host port does) needs to know which open
@@ -896,6 +918,55 @@ export class WasiShim {
         if(errno){ response=[]; responseLen=0; }
         return errno;
       },
+    };
+  }
+
+  // The inbound half of the port: requests the HOST hands to a RUNNING guest.
+  //
+  // Nothing can be delivered to a live session by postMessage — a running guest
+  // owns its worker and its event loop never turns — so the channel is shared
+  // memory the guest reads at a blocking point. Which is why this is a device
+  // and not a verb: a verb is the guest calling out, and here the guest is
+  // WAITING TO BE TOLD.
+  //
+  // Framing is the vocabulary the outbound half already settled: a request is a
+  // LINE. So the whole of a dev server is
+  //
+  //     exec 3< /dev/hostreq
+  //     while read -r req <&3; do handle "$req"; done
+  //
+  // and the two things it has to be told, it is told in the shell's own terms:
+  //
+  //   EPERM at open   this session can never receive a request. The loop
+  //                   refuses to start, rather than parking forever on one.
+  //   EOF at read     no more requests are coming. `read` returns non-zero and
+  //                   the loop ends, exactly as it does on a closed pipe.
+  //
+  // There is no third answer, and that is deliberate: every other way an
+  // inbound request can fail — a line with a newline in it, one too big for the
+  // channel — is refused AT THE PRODUCER, where there is something to be done
+  // about it. The guest has no write to fail and no $? to reach, so an error it
+  // could only report by reading is an error it cannot act on.
+  //
+  // The reply goes back out through /dev/host, as an ordinary verb. One
+  // direction per device, and no second vocabulary.
+  requestDevice(){
+    const w=this;
+    return {
+      open:()=> w.requests?0:E.PERM,
+      // Offered unconditionally, because its PRESENCE is what stops poll_oneoff
+      // calling this fd readable and putting the wait in the read behind it.
+      // True at end-of-stream too — the read is what reports EOF.
+      poll:(ms)=>{ const q=w.requests; if(!q) return true;
+        return q.pollReadable(ms) || !!(q.closed&&q.closed()); },
+      read(max,owner,nonblock){
+        if(!w.requests) return E.PERM;
+        const r=w.readInput(w.requests,max,nonblock);
+        return r.errno||r.data;
+      },
+      // No write half at all: the answer to a request is an outbound verb, and
+      // addDevice's default says what a missing half means — nothing that may
+      // be written, EPERM.
     };
   }
   // Drop a pipe's buffers once no fd references it (close/dup2 both funnel here).
