@@ -8,7 +8,9 @@ Fork-free busybox for wasm32-wasi (see wasi-sh ARCHITECTURE.md):
   bb_common_bufsiz1 (applets like grep keep their globals there and assume
   a freshly-zeroed process) and clearerr() the shared stdio streams (an
   applet that drained stdin leaves the EOF flag set, which a forked child
-  would never leak back to the parent).
+  would never leak back to the parent); after it, fflush(stdin) so bytes it
+  buffered and never read do not become the next applet's input (`head -1`
+  twice used to print l1 then l2).
 
 --- a/shell/ash.c
 +++ b/shell/ash.c
@@ -310,12 +312,52 @@ Fork-free busybox for wasm32-wasi (see wasi-sh ARCHITECTURE.md):
  #include "NUM_APPLETS.h"
  
  #define NOFORK_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_NOFORK))
-@@ -117,6 +118,8 @@
+@@ -56,6 +57,13 @@
+  */
+ #if NOFORK_SUPPORT
+ static jmp_buf die_jmp;
++/* Fork-free, an applet runs INSIDE the shell, so stdin's stdio buffer is the
++ * shell's. A short-reading applet (head -1, sed q, grep -m1) pulls a whole
++ * block, prints part of it and returns with the rest still buffered - bytes a
++ * forked child would have taken with it. The next applet then reads them as
++ * its own input, which corrupts data rather than merely surprising. Drained
++ * in run_nofork_applet() below, at the outermost applet only. */
++static unsigned nofork_depth;
+ static void jump(void)
+ {
+ 	/* Special case. We arrive here if NOFORK applet
+@@ -102,6 +110,7 @@
+ int FAST_FUNC run_nofork_applet(int applet_no, char **argv)
+ {
+ 	int rc, argc;
++	volatile unsigned depth; /* survives die_func's longjmp */
+ 	struct nofork_save_area old;
+ 
+ 	save_nofork_data(&old);
+@@ -117,6 +126,9 @@
  	argc = string_array_len(argv);
  
  	/* If xfunc "dies" in NOFORK applet, die_func longjmp's here instead */
 +	memset(bb_common_bufsiz1, 0, COMMON_BUFSIZE);
 +	clearerr(stdin); clearerr(stdout); clearerr(stderr);
++	depth = ++nofork_depth;
  	die_func = jump;
  	rc = setjmp(die_jmp);
  	if (!rc) {
+@@ -138,6 +150,16 @@
+ 		/* xfunc died in NOFORK applet */
+ 	}
+ 
++	/* Give back what this applet buffered and never read. fflush() on an
++	 * input stream discards the buffer and puts a seekable offset back to
++	 * where the reader actually stopped; on a pipe the seek fails and the
++	 * discard alone is what the child's exit used to do. Outermost applet
++	 * only: xargs and find -exec run their children through this same
++	 * function, and the stdin they have buffered is still theirs. */
++	nofork_depth = depth - 1;
++	if (depth == 1)
++		fflush(stdin);
++
+ 	/* Restoring some globals */
+ 	restore_nofork_data(&old);
+ 	/* Other globals can be simply reset to defaults */

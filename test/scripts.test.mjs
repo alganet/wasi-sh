@@ -298,6 +298,69 @@ test('pipe inside cmdsubst', async () => {
   assert.equal(r.stdout, 'r=[a-b-c-]\n');
 });
 
+// ─── a short reader keeps nothing for the next applet ────────────────────────
+// Fork-free, an applet's stdio buffer is the SHELL's. A short-reading applet
+// (`head -1`, `sed q`, `grep -m1`) pulls a whole block, prints part of it and
+// returns — and the remainder a forked child would have taken to the grave was
+// still sitting in stdin when the next applet read. That corrupts data rather
+// than merely surprising: the second reader got the first one's leftovers.
+// Every case below printed something else entirely before the drain landed.
+// A stale dist/busybox.wasm fails these; `npm run build:wasm` is the fix.
+
+test('the same pipeline twice gives the same answer', async () => {
+  const r = await sh('printf "l1\\nl2\\nl3\\n" | head -1\nprintf "l1\\nl2\\nl3\\n" | head -1\n');
+  assert.equal(r.stdout, 'l1\nl1\n', 'the second head used to print l2');
+});
+
+test('and a wider read after a narrow one is all fresh', async () => {
+  const r = await sh('printf "l1\\nl2\\nl3\\n" | head -1\nprintf "l1\\nl2\\nl3\\n" | head -2\n');
+  assert.equal(r.stdout, 'l1\nl1\nl2\n', 'head -2 used to serve l2 and l3 out of the first head\'s buffer');
+});
+
+test('a loop body reading a pipe repeats itself exactly', async () => {
+  const r = await sh('for i in 1 2 3; do seq 10 | head -2 | tr "\\n" " "; echo; done');
+  assert.equal(r.stdout, '1 2 \n1 2 \n1 2 \n');
+});
+
+test('every short-reading applet, not just head', async () => {
+  const r = await sh('printf "a\\nb\\nc\\n" | sed q\nprintf "a\\nb\\nc\\n" | grep -m1 .\n'
+    + 'printf "a\\nb\\nc\\n" | awk "NR==1{print;exit}"\nprintf "p\\nq\\n" | head -1\n');
+  assert.equal(r.stdout, 'a\na\na\np\n');
+});
+
+test('a heredoc does not leak into the next command', async () => {
+  const r = await sh('head -1 <<EOT\nh1\nh2\nEOT\nprintf "p\\nq\\n" | head -1\n');
+  assert.equal(r.stdout, 'h1\np\n', 'the pipeline used to print the heredoc\'s h2');
+});
+
+test('an applet that dies leaves nothing behind either', async () => {
+  const r = await sh('printf "a\\nb\\nc\\n" | head -1\nhead -1 /nope 2>/dev/null\nprintf "p\\nq\\n" | head -1\n');
+  assert.equal(r.stdout, 'a\np\n');
+});
+
+// On a SEEKABLE stdin the drain does better than dropping the bytes: fflush()
+// puts the file offset back to where the reader actually stopped, so nothing
+// is lost. Two separate redirections of one file each start at the top, and a
+// `read` after an applet continues from the line the applet printed.
+
+test('two redirections of one file each start at the top', async () => {
+  const r = await sh('head -1 < /f\nhead -1 < /f\n', { files: { '/f': 'f1\nf2\nf3\n' } });
+  assert.equal(r.stdout, 'f1\nf1\n', 'the second used to resume at f2');
+});
+
+test('and the offset is put back where the applet stopped, not where it read to', async () => {
+  const r = await sh('{ head -1; read x; echo "read=$x"; } < /f\n', { files: { '/f': 'r1\nr2\nr3\n' } });
+  assert.equal(r.stdout, 'r1\nread=r2\n', 'read used to see EOF: head had swallowed the file');
+});
+
+// The drain is outermost-only. xargs and find -exec run their children through
+// the same run_nofork_applet(), and the stdin the OUTER applet has buffered is
+// still its own to read.
+test('an applet nested inside another does not drain its parent', async () => {
+  const r = await sh('printf "a\\nb\\nc\\n" | xargs echo');
+  assert.equal(r.stdout, 'a b c\n');
+});
+
 // ─── subshell isolation (from test-isolation.mjs) ────────────────────────────
 
 test('isolation: vars set inside $() do not leak', async () => {
