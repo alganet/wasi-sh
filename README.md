@@ -131,6 +131,45 @@ mounted somewhere invisible. What a store *does* receive is your `files:`, plus
 live object, so in a browser it is registered inside the worker with
 `serve({ fs })`, exactly like host builtins.
 
+### Persistence: a project that survives a reload
+
+Every backend that outlives a tab is asynchronous, and the contract is
+synchronous, so the two meet through **hydrate-and-flush**: read the tree into
+a cache before the guest starts, serve every call from it, pipeline the writes
+back out. That is `@zenfs/dom`'s `WebAccessFS` over any
+`FileSystemDirectoryHandle` — so OPFS and a folder the user picked are one
+backend, and neither is ours. `persistentFs()` is the seam:
+
+```js
+import { WebAccess } from '@zenfs/dom';
+import { persistentFs } from 'wasi-sh/fs';
+
+const store = await persistentFs(
+  await WebAccess.create({ handle: await navigator.storage.getDirectory() }),
+  { onError: (err) => console.error('the project did not save:', err) },
+);
+
+serve({ async fs() { return store; } });   // in the worker, awaited once
+await store.flush();                       // when the answer is worth having
+```
+
+It does three things, each of which is silent when it is got wrong.
+**Hydration is not automatic** — `WebAccess.create()` loads the index and not
+the cache, and a store handed over between the two answers ENOENT for every
+file that is really there, so the shell sees an empty project and the first
+thing it writes shadows the real one. **A failed write-back is dropped** — the
+queue is awaited with `.catch(() => {})`, so a quota that filled up is
+invisible; `onError` is told as it happens and `flush()` raises it.
+And **`syncSync()` cannot flush an async backend** — it is the shim's one flush
+point, at every `proc_exit`, and nothing synchronous can await OPFS, so what it
+reports is what has already failed. `flush()` is the awaitable half.
+
+Measured in Chromium against OPFS, 2,000 files / 15 MB: hydrate **~500 ms**,
+a `writeSync` the guest sees as **0 ms**, its write-back **~13 ms** behind it.
+The cache costs roughly 6× the project's size in heap. Sync access handles
+(`createSyncAccessHandle`) are not used and are worker-only; they are the door
+left open for a live SQLite file, not this.
+
 ## Scope and drawbacks — read before depending on it
 
 - **No processes, ever.** There is no fork/exec: no external programs, no
@@ -522,7 +561,7 @@ driven from the page.
 | `wasi-sh/node` | `run`, `runScript`, `compileWasm`, `readTree` (fs sugar; node-only) |
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
 | `wasi-sh/ring` | `createRing`, `RingWriter`, `RingReader`, `frameRequest` — the SAB rings |
-| `wasi-sh/fs` | `memoryFs` and the `fs` contract — the filesystem, pluggable |
+| `wasi-sh/fs` | `memoryFs`, `persistentFs` and the `fs` contract — the filesystem, pluggable |
 | `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
 | `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register builtins, a store, a host port |
