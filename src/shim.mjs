@@ -721,11 +721,19 @@ export class WasiShim {
         f.gone.data.set(b,start); p.v=end;
         return 0;
       }
-      const st=this.statAt(f.path);
-      if(!st) return E.NOENT;
-      // O_APPEND means "at the end as it is NOW", which is why the size is
-      // read here rather than tracked: another fd may have grown the file.
-      const start=f.append?st.size:p.v;
+      // O_APPEND means "at the end as it is NOW", so that one path has to ask
+      // the store how big the file is; nothing else does. This used to stat on
+      // EVERY write — a round trip a persistent store charges real time for,
+      // once per iovec, and a stat that merely hiccuped then failed a write
+      // that would have succeeded, reported as ENOENT whatever it really said.
+      // A plain write goes straight through instead: the store's own error is
+      // both the existence check and the reason, which conformance pins.
+      let start=p.v;
+      if(f.append){
+        const st=this.statAt(f.path);
+        if(!st) return E.NOENT;
+        start=st.size;
+      }
       try { this.store.writeSync(f.path,b,start); } catch(e) { return wasiErrno(e); }
       p.v=start+b.length;
     }

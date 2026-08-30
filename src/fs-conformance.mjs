@@ -142,6 +142,23 @@ export function conformanceCases() {
       },
     },
     {
+      name: 'reads and writes refuse a missing path instead of creating one',
+      run(fs, dir) {
+        // This ENOENT is the shim's whole existence check on the write path:
+        // only O_APPEND needs the size, so every other write goes straight to
+        // the store rather than stat-ing first. A store that quietly created
+        // the file would turn a write into a phantom into a success, and one
+        // that reported another reason would hand the guest a comfortable lie.
+        fs.mkdirSync(dir, {});
+        throwsCode(() => write(fs, `${dir}/absent`, 'x'), 'ENOENT', 'write to a missing path');
+        // An empty write is a real call, not a hypothetical one: fd_write
+        // passes each iovec through on its own and an iovec may be empty.
+        throwsCode(() => fs.writeSync(`${dir}/absent`, new Uint8Array(0), 0), 'ENOENT', 'an empty write to a missing path');
+        throwsCode(() => fs.readSync(`${dir}/absent`, new Uint8Array(4), 0, 4), 'ENOENT', 'read from a missing path');
+        throwsCode(() => fs.statSync(`${dir}/absent`), 'ENOENT', 'and trying created nothing');
+      },
+    },
+    {
       name: 'reads and writes are positional — no offset state in the store',
       run(fs, dir) {
         fs.mkdirSync(dir, {});

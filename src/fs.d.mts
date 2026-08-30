@@ -64,9 +64,15 @@ export interface FileSystem {
   renameSync(from: string, to: string): void;
   /** A second name for one node. May throw ENOSYS — the shim reports it as such. */
   linkSync(target: string, link: string): void;
-  /** Read bytes [start, end) into `buffer` at offset 0. */
+  /** Read bytes [start, end) into `buffer` at offset 0. ENOENT if it is not there. */
   readSync(path: string, buffer: Uint8Array, start: number, end: number): void;
-  /** Write `buffer` at `offset`, extending the file (and zero-filling) as needed. */
+  /**
+   * Write `buffer` at `offset`, extending the file (and zero-filling) as needed.
+   *
+   * Throws ENOENT for a path that does not exist, an empty buffer included:
+   * this is the shim's only existence check on the write path, since nothing
+   * but O_APPEND has a reason to stat first.
+   */
   writeSync(path: string, buffer: Uint8Array, offset: number): void;
   /** truncate + chmod + chown + utimes: only the fields present apply. */
   touchSync(path: string, metadata: Partial<InodeLike>): void;
