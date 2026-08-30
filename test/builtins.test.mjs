@@ -173,13 +173,38 @@ test('a handler that forgets to return is success', () => {
 
 // ─── the hooks: bounded reads from guest memory ──────────────────────────────
 
-// A bad pointer must not walk the whole linear memory (and then spin past the
-// end comparing `undefined !== 0`).
-test('an unterminated string is bounded, not a scan of all memory', () => {
-  const { shim, memory } = makeShim({ lookup: () => true, run: () => 0 });
-  new Uint8Array(memory.buffer).fill(0x41, 2048, 40000);   // no NUL for 38KB
-  const s = shim.cstr(2048);
-  assert.ok(s.length <= 4096, `bounded (got ${s.length})`);
+// A char* has no length beside it, so the walk needs a stop condition — and a
+// byte budget is the wrong one. The budget was 4096, which is generous for a
+// flag and nothing at all for a command line carrying an encoded payload: a
+// longer argument arrived TRUNCATED and still well-formed, so the handler saw
+// a shorter value rather than an error. A dev-server loop passing a request as
+// one JSON argument hits it at the first modest POST body.
+test('a long argument crosses whole, not truncated to a budget', () => {
+  let seen;
+  const big = 'x'.repeat(50000);
+  const { call } = makeShim({ lookup: () => true, run: (ctx) => { seen = ctx; return 0; } });
+
+  assert.equal(call(['tool', big], [`BIG=${big}`]), 0);
+  assert.equal(seen.argv[1].length, big.length, 'an argument must not be silently shortened');
+  assert.equal(seen.argv[1], big);
+  assert.equal(seen.env.BIG, big, 'an environment value is the same char* walk');
+});
+
+// The other half of the stop condition: with no NUL anywhere, the scan must
+// end at the end of linear memory rather than run past it.
+test('an unterminated string stops at the end of memory', () => {
+  let seen;
+  const { memory, shim } = makeShim({ lookup: () => true, run: (ctx) => { seen = ctx; return 0; } });
+  const u8 = new Uint8Array(memory.buffer);
+  const start = u8.length - 16;
+  u8.fill(0x41, start);                       // 'A' to the last byte, no NUL
+
+  const dv = new DataView(memory.buffer);
+  const vec = start - 8;
+  dv.setUint32(vec, start, true);
+  dv.setUint32(vec + 4, 0, true);
+  assert.equal(shim.imports().env.__host_builtin_run(0, 1, vec, 0), 0);
+  assert.equal(seen.argv[0], 'A'.repeat(16));
 });
 
 test('cstr at a null pointer is the empty string', () => {
