@@ -58,6 +58,7 @@ session.onOutput((bytes, channel) => render(bytes)); // shell → you
 session.write('echo hi\n');                          // you → shell
 session.resize(100, 40);  // terminal resized: live size + a synthesized SIGWINCH
 session.post('GET /');// a host request → the running guest (needs requestBufferSize)
+session.interrupt();  // cooperative ^C into whatever is running
 session.end();        // stdin EOF
 session.terminate();  // hard kill (exited resolves 137, kill -9 style)
 await session.exited; // exit code — always settles, even after terminate()
@@ -143,9 +144,10 @@ host builtins.
   one-shot doesn't care; a REPL session that executes tools continuously
   grows slowly and wasm memory is never returned — plan to
   `session.terminate()` and respawn long-lived sessions eventually.
-- **A busy command can't be interrupted.** There is no ^C delivery into a
-  running tool; a long `awk` holds the worker until it finishes
-  (`terminate()` still kills the session from outside).
+- **A busy command can only be interrupted if it agrees to be.**
+  `session.interrupt()` delivers a cooperative ^C (below), which a host builtin
+  can act on — but a busybox applet cannot yet, so a long `awk` still holds the
+  worker until it finishes (`terminate()` remains the answer there).
 - **No symlinks, permissions, or timestamps** in the sandbox FS (`ln` is
   deliberately absent; `ls -l` shows placeholders).
 - A tool that fails or even calls `exit` only sets `$?` — the shell and
@@ -221,6 +223,29 @@ usual — it becomes the first `stty size` — and drive changes with
 `session.resize()`. A guest that doesn't trap WINCH just ignores the signal; the
 fresh size is still there for the next `stty size`.
 
+**Interrupt** is the fourth. wasm has no signals, so a command that will not
+stop holds the worker and `terminate()` — which takes the filesystem and every
+warm instance with it — is otherwise the only way out. `session.interrupt()`
+raises a count in the same ring and wakes the guest; work that polls it stops
+and reports 130.
+
+```js
+term.attachCustomKeyEventHandler((e) => {          // ^C → interrupt
+  if (e.type === 'keydown' && e.ctrlKey && e.key === 'c' && commandRunning) {
+    session.interrupt();
+    return false;
+  }
+  return true;
+});
+```
+
+Note the `commandRunning` guard. At the prompt, `^C` is a byte the shell wants
+for its own line editing, so a terminal that swallows `0x03` unconditionally
+takes it away from the guest. And *cooperative* is the whole contract: it
+cancels what chose to look. Host builtins can (`ctx.interrupted()`, below);
+busybox applets cannot yet, so `terminate()` is still the answer for a runaway
+`awk`.
+
 Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`
 and `<input>` with no terminal library at all, and `examples/repl.html` for
@@ -257,11 +282,31 @@ installed its redirections, so **`ctx.stdout` goes wherever fd 1 currently
 points** — a pipeline stage, a `> file`, a `$(...)` capture — with no work on
 your part.
 
-`ctx` is `{ argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs }`.
-`env` is the shell's live environment, exports and `VAR=x cmd` prefixes
-included; `cwd` comes from the guest itself, so relative paths in `ctx.fs`
-resolve the way the script expects. `type name` reports `name is a host
+`ctx` is `{ argv, env, cwd, stdin(max), stdout(bytes), stderr(bytes), fs,
+interrupted() }`. `env` is the shell's live environment, exports and `VAR=x cmd`
+prefixes included; `cwd` comes from the guest itself, so relative paths in
+`ctx.fs` resolve the way the script expects. `type name` reports `name is a host
 builtin` and `command -v name` prints it, so scripts can probe.
+
+**A long-running builtin should poll `ctx.interrupted()`.** It answers true once
+`session.interrupt()` has been called since *this* command started — an earlier
+^C, typed while nothing was running, is not inherited. It is the only way out of
+a busy handler: the handler runs on the guest's own stack, so nothing can unwind
+it from outside, and the safe points are the ones it picks itself.
+
+```js
+mytool(ctx) {
+  for (const item of huge) {
+    if (ctx.interrupted()) return 130;   // 128 + SIGINT, what `$?` should say
+    work(item);
+  }
+  return 0;
+}
+```
+
+It does not end a blocking `ctx.stdin()`: the wait wakes, but no bytes appeared,
+so the read parks again. A builtin that wants to be interruptible while waiting
+for input has to read with its own timeout and check between attempts.
 
 **Handlers must be synchronous.** The guest is a synchronous wasm stack frame
 below the call — there is nothing to await into. Returning a promise is

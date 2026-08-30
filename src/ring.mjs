@@ -3,8 +3,8 @@
 // Atomics.wait so the guest's blocking `read` and timed `read -t` cost nothing;
 // the producer stores bytes and Atomics.notify's it awake.
 //
-// Layout: Int32[head, tail, flags, seq, winRows, winCols, winch] header
-// (28 bytes), then the data ring.
+// Layout: Int32[head, tail, flags, seq, winRows, winCols, winch, intr] header
+// (32 bytes), then the data ring.
 // head (written by the producer) and tail (written by the consumer) are
 // MONOTONIC byte counters — only the data index is reduced modulo capacity —
 // so `head - tail` is always the number of unread bytes and the ABA problem
@@ -22,6 +22,14 @@
 // pulls the live dims through ioctl(TIOCGWINSZ). Geometry travels here rather
 // than as env because env is frozen at spawn — see ARCHITECTURE / MOAR.
 //
+// `intr` is the cooperative-interrupt word, and it is a MONOTONIC COUNT rather
+// than a flag on purpose. A flag has to be consumed by somebody, and the only
+// consumer is whatever happens to be running — so an interrupt posted while
+// nothing is (between commands, mid-applet) survives to cancel the NEXT thing,
+// which is a ^C the user never typed. A count needs no consumer: a handler
+// records the value it started at and compares, so an interrupt is delivered to
+// exactly the work that was in flight when it was posted, and to nothing else.
+//
 // Both sides of the package import this module — the writer (spawn/Session)
 // and the reader (worker) — so the format has a single source of truth.
 
@@ -32,7 +40,8 @@ const IDX_SEQ = 3;
 const IDX_WIN_ROWS = 4;
 const IDX_WIN_COLS = 5;
 const IDX_WINCH = 6;
-const CTRL_WORDS = 7;
+const IDX_INTR = 7;
+const CTRL_WORDS = 8;
 const FLAG_EOF = 1;
 export const HEADER_BYTES = CTRL_WORDS * 4;
 
@@ -147,6 +156,21 @@ export class RingWriter {
     this._wake();
   }
 
+  // Post a cooperative interrupt: bump the count and wake. This is the ^C the
+  // shell has never had — wasm cannot be signalled, so a long-running applet or
+  // host builtin holds the worker and only terminate() escapes it, which takes
+  // the filesystem and every warm instance with it.
+  //
+  // It cancels nothing by itself. Delivery is a count somebody chose to read:
+  // whoever is running records the count it started at and compares at its own
+  // safe points, exactly as a runtime with an interrupt hook already does. So
+  // work that never looks is untouched, and an interrupt posted while nothing
+  // is running lands between two counts nobody is comparing.
+  interrupt() {
+    Atomics.add(this.ctrl, IDX_INTR, 1);
+    this._wake();
+  }
+
   // Set the geometry WITHOUT raising winch or waking — used once at spawn so
   // the very first `stty size` / ioctl(TIOCGWINSZ) reports the real size before
   // any resize has happened. No signal: the guest hasn't installed a trap yet.
@@ -236,6 +260,11 @@ export class RingReader {
     };
   }
 
+  // Interrupts posted so far — the count, not a flag, so there is nothing to
+  // consume and no way for one to be missed or double-delivered. Read it once
+  // before the work starts, then compare: different means "interrupted since".
+  interruptCount() { return Atomics.load(this.ctrl, IDX_INTR); }
+
   // Consume the pending-winch flag: true exactly once per resize burst. The
   // guest polls this at its blocking point and, when true, synthesizes a
   // pending SIGWINCH so a registered `trap ... WINCH` fires.
@@ -254,6 +283,7 @@ export class RingReader {
       winsize: () => this.winsize(),
       winchPending: () => this.winchPending(),
       takeWinch: () => this.takeWinch(),
+      interruptCount: () => this.interruptCount(),
     };
   }
 }

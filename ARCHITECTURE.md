@@ -34,8 +34,9 @@ that back busybox's fork-free machinery (`__host_pipe`/`__host_dup`/`__host_dup2
 /`__host_trace`), two for terminal geometry (`__host_winsize`/`__host_winch`,
 see "Terminal resize" below), and two for host builtins
 (`__host_builtin_lookup`/`__host_builtin_run`, see "Host builtins" below).
-Eight in total — and still eight with the host port, which is a device rather
-than an import (see "The host port" below).
+Eight in total — and still eight with the host port and the cooperative
+interrupt, which are a device and a ring word rather than imports (see "The host
+port" and "Cooperative interrupt" below).
 
 **Filesystem.** A pluggable store (see "The `fs` contract" below), defaulting
 to `memoryFs(files)` — so a shim with no `fs` is the sealed in-memory sandbox
@@ -146,15 +147,15 @@ that never touches the published artifact.
 
 ## The stdin ring (`src/ring.mjs`)
 
-`Int32[head, tail, flags, seq, winRows, winCols, winch]` header + data bytes in
-one SharedArrayBuffer. `head` and `tail` are monotonic byte counters (only the
+`Int32[head, tail, flags, seq, winRows, winCols, winch, intr]` header + data
+bytes in one SharedArrayBuffer. `head` and `tail` are monotonic byte counters (only the
 data index is reduced modulo capacity), so `head - tail` is always the unread
 count. `seq` is a wakeup sequence word bumped on every producer event —
 consumers load it, re-check their condition, then `Atomics.wait` on it, so an
 event landing between check and wait returns immediately instead of being lost.
 `end()` sets an EOF flag and bumps `seq` (EOF changes no counter, so waiting on
-`head` alone would miss it). The last three words carry terminal geometry —
-their story is below.
+`head` alone would miss it). `winRows`/`winCols`/`winch` carry terminal
+geometry and `intr` the cooperative interrupt — both stories are below.
 
 **One format, two channels.** The inbound host-request ring is not a near-copy
 of this one, it *is* this one: a request channel needs `head/tail/flags/seq` and
@@ -208,6 +209,45 @@ general signal layer — just one pending bit:
 A burst of resizes coalesces: `winch` is one bit and the dims are last-write-wins,
 so the guest services one WINCH at the newest size. A guest that never traps
 WINCH simply drops the flag; the fresh size is still there for `stty size`.
+
+## Cooperative interrupt (`Session.interrupt`)
+
+wasm cannot be signalled and a live session is one synchronous `_start()` frame,
+so a command that will not stop holds the worker: `terminate()` is the only
+escape, and it takes the filesystem and every warm instance with it. That is a
+papercut with busybox and a showstopper with a language runtime, where one
+`while (true)` in a script bricks the tab.
+
+`Session.interrupt()` is the ^C that reaches a running guest. It travels the
+same way a resize does — a header word in the stdin ring, plus a `seq` bump so a
+parked guest wakes — and it is deliberately **cooperative**: it cancels what
+chose to look, and nothing else. A transport that could stop work which never
+opted in would be `terminate()` wearing a nicer name.
+
+- **A count, not a flag.** `intr` is monotonic and nothing consumes it. A flag
+  would need a consumer, and the only consumer is whatever happens to be
+  running — so an interrupt posted while nothing is (at the prompt, between two
+  commands, mid-applet) would survive to cancel the *next* thing, which is a ^C
+  the user never typed. With a count, work reads the value at entry and compares
+  at its own safe points: an interrupt reaches exactly what was in flight when
+  it was posted.
+- **Where the check goes.** `__host_builtin_run` records the count before
+  dispatch and hands the handler `ctx.interrupted()`. The handler runs on the
+  guest's own stack, so nothing can unwind it from outside — polling is not a
+  simplification, it is the only shape available. Returning 130 (128 + SIGINT)
+  gives the script the `$?` it expects.
+- **It does not end a blocking read.** The wake returns from `Atomics.wait`, but
+  no bytes have appeared, so `pollReadable`/`readBlocking` re-park. An
+  interrupt is not stdin input, and making a read fail on one would need the
+  EINTR path that only the poll wrapper has.
+- **Absent by default.** `interruptCount()` is an optional `input` method, so
+  `run()` and any fixed stdin degrade to a permanently false `interrupted()` —
+  the same "no info rather than an error" contract `winsize` follows.
+
+**Busybox applets cannot be interrupted yet.** That half needs the check in C —
+a count comparison at applet and loop boundaries, bailing through the existing
+`die_func` longjmp — and a wasm rebuild. Until then a runaway `awk` still wants
+`terminate()`. The transport is the same one either half reads.
 
 ## Fork-free ash (`build/ash-forkfree.patch`)
 
@@ -389,6 +429,13 @@ shim's `stdout` callback instead would print `cmd | grep x` straight past grep
 to the terminal and hand grep an empty pipe: the same fd-number-vs-fd-type
 mistake `poll_oneoff` made once. That is why `fd_read`/`fd_write` were split
 into iovec scatter/gather around reusable `readFd`/`writeFd`.
+
+**Cancelling one.** The handler runs on the guest's own stack, so nothing can
+unwind it from outside and there is no safe point but the ones it picks itself.
+`__host_builtin_run` reads the ring's interrupt count before dispatch and hands
+the handler `ctx.interrupted()`, which compares against it — see "Cooperative
+interrupt" above for why that baseline is what keeps a ^C typed at the prompt
+from cancelling the command typed after it.
 
 **Containment.** A JS exception thrown out of a wasm import unwinds the entire
 guest stack — the instance is dead, and no guest `setjmp` can catch it (the same

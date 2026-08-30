@@ -12,10 +12,10 @@ const dec = new TextDecoder();
 
 // A shim with real memory but no guest: we call the imports directly, writing
 // the C strings the guest would have passed.
-function makeShim(builtins, files = { '/work/data.txt': 'hello' }) {
+function makeShim(builtins, files = { '/work/data.txt': 'hello' }, input) {
   const out = { stdout: [], stderr: [] };
   const shim = new WasiShim({
-    builtins, files,
+    builtins, files, input,
     stdout: (b) => out.stdout.push(dec.decode(b)),
     stderr: (b) => out.stderr.push(dec.decode(b)),
   });
@@ -251,4 +251,65 @@ test('ctx.fs write/mkdir/list/stat/remove reuse the shim’s own bookkeeping', (
   assert.equal(fs.remove('/d/f'), true);
   assert.equal(fs.remove('/d'), true);
   assert.equal(fs.exists('/d'), false);
+});
+
+// ─── ctx.interrupted(): the cooperative interrupt, at the shim seam ──────────
+
+// The interrupt half of the `input` contract, with nothing else on it — the
+// shim must ask for interruptCount and for nothing more.
+function fakeInterrupts() {
+  let count = 0;
+  return {
+    input: {
+      pollReadable: () => false,
+      read: () => new Uint8Array(0),
+      interruptCount: () => count,
+    },
+    post: () => { count++; },
+  };
+}
+
+test('ctx.interrupted() reports a ^C posted while the builtin is running', () => {
+  const intr = fakeInterrupts();
+  const seen = [];
+  const { call } = makeShim({
+    lookup: () => true,
+    run: (ctx) => {
+      seen.push(ctx.interrupted());   // nothing posted yet
+      intr.post();                    // the host's session.interrupt()
+      seen.push(ctx.interrupted());   // ...noticed at the next safe point
+      return 130;                     // 128 + SIGINT, what a shell reads
+    },
+  }, undefined, intr.input);
+  assert.equal(call(['loop']), 130);
+  assert.deepEqual(seen, [false, true]);
+});
+
+test('ctx.interrupted() is scoped to the invocation, not to the session', () => {
+  // A ^C typed between commands must not cancel the command typed after it.
+  // The baseline is read at dispatch, so an interrupt already in the count is
+  // one this command did not receive — the reason the word is a count and not
+  // a flag (see ring.mjs).
+  const intr = fakeInterrupts();
+  intr.post();                        // ^C at the prompt, nothing running
+  const seen = [];
+  const { call } = makeShim({
+    lookup: () => true,
+    run: (ctx) => { seen.push(ctx.interrupted()); return 0; },
+  }, undefined, intr.input);
+  assert.equal(call(['work']), 0);
+  assert.deepEqual(seen, [false], 'did not inherit the earlier interrupt');
+  // ...and the next command is equally clean, having taken a fresh baseline.
+  assert.equal(call(['work']), 0);
+  assert.deepEqual(seen, [false, false]);
+});
+
+test('ctx.interrupted() is false when the session has no interrupt channel', () => {
+  // run(), or any fixed stdin: interruptCount is absent, and an optional method
+  // is absent by DEGRADING to no info — never by throwing at a builtin that
+  // reasonably polls it.
+  const seen = [];
+  const { call } = makeShim({ lookup: () => true, run: (ctx) => { seen.push(ctx.interrupted()); return 0; } });
+  assert.equal(call(['work']), 0);
+  assert.deepEqual(seen, [false]);
 });

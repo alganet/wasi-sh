@@ -41,6 +41,14 @@ export class RingWriter {
   end(): void;
   /** Post a terminal resize: store geometry, raise pending-winch, and wake. */
   resize(cols: number, rows: number): void;
+  /**
+   * Post a cooperative interrupt: bump the count and wake. Cancels nothing by
+   * itself — delivery is a count whoever is running chose to read at its own
+   * safe points. A count rather than a flag so nothing has to consume it, and
+   * an interrupt posted while nothing is running cannot cancel the next thing
+   * that is.
+   */
+  interrupt(): void;
 }
 
 /** The WasiShim `input` contract (see shim.d.mts). */
@@ -56,6 +64,8 @@ export interface RingInput {
   winchPending(): boolean;
   /** Consume the pending-winch flag (true once per resize burst). */
   takeWinch(): boolean;
+  /** Cooperative interrupts posted so far. Read once at entry, then compare. */
+  interruptCount(): number;
 }
 
 export class RingReader {
@@ -71,5 +81,6 @@ export class RingReader {
   winsize(): Winsize;
   winchPending(): boolean;
   takeWinch(): boolean;
+  interruptCount(): number;
   toInput(): RingInput;
 }

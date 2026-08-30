@@ -85,6 +85,22 @@ export class Session {
    * terminal's resize handler (e.g. xterm's term.onResize).
    */
   resize(cols: number, rows: number): void;
+  /**
+   * Deliver a cooperative interrupt — the ^C a wasm guest cannot be sent.
+   * There are no signals here, so a long-running command holds the worker and
+   * terminate() is otherwise the only escape, which takes the filesystem and
+   * every warm instance with it.
+   *
+   * Cooperative: it raises a count in shared memory and wakes the guest. What
+   * it cancels is whatever chose to look — a host builtin polling
+   * ctx.interrupted(), a language runtime with an interrupt hook. Work that
+   * ignores it is not stopped, and terminate() remains the answer then.
+   *
+   * Bind it to ^C only while a command is running: at the prompt that byte is
+   * the shell's own, and a terminal that swallows 0x03 unconditionally takes
+   * it away from the guest.
+   */
+  interrupt(): void;
   /** Hard-kill the worker. Settles `exited` (and fires onExit) with 137. */
   terminate(): void;
   /** Subscribe to output bytes. Returns an unsubscribe function. */
