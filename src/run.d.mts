@@ -20,6 +20,21 @@ export interface RunOptions {
   args?: string[];
   /** Fixed stdin content; the guest reads it, then EOF. */
   stdin?: string | Uint8Array;
+  /**
+   * Inbound host requests, staged up front: the guest reads them as lines from
+   * /dev/hostreq, in order, then EOF.
+   *
+   * Nothing can arrive DURING a run() — the guest holds the thread for its
+   * whole life — so the whole channel is known before the shell starts. That is
+   * a dev-server loop with a finite queue, and enough to write the loop
+   * against; spawn()'s session.post() is what makes the queue live.
+   *
+   * Omitted, /dev/hostreq is EPERM and the loop refuses to start. An empty
+   * array is a granted channel with nothing in it: the loop runs zero times.
+   * Each request must be one line — an embedded newline is refused here, where
+   * something can be done about it.
+   */
+  requests?: string | Uint8Array | Array<string | Uint8Array>;
   files?: Files;
   /**
    * The filesystem to run on; omitted, an in-memory store seeded with `files`.

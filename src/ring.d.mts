@@ -2,6 +2,14 @@ export const HEADER_BYTES: number;
 
 export function createStdinRing(dataBytes?: number): SharedArrayBuffer;
 
+/**
+ * Frame one inbound request as the line /dev/hostreq delivers. Refuses an empty
+ * request and one containing a newline — both at the producer, because a guest
+ * parked on a request has no write to fail and no `$?` to reach, so an error it
+ * could only learn by reading is one it cannot act on.
+ */
+export function frameRequest(request: string | Uint8Array | ArrayBuffer | ArrayBufferView): Uint8Array;
+
 export class RingOverflowError extends Error {
   constructor(requested: number, free: number);
 }

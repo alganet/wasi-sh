@@ -5,12 +5,12 @@
 // postMessage Worker by default; pass inline:true (the node default) to run
 // on the calling thread instead.
 import { WasiShim, WasiExit } from './shim.mjs';
-import { resolveArgv, mergeEnv, resolveWasm, resolveWasmForWorker, fixedInput, toBytes, resolveBuiltins, resolveHost } from './options.mjs';
+import { resolveArgv, mergeEnv, resolveWasm, resolveWasmForWorker, fixedInput, toBytes, toRequestBytes, fixedRequests, resolveBuiltins, resolveHost } from './options.mjs';
 
 const DEC = new TextDecoder();
 
 // Options: { command | script | args, stdin, files, env, wasm, inline,
-//            onOutput, workerUrl, worker, builtins }
+//            onOutput, workerUrl, worker, builtins, requests }
 // Resolves to { stdout, stderr, exitCode }. onOutput streams raw bytes as
 // they happen: onOutput(bytes, channel) with channel 'stdout' | 'stderr'.
 export async function run(options = {}) {
@@ -34,6 +34,7 @@ async function runInline(options) {
     stdout: sink('stdout'),
     stderr: sink('stderr'),
     input: fixedInput(options.stdin),
+    requests: fixedRequests(toRequestBytes(options.requests)),
     builtins: await resolveBuiltins(options.builtins),
     host: await resolveHost(options.host),
   });
@@ -132,6 +133,9 @@ async function runInWorker(options) {
     args: argv,
     env: mergeEnv(options.env),
     stdin: toBytes(options.stdin),
+    // Bytes, so they structured-clone into a stock worker exactly as stdin
+    // does — the whole channel is data here, and none of it is a live object.
+    requests: toRequestBytes(options.requests),
   };
   worker.postMessage(msg, msg.wasmBytes ? [msg.wasmBytes.buffer] : []);
   try {

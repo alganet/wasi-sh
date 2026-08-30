@@ -178,3 +178,86 @@ test('the guest cannot remove, rename or shadow the inbound device', () => {
   assert.equal(t.p1.path_rename(3, 0x100, b.length, 3, 0x180, to.length), EPERM);
   assert.ok(openReq(t) > 0, 'still there');
 });
+
+// ─── through a real shell ────────────────────────────────────────────────────
+// The suite above drives the imports by hand; these run busybox ash against the
+// shipped wasm, which is what pins the thing the port exists for — the dev
+// server as an ordinary shell loop. run() stages the whole queue up front,
+// because nothing can arrive DURING a run(); interactive.test.mjs is where a
+// request reaches a guest that is already parked.
+import { before } from 'node:test';
+import { compileWasm, runScript } from '../src/node.mjs';
+
+let wasm;
+before(async () => { wasm = await compileWasm(); });
+const sh = (script, opts = {}) => runScript(script, { wasm, env: { LC_ALL: 'C' }, ...opts });
+
+const LOOP = 'while read -r req <&3; do\n  echo "handling [$req]"\ndone 3< /dev/hostreq\necho loop-ended\n';
+
+test('the dev server is a shell loop', async () => {
+  const r = await sh(LOOP, { requests: ['GET /index.php', 'GET /about.php'] });
+  assert.equal(r.stdout, 'handling [GET /index.php]\nhandling [GET /about.php]\nloop-ended\n');
+  assert.equal(r.exitCode, 0);
+});
+
+// The end-of-stream half of the contract: `read` fails at EOF, which is the
+// only reason the loop above ever ends.
+test('an empty but granted channel runs the loop zero times', async () => {
+  const r = await sh(LOOP, { requests: [] });
+  assert.equal(r.stdout, 'loop-ended\n');
+});
+
+// And the "never" half. A session that cannot be asked must say so where the
+// script can see it, rather than hand back an EOF that reads as "no requests
+// today" — the loop would then exit 0 having served nothing, and look right.
+test('with no channel the loop refuses to start, and can say so', async () => {
+  // Redirected on the loop rather than with `exec`: a failed `exec`
+  // redirection ends a non-interactive shell outright, which is a fine way to
+  // fail but leaves nothing to say about it.
+  const r = await sh(`{ ${LOOP} } 3< /dev/hostreq 2>/dev/null || { echo 'not granted'; exit 7; }\n`);
+  assert.equal(r.stdout, 'not granted\n');
+  assert.equal(r.exitCode, 7);
+});
+
+test('a request keeps every byte of its line, spaces and all', async () => {
+  const r = await sh('{ read -r req <&3; printf "%s" "$req" | wc -c; } 3< /dev/hostreq\n',
+    { requests: ['GET /a%20b.php?x=1&y=2 HTTP/1.1'] });
+  assert.equal(r.stdout.trim(), '31');
+});
+
+// Reading one request must not swallow the next: busybox's `read` takes a byte
+// at a time for exactly this reason, and a device handing back a block would
+// leave the remainder in a stdio buffer the next reader inherits.
+test('a request read one at a time leaves the rest of the queue alone', async () => {
+  const r = await sh('{ read -r a <&3; echo "first=$a"; read -r b <&3; echo "second=$b"; } 3< /dev/hostreq\n',
+    { requests: ['one', 'two', 'three'] });
+  assert.equal(r.stdout, 'first=one\nsecond=two\n');
+});
+
+// The reply is an outbound verb. Both halves of the port in one loop is the
+// whole shape phasm's dev server needs, minus the PHP.
+test('a request is answered through the outbound half', async () => {
+  const served = [];
+  const r = await sh(
+    'while read -r req <&3; do\n'
+    + '  echo "respond 200 ${req}" > /dev/host\n'
+    + 'done 3< /dev/hostreq\n'
+    + 'echo served\n',
+    { requests: ['/index.php', '/about.php'], host: { respond: (p) => { served.push(dec.decode(p)); } } },
+  );
+  assert.deepEqual(served, ['200 /index.php', '200 /about.php']);
+  assert.equal(r.stdout, 'served\n');
+});
+
+// One direction per device, said where a script can see it.
+test('a script cannot write a reply back into the inbound device', async () => {
+  const r = await sh("echo reply > /dev/hostreq 2>/dev/null || echo 'refused'", { requests: ['x'] });
+  assert.equal(r.stdout, 'refused\n');
+});
+
+// Refused at the producer, because a guest parked on a request has nowhere to
+// put the error.
+test('a request with a newline in it is refused before it is delivered', async () => {
+  await assert.rejects(() => sh(LOOP, { requests: ['GET /a.php\nforged'] }), /newline/);
+  await assert.rejects(() => sh(LOOP, { requests: [''] }), /empty/);
+});
