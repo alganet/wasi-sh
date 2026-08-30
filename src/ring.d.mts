@@ -19,7 +19,9 @@ export const createStdinRing: typeof createRing;
 export function frameRequest(request: string | Uint8Array | ArrayBuffer | ArrayBufferView): Uint8Array;
 
 export class RingOverflowError extends Error {
-  constructor(requested: number, free: number);
+  constructor(requested: number, free: number, channel?: string, sizeOption?: string);
+  /** Which channel overflowed — 'stdin' or 'host request'. */
+  channel: string;
 }
 
 export interface Winsize {
@@ -28,7 +30,8 @@ export interface Winsize {
 }
 
 export class RingWriter {
-  constructor(sab: SharedArrayBuffer);
+  /** `channel`/`sizeOption` name this ring in failures; they change nothing else. */
+  constructor(sab: SharedArrayBuffer, naming?: { channel?: string; sizeOption?: string });
   readonly capacity: number;
   readonly pending: number;
   readonly ended: boolean;

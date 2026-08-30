@@ -69,13 +69,21 @@ export async function spawn(options = {}) {
   // Opt-in, and a size IS the grant — there is no second way to say the same
   // thing. Without one the guest's /dev/hostreq is EPERM, so a dev-server loop
   // refuses to start rather than parking on a request that can never arrive.
-  const reqSab = options.requestBufferSize > 0 ? createRing(options.requestBufferSize) : null;
+  const reqBytes = options.requestBufferSize;
+  if (reqBytes !== undefined && !(Number.isFinite(reqBytes) && reqBytes > 0)) {
+    // A truthy non-size (`true`, '64k') would either build a 29-byte ring that
+    // overflows on the first request or, worse, read as no grant at all and
+    // leave every /dev/hostreq open EPERM with nothing said about why.
+    throw new Error(`spawn({ requestBufferSize }) must be a positive number of bytes; got ${JSON.stringify(reqBytes)}.`);
+  }
+  const reqSab = reqBytes ? createRing(reqBytes) : null;
   const worker = options.worker
     || (options.workerUrl
       ? new Worker(options.workerUrl, { type: 'module' })
       : new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' }));
   const ringWriter = new RingWriter(sab);
-  const session = new Session(worker, ringWriter, options.worker == null, reqSab && new RingWriter(reqSab));
+  const session = new Session(worker, ringWriter, options.worker == null,
+    reqSab && new RingWriter(reqSab, { channel: 'host request', sizeOption: 'requestBufferSize' }));
   if (options.onOutput) session.onOutput(options.onOutput);
   if (options.onExit) session.onExit(options.onExit);
   if (options.onError) session.onError(options.onError);

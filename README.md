@@ -57,7 +57,7 @@ const session = await spawn({ env: { COLUMNS: '80', LINES: '24' } });
 session.onOutput((bytes, channel) => render(bytes)); // shell → you
 session.write('echo hi\n');                          // you → shell
 session.resize(100, 40);  // terminal resized: live size + a synthesized SIGWINCH
-session.post('GET /');// hand the RUNNING guest a host request (see the host port)
+session.post('GET /');// a host request → the running guest (needs requestBufferSize)
 session.end();        // stdin EOF
 session.terminate();  // hard kill (exited resolves 137, kill -9 style)
 await session.exited; // exit code — always settles, even after terminate()

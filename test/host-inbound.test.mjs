@@ -361,3 +361,27 @@ test('a request is served off the filesystem the shell owns', async () => {
   t.requests.end();
   await t.exited;
 });
+
+// ─── the grant, and what a failure says ──────────────────────────────────────
+
+test('spawn refuses a request option it would have to drop, and a size that is not one', async () => {
+  const { spawn } = await import('../src/spawn.mjs');
+  await assert.rejects(() => spawn({ command: 'true', requests: ['GET /'] }), /session\.post/,
+    'a live session cannot take a queue that is complete before it starts');
+  await assert.rejects(() => spawn({ command: 'true', requestBufferSize: true }), /positive number of bytes/,
+    'a truthy non-size would build a 29-byte ring, or read as no grant at all');
+});
+
+// A wrong answer costs more than none: "increase stdinBufferSize" is the wrong
+// fix for a host request that did not fit.
+test('an overflowing request ring names its own channel and option', () => {
+  const w = new RingWriter(createRing(32), { channel: 'host request', sizeOption: 'requestBufferSize' });
+  assert.throws(() => w.write(frameRequest('a request far longer than thirty-two bytes')),
+    /host request ring overflow[\s\S]*requestBufferSize/);
+});
+
+test('post() without the grant says which option is missing', async () => {
+  const { Session } = await import('../src/spawn.mjs');
+  const s = new Session({ addEventListener() {} }, { write() {} }, false, null);
+  assert.throws(() => s.post('GET /'), /requestBufferSize/);
+});
