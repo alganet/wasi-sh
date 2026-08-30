@@ -44,7 +44,7 @@ function collect(posted) {
   return { ...out, exitCode: exit ? exit.code : undefined, error: err && err.msg };
 }
 
-async function runInWorker(script, options) {
+async function runInWorker(script, options, message = {}) {
   const self_ = fakeSelf();
   const { serve } = await loadWorker();
   serve(options);
@@ -54,6 +54,7 @@ async function runInWorker(script, options) {
     args: ['busybox', 'sh', '/main.sh'],
     env: { PATH: '/', HOME: '/', LC_ALL: 'C' },
     stdin: new Uint8Array(0),
+    ...message,
   });
   return collect(self_.posted);
 }
@@ -179,4 +180,39 @@ test('serve({ async fs() }) is awaited before the shell starts', async (t) => {
   });
   assert.equal(opens, 1, 'opened once, up front');
   assert.equal(r.stdout, 'opened in time\n');
+});
+
+// ─── the inbound host-port channel ───────────────────────────────────────────
+// Both transports reach the shell through this module, and this is the browser
+// path for both: run() posts a staged queue, spawn() posts a second ring.
+
+test('a staged request queue reaches the shell as /dev/hostreq', async () => {
+  const r = await runInWorker(
+    'while read -r req <&3; do echo "handling [$req]"; done 3< /dev/hostreq\necho loop-ended\n',
+    {},
+    { requests: new TextEncoder().encode('GET /a.php\nGET /b.php\n') },
+  );
+  assert.equal(r.stdout, 'handling [GET /a.php]\nhandling [GET /b.php]\nloop-ended\n');
+});
+
+// Nothing posted, so the guest reads its whole queue and hits EOF at once —
+// what matters here is that the RING is what it read, not a staged buffer.
+test('a request ring reaches it too, and an ended one ends the loop', async () => {
+  const { createRing, RingWriter, frameRequest } = await import('../src/ring.mjs');
+  const reqSab = createRing(4096);
+  const writer = new RingWriter(reqSab);
+  writer.write(frameRequest('GET /from-the-ring'));
+  writer.end();
+  const r = await runInWorker(
+    'while read -r req <&3; do echo "handling [$req]"; done 3< /dev/hostreq\necho loop-ended\n',
+    {},
+    { reqSab },
+  );
+  assert.equal(r.stdout, 'handling [GET /from-the-ring]\nloop-ended\n');
+});
+
+// Capabilities are injected, never ambient: neither transport, no channel.
+test('with neither transport the device is refused', async () => {
+  const r = await runInWorker("{ read -r req <&3; } 3< /dev/hostreq 2>/dev/null || echo 'not granted'\n", {});
+  assert.equal(r.stdout, 'not granted\n');
 });
