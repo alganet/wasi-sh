@@ -144,6 +144,7 @@ jobs:
         run: npm install --no-audit --no-fund --ignore-scripts
 
       # Not `npm test`: that wants dist/busybox.wasm, and these files are pure
-      # JS. A skipped @zenfs/core suite here would mean the install failed.
+      # JS bar one case that runs a shell and skips without it. A skipped
+      # @zenfs/core suite here would mean the install failed.
       - name: Run the fs conformance suite
         run: node --test test/fs.test.mjs test/fs-conformance.test.mjs test/fs-zenfs.test.mjs

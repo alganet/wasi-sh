@@ -566,3 +566,79 @@ test('a host builtin sees null from fs.list(), not an exception', () => {
   assert.equal(fs.list('/d'), null);
   assert.equal(fs.list('/nope'), null, 'and a missing path is still null');
 });
+
+// ─── what a creation tells the store ─────────────────────────────────────────
+//
+// The contract's shape is ZenFS's, and ZenFS makes uid, gid and mode REQUIRED
+// at creation — so `{}` is not "take your defaults", it is a mode of zero.
+// `memoryFs` supplies one when the caller names none, which is why passing
+// `{}` was invisible for as long as the built-in store was the only store.
+//
+// It stops being invisible the moment the contract does its job: a second
+// guest sharing the store finds a tree with no permission bits on anything.
+// busybox does not care — it is alone in there and the shim enforces nothing —
+// but PHP mounted over the same store stats the shell's own script, gets
+// EACCES, and reports it as a 404 for a file that is right there.
+//
+// So these assert what the shim SAYS, against a store that records exactly
+// what it is handed. Against memoryFs they pass either way.
+
+/** A store that keeps the mode it was given, zero included, and logs the ask. */
+function literalStore(files) {
+  const base = memoryFs(files);
+  const created = [];
+  const keep = (path, options) => {
+    created.push([path, options]);
+    base.touchSync(path, { mode: (options && options.mode) || 0 });
+  };
+  const store = wrapStore(base, {
+    createFileSync(path, options) { const n = base.createFileSync(path, options); keep(path, options); return n; },
+    mkdirSync(path, options) { const n = base.mkdirSync(path, options); keep(path, options); return n; },
+  });
+  store.created = created;
+  return store;
+}
+
+const permsOf = (store, path) => store.statSync(path).mode & 0o7777;
+
+test('a file the guest creates is created readable', () => {
+  const store = literalStore({});
+  const t = makeShim({ fs: store });
+  openPath(t, '/new.txt', 0, 1 /* O_CREAT */);
+  assert.equal(permsOf(store, '/new.txt'), 0o644);
+});
+
+test('a directory the guest creates is created traversable', () => {
+  const store = literalStore({});
+  const t = makeShim({ fs: store });
+  assert.equal(pathOp(t, 'path_create_directory', '/d'), 0);
+  assert.equal(permsOf(store, '/d'), 0o755);
+});
+
+test('a builtin writing a new path through ctx.fs creates it readable', () => {
+  const store = literalStore({});
+  const t = makeShim({ fs: store });
+  assert.equal(t.shim.hostFs('/').write('/from-builtin.txt', 'x'), true);
+  assert.equal(permsOf(store, '/from-builtin.txt'), 0o644);
+});
+
+test('seeded files and the directories under them are created too', () => {
+  const store = literalStore({});
+  makeShim({ fs: store, files: { '/srv/app/index.php': '<?php' } });
+  assert.equal(permsOf(store, '/srv'), 0o755);
+  assert.equal(permsOf(store, '/srv/app'), 0o755);
+  assert.equal(permsOf(store, '/srv/app/index.php'), 0o644);
+});
+
+test('every creation names uid and gid, which ZenFS also requires', () => {
+  const store = literalStore({});
+  const t = makeShim({ fs: store, files: { '/d/seeded': 'x' } });
+  openPath(t, '/new.txt', 0, 1);
+  assert.equal(pathOp(t, 'path_create_directory', '/made'), 0);
+  assert.ok(store.created.length >= 4, `only ${store.created.length} creations`);
+  for (const [path, options] of store.created) {
+    assert.equal(typeof options, 'object', `${path}: no options at all`);
+    assert.equal(options.uid, 0, `${path}: uid`);
+    assert.equal(options.gid, 0, `${path}: gid`);
+  }
+});

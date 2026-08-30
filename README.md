@@ -119,15 +119,17 @@ import { checkConformance } from 'wasi-sh/fs/conformance';
 const { failed } = checkConformance(() => myStore());
 ```
 
-Four things worth knowing. A store is **injected, never ambient**: no `fs` is
-the sealed sandbox, and a read-only store is a read-only shell with nothing
-shell-side to bypass it. `/dev` belongs to the shim, so mounting a real
-directory never writes device nodes into it — and for the same reason a
-`files:` path under `/dev` is refused rather than mounted somewhere invisible.
-What a store *does* receive is your `files:`, plus `script:` if you use it,
-since that is mounted at `/main.sh`. And a store is a live object, so in a
-browser it is registered inside the worker with `serve({ fs })`, exactly like
-host builtins.
+Five things worth knowing. **Creations name `uid`, `gid` and `mode`** — they
+are required arguments there, and a store may record exactly what it is given,
+so a shell that named none left a tree no second guest could read. A store is
+**injected, never ambient**: no `fs` is the sealed sandbox, and a read-only
+store is a read-only shell with nothing shell-side to bypass it. `/dev` belongs
+to the shim, so mounting a real directory never writes device nodes into it —
+and for the same reason a `files:` path under `/dev` is refused rather than
+mounted somewhere invisible. What a store *does* receive is your `files:`, plus
+`script:` if you use it, since that is mounted at `/main.sh`. And a store is a
+live object, so in a browser it is registered inside the worker with
+`serve({ fs })`, exactly like host builtins.
 
 ## Scope and drawbacks — read before depending on it
 

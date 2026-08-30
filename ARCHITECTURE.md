@@ -120,6 +120,16 @@ mtime never moves is never reloaded, so editing a file in the shell and
 reloading the page shows the old output, in a way that looks like a caching
 bug somewhere else entirely.
 
+**Mode bits are the same trap one field over, and they had the same cause.**
+ZenFS makes `uid`, `gid` and `mode` *required* arguments of `createFileSync`
+and `mkdirSync`; the shim passed `{}` and leaned on `memoryFs` filling them
+in. Against a store that takes the contract literally — every ZenFS backend —
+that is a mode of **zero** on every file and directory the shell creates.
+busybox never notices, because it is alone in there and the shim enforces no
+permissions at all; a second guest sharing the store cannot read one byte of
+it, and reports that as whatever its own layer makes of EACCES. Creations name
+their mode now (`0o644`/`0o755`, uid and gid 0), and the type says so.
+
 **Two things stay out of a store**, both on purpose: open file descriptions
 (offsets are arguments here, so the shared `pos` cell never reaches one and
 cannot be got wrong by one), and devices.

@@ -65,9 +65,25 @@
 //   shim.bindMemory(instance.exports.memory);
 //   try { instance.exports._start(); } catch (e) { if (!(e instanceof WasiExit)) throw e; }
 
-import { memoryFs, normalize, isDir, isChar, S_IFDIR, S_IFREG, S_IFCHR } from './fs.mjs';
+import { memoryFs, normalize, isDir, isChar, S_IFDIR, S_IFREG, S_IFCHR, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE } from './fs.mjs';
 
 export class WasiExit extends Error { constructor(code){ super('exit '+code); this.code=code; } }
+
+// What every creation hands the store. The contract's shape is ZenFS's, and
+// ZenFS makes uid, gid and mode REQUIRED at creation — so `{}` is not "take
+// your defaults", it is a mode of zero, and a store entitled to take that
+// literally produced a tree with no permission bits on anything.
+//
+// busybox never noticed: it is alone in there and the shim enforces nothing.
+// The contract exists so a SECOND guest can share the store, and the first one
+// to try could not read a byte of it — PHP stats the shell's own file, gets
+// EACCES, and reports it as a 404 for a script that is right there. uid/gid 0
+// because a guest here is root and there is nobody else to be.
+// Frozen because one object serves every creation: a store that kept a
+// reference and wrote through it would be editing the defaults for the rest of
+// the session, and ZenFS's own type is Readonly for the same reason.
+const NEW_FILE = Object.freeze({ mode: DEFAULT_FILE_MODE, uid: 0, gid: 0 });
+const NEW_DIR = Object.freeze({ mode: DEFAULT_DIR_MODE, uid: 0, gid: 0 });
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
@@ -220,7 +236,7 @@ export class WasiShim {
           // Creating a name under /dev would land in the store, where the
           // overlay then hides it forever.
           if(w.ownsPath(path)) return E.PERM;
-          try { st=w.store.createFileSync(path,{}); } catch(e) { return wasiErrno(e); }
+          try { st=w.store.createFileSync(path,NEW_FILE); } catch(e) { return wasiErrno(e); }
         } else if((oflags&1)&&(oflags&4)) return E.EXIST;
         const device=w.devices.get(path);
         // A device may refuse the open outright — the host port does, with
@@ -796,7 +812,7 @@ export class WasiShim {
   makeDir(path){
     if(this.statAt(path)) return E.EXIST;
     if(this.ownsPath(path)) return E.PERM;   // the overlay would hide it
-    try { this.store.mkdirSync(path,{}); } catch(e) { return wasiErrno(e); }
+    try { this.store.mkdirSync(path,NEW_DIR); } catch(e) { return wasiErrno(e); }
     return 0;
   }
   // The FS as a small stable surface for host builtins, bound to the command's
@@ -820,7 +836,7 @@ export class WasiShim {
         if(!st&&w.ownsPath(path)) return false;
         const bytes=typeof data==='string'?strBytes(data):new Uint8Array(data);
         try {
-          if(!st) w.store.createFileSync(path,{});
+          if(!st) w.store.createFileSync(path,NEW_FILE);
           // Write first, THEN trim the old tail. Truncating up front would
           // mean a store that refuses the write has already destroyed what was
           // there, while this call still reports failure.
@@ -1140,9 +1156,9 @@ function seedInto(store,files){
     let dir='';
     for(let i=0;i<segs.length-1;i++){
       dir=`${dir}/${segs[i]}`;
-      if(!present(dir)) store.mkdirSync(dir,{});
+      if(!present(dir)) store.mkdirSync(dir,NEW_DIR);
     }
-    if(!present(abs)) store.createFileSync(abs,{});
+    if(!present(abs)) store.createFileSync(abs,NEW_FILE);
     const bytes=bytesOf(content);
     if(bytes.length) store.writeSync(abs,bytes,0);
     store.touchSync(abs,{size:bytes.length});

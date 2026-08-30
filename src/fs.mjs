@@ -77,8 +77,17 @@ export const isDir = (mode) => (mode & S_IFMT) === S_IFDIR;
 export const isFile = (mode) => (mode & S_IFMT) === S_IFREG;
 export const isChar = (mode) => (mode & S_IFMT) === S_IFCHR;
 
-const DEFAULT_DIR_MODE = 0o755;
-const DEFAULT_FILE_MODE = 0o644;
+/**
+ * What a node is created with when the caller names no mode — and the caller
+ * always should, because a store is entitled to take the contract literally.
+ *
+ * These are exported so the shim can pass them explicitly: `memoryFs` filling
+ * them in is a courtesy, not a promise every store makes, and a store that
+ * records exactly what it is given produced files no second guest could read.
+ * See the note over `NEW_FILE` in shim.mjs.
+ */
+export const DEFAULT_DIR_MODE = 0o755;
+export const DEFAULT_FILE_MODE = 0o644;
 const ENC = new TextEncoder();
 const EMPTY = new Uint8Array(0);
 
