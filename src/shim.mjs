@@ -67,7 +67,7 @@ const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
-const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
 // Stores speak LINUX errno; WASI numbers its own list alphabetically. The two
@@ -272,11 +272,18 @@ export class WasiShim {
           return total?0:errno;
         }
         w.dv().setUint32(out,total,true); return 0; },
+      // An unseekable fd is ESPIPE, as lseek says. A pipe keeps its offset on
+      // the pipe object and the stdin ring has none, so moving their cell was
+      // invisible — but SUCCESS is not: lseek() is how a program asks whether
+      // an fd can seek, and stdio calls it when it gives back a buffered read
+      // (the applet drain in build/ash-forkfree.patch). A file redirected onto
+      // fd 0 is a file, not the ring — dup2 copies the record — so `head -1 <
+      // f` still seeks.
       // A negative result is EINVAL and leaves the offset alone, as lseek does.
       // Without the check a rewind past the start makes every later read ask
       // the store for a range it will zero-fill, and the guest gets fabricated
       // NUL bytes reported as a successful read.
-      fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const p=w.pos(f); const sz=w.sizeOf(f); off=Number(off);
+      fd_seek:(fd,off,whence,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; if(f.type==='pipe'||f.type==='stdin'||f.type==='stdout'||f.type==='stderr') return E.SPIPE; const p=w.pos(f); const sz=w.sizeOf(f); off=Number(off);
         const next=whence===0?off:whence===1?p.v+off:sz+off;
         if(!Number.isFinite(next)||next<0) return E.INVAL;
         p.v=next; w.dv().setBigUint64(out,BigInt(p.v),true); return 0; },
@@ -747,7 +754,9 @@ export class WasiShim {
   // fork-free evalpipe's fcntl(F_DUPFD,10)/dup2 save-restore REWOUND a
   // file-backed stdin between pipeline stages. Sharing the cell fixes both.
   // Lazy for non-file fds: pipes keep their offset on the pipe object and
-  // stdio has none, but fd_seek must still answer for them.
+  // stdio has none. fd_seek refuses both with ESPIPE, but a device still needs
+  // a cell — /dev/host reads it as the identity of the open description an
+  // exchange belongs to, not as an offset.
   pos(f){ return f.pos || (f.pos={v:0}); }
   // mkdir, shared by path_create_directory and a host builtin's ctx.fs.mkdir.
   makeDir(path){

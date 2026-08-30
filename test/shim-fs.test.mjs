@@ -469,6 +469,26 @@ test('seeking before the start is EINVAL, not a well of zeroes', () => {
   assert.equal(dec.decode(readFd(t, fd).data), 'c');
 });
 
+test('an unseekable fd says ESPIPE instead of moving an offset nobody reads', () => {
+  // fd_seek used to move the pos cell of ANY fd and report success. A pipe
+  // keeps its offset on the pipe object and the stdin ring has none, so the
+  // move was invisible — but the SUCCESS is a lie a caller acts on: lseek() is
+  // how a program asks "can I seek this?", and stdio calls it when it drops a
+  // buffered read (see the applet drain in build/ash-forkfree.patch).
+  const t = makeShim({ files: { '/f.txt': 'abc' } });
+  t.env.__host_pipe(0x800);
+  const rd = t.view().getUint32(0x800, true), wr = t.view().getUint32(0x804, true);
+  assert.equal(t.p1.fd_seek(rd, 0n, 1, 0x700), 70 /* ESPIPE */);
+  assert.equal(t.p1.fd_seek(wr, 0n, 1, 0x700), 70 /* ESPIPE */);
+  for (const fd of [0, 1, 2]) assert.equal(t.p1.fd_seek(fd, 0n, 1, 0x700), 70, `fd ${fd}`);
+  // A file redirected onto fd 0 is a file, not the ring: `head -1 < f` has to
+  // keep seeking, which is what dup2 copying the record already gives it.
+  const fd = openPath(t, '/f.txt');
+  assert.equal(t.env.__host_dup2(fd, 0), 0);
+  assert.equal(t.p1.fd_seek(0, 1n, 0, 0x700), 0, 'a file on fd 0 still seeks');
+  assert.equal(dec.decode(readFd(t, 0).data), 'bc');
+});
+
 test('a file mounted under /dev is refused instead of hidden', () => {
   assert.throws(() => makeShim({ files: { '/dev/tty': 'x' } }), /under \/dev/);
   assert.throws(() => makeShim({ fs: memoryFs(), files: { '/dev/tty': 'x' } }), /under \/dev/);
