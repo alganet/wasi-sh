@@ -37,9 +37,17 @@ const FLAG_EOF = 1;
 export const HEADER_BYTES = CTRL_WORDS * 4;
 
 // A SharedArrayBuffer sized for `dataBytes` of ring capacity.
-export function createStdinRing(dataBytes = 65536) {
+//
+// One format, two channels. The inbound host-request ring is not a near-copy of
+// this one — it IS this one, because a request channel needs head/tail/flags/seq
+// and nothing else, and those are a strict subset of what stdin needs. The
+// terminal words simply go unused there. So the reader and writer below serve
+// both directions with no adapter, and the wake mechanics that took a bug fix
+// to get right exist once.
+export function createRing(dataBytes = 65536) {
   return new SharedArrayBuffer(HEADER_BYTES + dataBytes);
 }
+export { createRing as createStdinRing };
 
 // Frame one inbound request for the guest's /dev/hostreq. A request is a LINE
 // — the vocabulary the outbound half settled, for the same reason: a write

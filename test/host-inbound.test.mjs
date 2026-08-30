@@ -261,3 +261,103 @@ test('a request with a newline in it is refused before it is delivered', async (
   await assert.rejects(() => sh(LOOP, { requests: ['GET /a.php\nforged'] }), /newline/);
   await assert.rejects(() => sh(LOOP, { requests: [''] }), /empty/);
 });
+
+// ─── reaching a guest that is already parked ─────────────────────────────────
+// The whole reason the channel is shared memory. A live session is one
+// synchronous _start() frame, so a postMessage into a running shell worker is
+// not slow — it is not delivered: measured at +303ms posted, +3020ms handled,
+// and only because an unrelated wait expired. Here the guest is parked in the
+// read of /dev/hostreq with nothing queued, which is a dev server between
+// requests, and the post has to wake it.
+import { Worker } from 'node:worker_threads';
+import { createRing, RingWriter, frameRequest } from '../src/ring.mjs';
+
+// The node twin of src/worker.mjs, with both rings — the same shim wiring,
+// parentPort standing in for postMessage.
+const TWIN = `
+  import { parentPort, workerData } from 'node:worker_threads';
+  const { WasiShim, WasiExit } = await import(workerData.shimUrl);
+  const { RingReader } = await import(workerData.ringUrl);
+  const { module, files, args, env, sab, reqSab } = workerData;
+  const dec = new TextDecoder();
+  const emit = (b) => parentPort.postMessage({ type: 'out', text: dec.decode(b) });
+  const shim = new WasiShim({
+    args, env, files, stdout: emit, stderr: emit,
+    input: new RingReader(sab).toInput(),
+    requests: new RingReader(reqSab).toInput(),
+  });
+  const instance = await WebAssembly.instantiate(module, shim.imports());
+  shim.bindMemory(instance.exports.memory);
+  let code = 0;
+  try { instance.exports._start(); }
+  catch (e) { if (e instanceof WasiExit) code = e.code; else throw e; }
+  parentPort.postMessage({ type: 'exit', code });
+`;
+
+function spawnTwin(script) {
+  const sab = createRing(), reqSab = createRing();
+  const worker = new Worker(TWIN, {
+    eval: true,
+    workerData: {
+      module: wasm, files: { '/t.sh': script }, args: ['busybox', 'sh', '/t.sh'],
+      env: { PATH: '/', LC_ALL: 'C' }, sab, reqSab,
+      shimUrl: new URL('../src/shim.mjs', import.meta.url).href,
+      ringUrl: new URL('../src/ring.mjs', import.meta.url).href,
+    },
+  });
+  let seen = '';
+  const exited = new Promise((resolve, reject) => {
+    worker.on('message', (m) => {
+      if (m.type === 'exit') { resolve(m); worker.terminate(); }
+      else seen += m.text;
+    });
+    worker.on('error', reject);
+  });
+  return { requests: new RingWriter(reqSab), exited, live: () => seen };
+}
+
+// Poll for a condition the PARKED guest is supposed to produce; the assertion
+// is what it printed while still running, which an exit-time snapshot cannot say.
+async function until(fn, ms = 5000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+test('a request wakes a guest parked between requests', async () => {
+  const t = spawnTwin('echo ready\nwhile read -r req <&3; do\n  echo "handled $req"\ndone 3< /dev/hostreq\necho loop-ended\n');
+  assert.ok(await until(() => t.live().includes('ready\n')), 'the loop reached its first read');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(t.live(), 'ready\n', 'and parked there — nothing to handle yet');
+
+  const t0 = Date.now();
+  t.requests.write(frameRequest('GET /index.php'));
+  assert.ok(await until(() => t.live().includes('handled GET /index.php')), 'the parked guest was woken');
+  assert.ok(Date.now() - t0 < 1000, `delivered in ${Date.now() - t0}ms, not at some unrelated wakeup`);
+
+  t.requests.write(frameRequest('GET /about.php'));
+  assert.ok(await until(() => t.live().includes('handled GET /about.php')), 'and again, in the same session');
+
+  t.requests.end();
+  const exit = await t.exited;
+  assert.match(t.live(), /loop-ended/, 'end-of-stream is what ends the loop');
+  assert.equal(exit.code, 0);
+});
+
+// The claim §5 rests on: one worker, one filesystem, no divergence — the guest
+// serving requests is the guest that owns the files.
+test('a request is served off the filesystem the shell owns', async () => {
+  const t = spawnTwin(
+    'mkdir -p /srv\necho "first version" > /srv/index.html\necho ready\n'
+    + 'while read -r req <&3; do cat "/srv/$req"; done 3< /dev/hostreq\n',
+  );
+  await until(() => t.live().includes('ready\n'));
+  t.requests.write(frameRequest('index.html'));
+  assert.ok(await until(() => t.live().includes('first version')), 'served');
+  t.requests.end();
+  await t.exited;
+});

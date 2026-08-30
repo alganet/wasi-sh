@@ -18,6 +18,18 @@ export interface SpawnOptions {
   wasm?: WasmSource;
   /** SAB stdin ring capacity in bytes (default 65536). */
   stdinBufferSize?: number;
+  /**
+   * Grant the inbound host-request channel, sized in bytes — a second SAB ring
+   * in the same format, which is what session.post() writes into and the guest
+   * reads at /dev/hostreq.
+   *
+   * A size IS the grant; there is no second way to say it. Absent, the guest's
+   * /dev/hostreq is EPERM, so a dev-server loop refuses to start rather than
+   * parking on a request that can never arrive. The capacity is also the cap
+   * on unread requests: post() throws RingOverflowError when the guest is not
+   * consuming, which is the host's problem to size.
+   */
+  requestBufferSize?: number;
   /** Bring-your-own Worker. */
   worker?: Worker;
   /** Alternate URL for the wasi-sh worker module. */
@@ -43,6 +55,29 @@ export class Session {
   write(data: string | Uint8Array): void;
   /** Signal stdin EOF. */
   end(): void;
+  /**
+   * Hand the RUNNING guest a host request, read as a line from /dev/hostreq.
+   * Needs requestBufferSize; without it this throws rather than dropping the
+   * request into a channel the guest cannot open.
+   *
+   * This is the one direction postMessage cannot go. A live session is a single
+   * synchronous _start() frame, so a message posted to a running shell worker
+   * is not slow — it is not delivered until the guest happens to yield. The
+   * request travels through shared memory the guest reads at its blocking
+   * point, which wakes it in under a millisecond.
+   *
+   * Fire-and-forget: a request the guest is still handling has nothing to
+   * return, so the answer comes back as an ordinary outbound verb on
+   * /dev/host. One line per request — an embedded newline is refused here,
+   * where something can be done about it, rather than forging a second request
+   * at the guest.
+   */
+  post(request: string | Uint8Array | ArrayBuffer | ArrayBufferView): number;
+  /**
+   * No more requests are coming. The guest's read hits EOF, which is the only
+   * thing that ever ends `while read -r req <&3; do ...; done 3< /dev/hostreq`.
+   */
+  endRequests(): void;
   /**
    * Report a terminal resize (cols × rows). Stores live geometry and
    * synthesizes SIGWINCH in the guest, so a `trap ... WINCH` handler runs and

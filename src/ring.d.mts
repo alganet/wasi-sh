@@ -1,6 +1,14 @@
 export const HEADER_BYTES: number;
 
-export function createStdinRing(dataBytes?: number): SharedArrayBuffer;
+/**
+ * A SharedArrayBuffer sized for `dataBytes` of ring capacity — the format both
+ * channels use. An inbound host-request ring is not a copy of the stdin one, it
+ * is the same ring: a request channel needs head/tail/flags/seq and nothing
+ * else, and those are a strict subset of what stdin needs.
+ */
+export function createRing(dataBytes?: number): SharedArrayBuffer;
+/** @deprecated The same function; the format was never stdin's alone. */
+export const createStdinRing: typeof createRing;
 
 /**
  * Frame one inbound request as the line /dev/hostreq delivers. Refuses an empty
