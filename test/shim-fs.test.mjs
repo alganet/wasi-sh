@@ -371,6 +371,42 @@ test('a duped fd shares one offset with its source (one open description)', () =
   assert.equal(dec.decode(readFd(t, dup, 4).data), 'efgh', 'the dup continues where the source stopped');
 });
 
+test('a plain write does not stat, and O_APPEND is the only reason to', () => {
+  // Only "the end as it is NOW" needs the size. Writing used to ask the store
+  // for it regardless — per iovec, so a two-iovec writev cost two — which on a
+  // persistent store is a real round trip per write, and one more call whose
+  // failure fails a write that would have landed.
+  const base = memoryFs({ '/f.txt': 'a\n' });
+  let stats = 0, hiccup = false;
+  const counted = wrapStore(base, {
+    statSync: (path) => { stats++; if (hiccup) throw fsError('EIO', path); return base.statSync(path); },
+  });
+  const t = makeShim({ fs: counted });
+  const plain = openPath(t, '/f.txt');
+  const appender = openPath(t, '/f.txt', 0, 0, 1 /* APPEND */);
+  stats = 0;
+  writeFd(t, plain, 'XX');
+  assert.equal(stats, 0, 'a plain write asks the store nothing but the write');
+  writeFd(t, appender, 'b\n');
+  assert.equal(stats, 1, 'an appending write still reads the size, once');
+  // And a stat that merely hiccups no longer fails a write that would have
+  // landed — there is no longer a second call for it to fail in.
+  hiccup = true;
+  assert.deepEqual(writeFd(t, plain, 'YY'), { errno: 0, n: 2 });
+});
+
+test('a write to a file the store lost is ENOENT, not a silent success', () => {
+  // With the stat gone, the store's own ENOENT IS the existence check. Nothing
+  // in the shell can remove a file behind an open fd — that path snapshots the
+  // bytes instead — but a shared or host-backed store has another writer, and
+  // the answer must still be the errno rather than a write into nowhere.
+  const base = memoryFs({ '/f.txt': 'orig' });
+  const t = makeShim({ fs: base });
+  const fd = openPath(t, '/f.txt');
+  base.unlinkSync('/f.txt');                 // underneath the shim, as a second writer would
+  assert.deepEqual(writeFd(t, fd, 'NEW!'), { errno: 44 /* ENOENT */, n: 0 });
+});
+
 test('O_APPEND writes land at the end even when another fd grew the file', () => {
   // "The end" means the end as it is NOW, so the size has to be read at write
   // time. A cached one would put these two bytes at offset 2 and overwrite.
