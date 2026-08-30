@@ -193,7 +193,7 @@ test('a registered device lists, stats and opens, all from one map', () => {
     const nlen = t.view().getUint32(0x800 + 16, true);
     names.push(dec.decode(t.bytes().slice(0x800 + 24, 0x800 + 24 + nlen)));
   }
-  assert.deepEqual(names, ['null', 'host', 'probe'], 'ls /dev');
+  assert.deepEqual(names, ['null', 'host', 'hostreq', 'probe'], 'ls /dev');
   const fd = openPath(t, '/dev/probe');
   assert.equal(dec.decode(readFd(t, fd).data), 'probe', 'and it is the device that answers');
   const probe = filestat(t, fd), devnull = filestat(t, openPath(t, '/dev/null'));

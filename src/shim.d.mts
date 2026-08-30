@@ -28,6 +28,13 @@ export interface ShimInput {
   takeWinch?(): boolean;
 }
 
+/**
+ * The inbound request channel: stdin's contract aimed the other way. No
+ * terminal half, because a request is not a keystroke — but the same park,
+ * read, EOF shape, so a SAB ring reader serves both without an adapter.
+ */
+export type ShimRequests = Pick<ShimInput, 'pollReadable' | 'read' | 'readBlocking' | 'closed'>;
+
 import type { FileSystem } from './fs.mjs';
 
 export type Files = Record<string, string | Uint8Array>;
@@ -179,6 +186,23 @@ export interface WasiShimOptions {
    * "no such thing".
    */
   host?: HostPort;
+  /**
+   * The inbound half of that port: requests the HOST hands to a RUNNING guest,
+   * read as lines from /dev/hostreq. A running guest owns its worker and its
+   * event loop never turns, so nothing reaches a live session by postMessage —
+   * this channel is shared memory the guest reads at a blocking point, which
+   * makes a dev server an ordinary shell loop:
+   *
+   *     exec 3< /dev/hostreq
+   *     while read -r req <&3; do handle "$req"; done
+   *
+   * Granted separately from `host` — a session may be able to ask the host
+   * without being able to be asked. Absent, the device is there and every open
+   * is EPERM, so the loop refuses to start rather than parking on a request
+   * that can never arrive; end-of-stream is EOF, which ends it. The reply goes
+   * back out as an ordinary verb on /dev/host.
+   */
+  requests?: ShimRequests;
 }
 
 /**
