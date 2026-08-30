@@ -1017,13 +1017,18 @@ export class WasiShim {
   str(p,len){ return DEC.decode(this.bytes().subarray(p,p+len)); }
   // NUL-terminated C string. Everything WASI hands us is (ptr,len); the host
   // builtin hooks are the first imports taking a bare char*, so there is no
-  // length to pair with the pointer. The cap is not decorative: a bad pointer
-  // would otherwise scan the whole linear memory and then spin forever past
-  // the end comparing `undefined !== 0`.
-  cstr(p,cap=4096){ if(!p) return ''; const u=this.bytes(); const lim=Math.min(u.length,p+cap); let e=p; while(e<lim&&u[e]!==0) e++; return DEC.decode(u.subarray(p,e)); }
+  // length to pair with the pointer. The scan ends at the NUL or at the end of
+  // linear memory, whichever comes first — a bad pointer costs one memchr and
+  // cannot spin past the end comparing `undefined !== 0`. It must NOT end at a
+  // byte budget: an argument longer than one would arrive shorter and still
+  // well-formed, which is a wrong value rather than a failure, and a command
+  // line carrying an encoded payload is exactly that argument.
+  cstr(p){ if(!p) return ''; const u=this.bytes(); const e=u.indexOf(0,p); return DEC.decode(u.subarray(p,e<0?u.length:e)); }
   // NULL-terminated char** (argv, envp). Each element re-enters cstr, which
   // re-fetches the byte view, so a memory.grow mid-walk cannot leave us stale.
-  cstrv(p,cap=4096){ const out=[]; if(!p) return out; for(let q=p;out.length<cap;q+=4){ const s=this.dv().getUint32(q,true); if(!s) break; out.push(this.cstr(s)); } return out; }
+  // `cap` counts ELEMENTS, and the walk also stops at the end of memory: a
+  // vector with no terminator is a bad pointer, not a long argv.
+  cstrv(p,cap=4096){ const out=[]; if(!p) return out; const end=this.bytes().length-4; for(let q=p;out.length<cap&&q<=end;q+=4){ const s=this.dv().getUint32(q,true); if(!s) break; out.push(this.cstr(s)); } return out; }
   iovecs(iovs,n){ const out=[]; for(let i=0;i<n;i++){ const buf=this.dv().getUint32(iovs+i*8,true); const l=this.dv().getUint32(iovs+i*8+4,true); out.push(this.bytes().subarray(buf,buf+l)); } return out; }
   // Resolve a path given at an fd. A relative one is resolved against a
   // DIRECTORY, and against nothing else — which matters because of what fd 3
