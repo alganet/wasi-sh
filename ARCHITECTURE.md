@@ -8,6 +8,7 @@ there; this is how the pieces actually work and why they look the way they do.
 ```
 run() / spawn()            main thread (or node)
    │  postMessage {wasm, files, args, env, sab?, reqSab?, stdin?, requests?}
+   │  (a message with no wasm in it is not this one, and is left alone)
    ▼
 worker.mjs                 Web Worker / worker_threads
    │  WebAssembly.instantiate(module, shim.imports())
@@ -469,6 +470,20 @@ detects the late call and fails loudly. The factory form (`async builtins()`) is
 awaited before instantiation, which is where an expensive boot belongs — that
 split is what lets a builtin be backed by a second wasm module: async once, then
 synchronous per invocation.
+
+**A worker module keeps its own messages.** There is one `message` event and two
+things want it, and for a while the shim took all of them: every message was
+read as the startup message. That made the documented way to reach `serve({ fs })`
+impossible — a store cannot be structured-cloned any more than a builtin can, so
+the `SharedArrayBuffer` behind it has to arrive as an ordinary `postMessage`, and
+the shim ate it, destructured it into `undefined` and failed the session naming a
+wasm nobody had passed. The shell now starts on a message carrying `module` or
+`wasmBytes` and on no other, which is what a startup message structurally *is* —
+so the test needs no agreement between page and worker beyond the one they
+already have, and every other message reaches the module's own listener. A
+*second* startup message is refused: one worker hosts one guest, and two shells
+over one stdout, one stdin ring and two `exit` messages is not a state worth
+entering quietly.
 
 **Independent fix in the same patch.** A command name containing a slash took
 `find_command`'s slash short circuit, reached `vforkexec()`, and died on

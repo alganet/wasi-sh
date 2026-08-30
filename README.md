@@ -352,6 +352,32 @@ top-level `await`. A startup message that arrives while the module is suspended
 is delivered to no one, and the shell would quietly run without your builtins;
 `serve()` detects a late call and fails loudly instead.
 
+**The worker's other messages are yours.** Only a message carrying wasm is the
+startup message; anything else is left for a listener of your own. That is what
+lets a factory wait on something the page hands over — a store is a live object,
+so what actually crosses is the `SharedArrayBuffer` behind it:
+
+```js
+// my-worker.mjs
+import { serve } from 'wasi-sh/worker';
+
+let handOver;
+const handed = new Promise((res) => { handOver = res; });
+self.addEventListener('message', (e) => { if (e.data.type === 'store') handOver(e.data.sab); });
+
+serve({ async fs() { return storeOver(await handed); } });
+```
+
+```js
+// the page — post first, then spawn; both messages queue in order
+const worker = new Worker(new URL('./my-worker.mjs', import.meta.url), { type: 'module' });
+worker.postMessage({ type: 'store', sab });
+const session = await spawn({ worker });
+```
+
+One worker hosts exactly one shell: a second `run()`/`spawn()` over the same
+`worker` is refused rather than started beside the first.
+
 Working example: [`examples/host-builtins.html`](examples/host-builtins.html)
 and its [worker](examples/host-builtins.worker.mjs).
 
