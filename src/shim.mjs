@@ -1003,7 +1003,18 @@ export class WasiShim {
   // re-fetches the byte view, so a memory.grow mid-walk cannot leave us stale.
   cstrv(p,cap=4096){ const out=[]; if(!p) return out; for(let q=p;out.length<cap;q+=4){ const s=this.dv().getUint32(q,true); if(!s) break; out.push(this.cstr(s)); } return out; }
   iovecs(iovs,n){ const out=[]; for(let i=0;i<n;i++){ const buf=this.dv().getUint32(iovs+i*8,true); const l=this.dv().getUint32(iovs+i*8+4,true); out.push(this.bytes().subarray(buf,buf+l)); } return out; }
-  resolve(fd,path){ if(path.startsWith('/')) return normalize(path); const base=(this.fds.get(fd)||{}).path||'/'; return normalize(base.replace(/\/$/,'')+'/'+path); }
+  // Resolve a path given at an fd. A relative one is resolved against a
+  // DIRECTORY, and against nothing else — which matters because of what fd 3
+  // is. wasi-libc scans the preopen table once at startup, finds '/' at fd 3,
+  // and from then on turns every absolute path in the program into a RELATIVE
+  // one addressed through that number. A shell that redirects onto fd 3
+  // (`exec 3< file`, or a `while read <&3` loop) has not asked for openat — it
+  // has taken the root out from under every later open in the session, and
+  // resolving against the file sitting there produced paths like
+  // /data.txt/tmp/a: "nonexistent directory" for a directory that is right
+  // there. Falling back to the root is what the preopen still means; a file or
+  // a device is not a base and never was.
+  resolve(fd,path){ if(path.startsWith('/')) return normalize(path); const f=this.fds.get(fd); const base=(f&&f.type==='dir'&&f.path)||'/'; return normalize(base.replace(/\/$/,'')+'/'+path); }
   // Introspection for tests and debugging, in the shape the private FS map
   // used to have. `data` is a getter because reading a whole file to answer a
   // stat would be absurd; nothing on a hot path goes through here.

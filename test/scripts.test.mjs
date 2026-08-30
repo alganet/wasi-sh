@@ -12,6 +12,26 @@ before(async () => { wasm = await compileWasm(); });
 // Run with the POC harness env (LC_ALL=C, PATH=/) for byte-identical behavior.
 const sh = (script, opts = {}) => runScript(script, { wasm, env: { LC_ALL: 'C' }, ...opts });
 
+// ─── the preopen fd ──────────────────────────────────────────────────────────
+// fd 3 is not an ordinary fd here: wasi-libc scans the preopen table once at
+// startup, finds '/' there, and from then on every absolute path in the program
+// is addressed as a relative one through that number. A shell is entitled to
+// redirect onto fd 3, and doing so must not take the root away from everything
+// after it.
+
+test('a redirection onto fd 3 does not take the filesystem root away', async () => {
+  const r = await sh('exec 3< /data.txt\nread -r line <&3\necho "read=$line"\necho written > /tmp/a\ncat /tmp/a\n',
+    { files: { '/data.txt': 'from fd 3\n' } });
+  assert.equal(r.stdout, 'read=from fd 3\nwritten\n');
+  assert.equal(r.stderr, '', 'the open used to fail with "nonexistent directory"');
+});
+
+test('and an absolute path opened while fd 3 is redirected still lands', async () => {
+  const r = await sh('while read -r l <&3; do echo "$l" >> /tmp/log; done 3< /in.txt\ncat /tmp/log\n',
+    { files: { '/in.txt': 'a\nb\n' } });
+  assert.equal(r.stdout, 'a\nb\n');
+});
+
 // ─── basics ──────────────────────────────────────────────────────────────────
 
 test('echo + quoting', async () => {
