@@ -39,6 +39,24 @@ export interface InodeLike {
 }
 
 /**
+ * What a node is created with. `uid`, `gid` and `mode` are REQUIRED, as they
+ * are in ZenFS's `CreationOptions` — a store is entitled to record exactly
+ * what it is handed, and one that did produced files with no permission bits,
+ * unreadable to any guest sharing the store. `memoryFs` filling them in is a
+ * courtesy; nothing may rely on it.
+ */
+export interface CreationOptions extends Partial<InodeLike> {
+  uid: number;
+  gid: number;
+  /** Permission bits; the type bits are the store's to add. */
+  mode: number;
+}
+
+/** What the shim creates with when nothing else says. */
+export const DEFAULT_DIR_MODE: number;
+export const DEFAULT_FILE_MODE: number;
+
+/**
  * The store a WasiShim reads and writes through: path-addressed, synchronous,
  * in ZenFS's `FileSystem` shape.
  *
@@ -56,8 +74,8 @@ export interface FileSystem {
   /** Entry names, not paths. Throws ENOTDIR when `path` is a file. */
   readdirSync(path: string): string[];
   /** Throws EEXIST if it is there, ENOENT if the parent directory is not. */
-  createFileSync(path: string, options?: Partial<InodeLike>): InodeLike;
-  mkdirSync(path: string, options?: Partial<InodeLike>): InodeLike;
+  createFileSync(path: string, options: CreationOptions): InodeLike;
+  mkdirSync(path: string, options: CreationOptions): InodeLike;
   /** Throws ENOTEMPTY unless the directory is empty. */
   rmdirSync(path: string): void;
   unlinkSync(path: string): void;

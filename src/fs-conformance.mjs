@@ -43,6 +43,14 @@ const S_IFMT = 0o170000;
 const S_IFDIR = 0o040000;
 const S_IFREG = 0o100000;
 
+// Creations are made the way the shim makes them, not with `{}`. The options
+// are ZenFS's `CreationOptions`, where uid, gid and mode are REQUIRED — a store
+// may record exactly what it is handed, and driving the suite with `{}` taught
+// store authors that a mode of zero was a legal ask. It is not: it produces a
+// tree the shell can use and no second guest can read.
+const NEW_DIR = Object.freeze({ mode: 0o755, uid: 0, gid: 0 });
+const NEW_FILE = Object.freeze({ mode: 0o644, uid: 0, gid: 0 });
+
 const write = (fs, path, text, offset = 0) => fs.writeSync(path, ENC.encode(text), offset);
 
 // Read a whole file back through the positional API, exactly as the shim does.
@@ -83,28 +91,62 @@ export function conformanceCases() {
     {
       name: 'mkdirSync creates a directory, and refuses a repeat or a missing parent',
       run(fs, dir) {
-        const stat = fs.mkdirSync(dir, {});
+        const stat = fs.mkdirSync(dir, NEW_DIR);
         eq(stat.mode & S_IFMT, S_IFDIR, 'mkdirSync must return a directory mode');
         eq(fs.statSync(dir).mode & S_IFMT, S_IFDIR, 'and statSync must agree');
-        throwsCode(() => fs.mkdirSync(dir, {}), 'EEXIST', 'mkdir over an existing name');
-        throwsCode(() => fs.mkdirSync(`${dir}/no/parent`, {}), 'ENOENT', 'mkdir without a parent');
+        throwsCode(() => fs.mkdirSync(dir, NEW_DIR), 'EEXIST', 'mkdir over an existing name');
+        throwsCode(() => fs.mkdirSync(`${dir}/no/parent`, NEW_DIR), 'ENOENT', 'mkdir without a parent');
       },
     },
     {
       name: 'createFileSync creates an empty file, and refuses a repeat or a missing parent',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        const stat = fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        const stat = fs.createFileSync(`${dir}/f`, NEW_FILE);
         eq(stat.mode & S_IFMT, S_IFREG, 'createFileSync must return a regular-file mode');
         eq(fs.statSync(`${dir}/f`).size, 0, 'a new file is empty');
-        throwsCode(() => fs.createFileSync(`${dir}/f`, {}), 'EEXIST', 'create over an existing name');
-        throwsCode(() => fs.createFileSync(`${dir}/no/f`, {}), 'ENOENT', 'create without a parent');
+        throwsCode(() => fs.createFileSync(`${dir}/f`, NEW_FILE), 'EEXIST', 'create over an existing name');
+        throwsCode(() => fs.createFileSync(`${dir}/no/f`, NEW_FILE), 'ENOENT', 'create without a parent');
+      },
+    },
+    {
+      // The invariant a shared store lives or dies by, and the one nothing
+      // upstream of it notices: the shell enforces no permissions, so a store
+      // that dropped the mode looked perfect until a second guest — a language
+      // runtime mounting the same tree — could not open a file the shell had
+      // just written, and said EACCES about a script that was right there.
+      name: 'a creation keeps the mode, uid and gid it was given',
+      run(fs, dir) {
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
+        const d = fs.statSync(dir);
+        const f = fs.statSync(`${dir}/f`);
+        eq(d.mode & 0o7777, 0o755, 'a directory keeps its permission bits');
+        eq(f.mode & 0o7777, 0o644, 'a file keeps its permission bits');
+        eq(f.uid, 0, 'uid');
+        eq(f.gid, 0, 'gid');
+      },
+    },
+    {
+      // chmod, the other half of the same field. The type bits are not the
+      // caller's to set — POSIX chmod cannot turn a file into a directory —
+      // and the shim reads the type out of `mode` on every path it resolves,
+      // so a store that let a chmod clear it would leave a node that is
+      // neither file nor directory.
+      name: 'touchSync changes permission bits and leaves the type alone',
+      run(fs, dir) {
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
+        fs.touchSync(`${dir}/f`, { mode: 0o600 });
+        const f = fs.statSync(`${dir}/f`);
+        eq(f.mode & 0o7777, 0o600, 'the permission bits changed');
+        eq(f.mode & S_IFMT, S_IFREG, 'the type did not');
       },
     },
     {
       name: 'statSync on a missing path throws ENOENT carrying a Linux errno',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
+        fs.mkdirSync(dir, NEW_DIR);
         throwsCode(() => fs.statSync(`${dir}/absent`), 'ENOENT', 'stat of a missing path');
         let errno = null;
         try { fs.statSync(`${dir}/absent`); } catch (err) { errno = err.errno; }
@@ -116,9 +158,9 @@ export function conformanceCases() {
     {
       name: 'readdirSync lists entry names, and a file is not a directory',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/b`, {});
-        fs.mkdirSync(`${dir}/a`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/b`, NEW_FILE);
+        fs.mkdirSync(`${dir}/a`, NEW_DIR);
         const names = fs.readdirSync(dir).slice().sort();
         eq(names.join(','), 'a,b', 'readdirSync returns bare names, not paths');
         eq(fs.readdirSync(`${dir}/a`).length, 0, 'an empty directory lists nothing');
@@ -134,8 +176,8 @@ export function conformanceCases() {
         // 2.6.3's InMemory overwrites the directory's own serialized index
         // with them, after which the directory cannot be listed at all, and a
         // read hands back pieces of that index as if it were file content.
-        fs.mkdirSync(dir, {});
-        fs.mkdirSync(`${dir}/d`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.mkdirSync(`${dir}/d`, NEW_DIR);
         throwsCode(() => fs.writeSync(`${dir}/d`, ENC.encode('x'), 0), 'EISDIR', 'write to a directory');
         throwsCode(() => fs.readSync(`${dir}/d`, new Uint8Array(4), 0, 4), 'EISDIR', 'read from a directory');
         eq(fs.readdirSync(`${dir}/d`).length, 0, 'the directory is still a directory');
@@ -149,7 +191,7 @@ export function conformanceCases() {
         // the store rather than stat-ing first. A store that quietly created
         // the file would turn a write into a phantom into a success, and one
         // that reported another reason would hand the guest a comfortable lie.
-        fs.mkdirSync(dir, {});
+        fs.mkdirSync(dir, NEW_DIR);
         throwsCode(() => write(fs, `${dir}/absent`, 'x'), 'ENOENT', 'write to a missing path');
         // An empty write is a real call, not a hypothetical one: fd_write
         // passes each iovec through on its own and an iovec may be empty.
@@ -161,8 +203,8 @@ export function conformanceCases() {
     {
       name: 'reads and writes are positional — no offset state in the store',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'hello world');
         eq(fs.statSync(`${dir}/f`).size, 11, 'size follows the write');
         // Reading the middle twice must give the same bytes: an implicit
@@ -176,8 +218,8 @@ export function conformanceCases() {
     {
       name: 'writeSync at an offset appends and overwrites in place',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'hello world');
         write(fs, `${dir}/f`, '!!', 11);                       // append at the end
         eq(readAll(fs, `${dir}/f`), 'hello world!!', 'append at offset');
@@ -189,8 +231,8 @@ export function conformanceCases() {
     {
       name: 'a write past the end extends the file with a zero hole',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'end', 5);
         eq(fs.statSync(`${dir}/f`).size, 8, 'the file grew to cover the offset');
         const buf = new Uint8Array(8);
@@ -202,8 +244,8 @@ export function conformanceCases() {
     {
       name: 'touchSync truncates, both shorter and longer',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'abcdefgh');
         fs.touchSync(`${dir}/f`, { size: 3 });
         eq(fs.statSync(`${dir}/f`).size, 3, 'shrunk');
@@ -216,8 +258,8 @@ export function conformanceCases() {
     {
       name: 'touchSync sets permission bits and leaves the file type alone',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         fs.touchSync(`${dir}/f`, { mode: S_IFREG | 0o600 });
         const stat = fs.statSync(`${dir}/f`);
         eq(stat.mode & 0o7777, 0o600, 'permission bits applied');
@@ -230,8 +272,8 @@ export function conformanceCases() {
         // The whole reason mtime is in the contract: a runtime with a
         // validate-timestamps opcode cache never reloads a file whose mtime
         // does not move, so an edit in the shell is invisible to the page.
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         const born = fs.statSync(`${dir}/f`).mtimeMs;
         ok(born > 0, 'a fresh file must not be stuck at epoch 0');
         const after = untilChanged(
@@ -251,10 +293,10 @@ export function conformanceCases() {
         // busybox find and cp -r detect directory loops by dev:ino. A store
         // handing out one constant makes every directory look infinitely
         // recursive, and cp -r never terminates.
-        fs.mkdirSync(dir, {});
-        fs.mkdirSync(`${dir}/a`, {});
-        fs.mkdirSync(`${dir}/b`, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.mkdirSync(`${dir}/a`, NEW_DIR);
+        fs.mkdirSync(`${dir}/b`, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         const inos = [fs.statSync(`${dir}/a`).ino, fs.statSync(`${dir}/b`).ino, fs.statSync(`${dir}/f`).ino];
         ok(inos.every((i) => typeof i === 'number'), 'inodes are numbers');
         eq(new Set(inos).size, 3, 'distinct nodes get distinct inodes');
@@ -266,8 +308,8 @@ export function conformanceCases() {
     {
       name: 'renameSync moves a file and drops the old name',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'payload');
         fs.renameSync(`${dir}/f`, `${dir}/g`);
         eq(readAll(fs, `${dir}/g`), 'payload', 'contents came along');
@@ -279,10 +321,10 @@ export function conformanceCases() {
     {
       name: 'renameSync moves a directory with its whole subtree',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.mkdirSync(`${dir}/a`, {});
-        fs.mkdirSync(`${dir}/a/deep`, {});
-        fs.createFileSync(`${dir}/a/deep/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.mkdirSync(`${dir}/a`, NEW_DIR);
+        fs.mkdirSync(`${dir}/a/deep`, NEW_DIR);
+        fs.createFileSync(`${dir}/a/deep/f`, NEW_FILE);
         write(fs, `${dir}/a/deep/f`, 'payload');
         fs.renameSync(`${dir}/a`, `${dir}/b`);
         eq(readAll(fs, `${dir}/b/deep/f`), 'payload', 'descendants moved with it');
@@ -292,9 +334,9 @@ export function conformanceCases() {
     {
       name: 'unlinkSync removes a file and refuses a directory',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
-        fs.mkdirSync(`${dir}/d`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
+        fs.mkdirSync(`${dir}/d`, NEW_DIR);
         throwsCode(() => fs.unlinkSync(`${dir}/d`), 'EISDIR', 'unlink of a directory');
         fs.unlinkSync(`${dir}/f`);
         throwsCode(() => fs.statSync(`${dir}/f`), 'ENOENT', 'the file is gone');
@@ -305,9 +347,9 @@ export function conformanceCases() {
     {
       name: 'rmdirSync removes an empty directory and refuses a full one',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.mkdirSync(`${dir}/d`, {});
-        fs.createFileSync(`${dir}/d/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.mkdirSync(`${dir}/d`, NEW_DIR);
+        fs.createFileSync(`${dir}/d/f`, NEW_FILE);
         throwsCode(() => fs.rmdirSync(`${dir}/d`), 'ENOTEMPTY', 'rmdir of a non-empty directory');
         fs.unlinkSync(`${dir}/d/f`);
         fs.rmdirSync(`${dir}/d`);
@@ -320,8 +362,8 @@ export function conformanceCases() {
         // Hard links are optional: the shim answers path_link with ENOSYS
         // anyway. What is NOT optional is failing honestly instead of
         // pretending to have linked.
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'shared');
         let supported = true;
         try { fs.linkSync(`${dir}/f`, `${dir}/g`); } catch (err) {
@@ -339,8 +381,8 @@ export function conformanceCases() {
     {
       name: 'syncSync is callable and does not lose writes',
       run(fs, dir) {
-        fs.mkdirSync(dir, {});
-        fs.createFileSync(`${dir}/f`, {});
+        fs.mkdirSync(dir, NEW_DIR);
+        fs.createFileSync(`${dir}/f`, NEW_FILE);
         write(fs, `${dir}/f`, 'durable');
         fs.syncSync();
         eq(readAll(fs, `${dir}/f`), 'durable', 'a flush keeps what was written');
