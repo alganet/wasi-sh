@@ -258,9 +258,21 @@ as a real bug during bring-up):
    on `bb_common_bufsiz1` and assume a freshly zeroed process; the second grep
    in a session parsed its pattern as a filename. The patch zeroes the buffer
    before each in-process run.
-2. **Shared stdio state** — an applet that drains stdin leaves the EOF flag
-   set on the shared `FILE`; the next pipe-fed applet read zero bytes. The
-   patch `clearerr()`s the three std streams before each run.
+2. **Shared stdio state** — the `FILE` behind fd 0 is the *process's*, and
+   both ends of an applet's use of it leaked into the next one. An applet that
+   drains stdin leaves the EOF flag set, so the next pipe-fed applet read zero
+   bytes; the patch `clearerr()`s the three std streams before each run. And a
+   short-reading applet (`head -1`, `sed q`, `grep -m1`) pulls a whole block,
+   prints part of it and returns with the rest still buffered — bytes a forked
+   child would have taken with it — so the next applet read the previous one's
+   leftovers as its own input. `printf 'l1\nl2\nl3\n' | head -1` printed `l1`,
+   then `l2`, then `l3`. The patch `fflush(stdin)`s after each run, which on a
+   pipe discards exactly what the child's death used to and on a *seekable*
+   stdin does better than that: POSIX puts the file offset back where the
+   reader stopped, so `{ head -1; read x; } < f` leaves `x` as the second line
+   instead of losing the file to `head`'s buffer. Outermost applet only —
+   `xargs` and `find -exec` run their children through the same
+   `run_nofork_applet()`, and what the *parent* has buffered is still its own.
 3. **Raw `exit()`** — libc exit becomes wasi `proc_exit`, which kills the
    whole instance (a JS exception unwinds the entire wasm stack — no guest
    setjmp can catch it). `build.sh` links with `--wrap exit`; the wrap in
@@ -315,8 +327,7 @@ sockets, `/proc`, or a real tty.
   `spawn_and_wait` state bug); `xargs`/`find -exec` with a *NOEXEC* child
   (e.g. `xargs grep`) still fork-fails — only NOFORK children (`echo` etc.)
   work; `VAR=VAL applet` prefix assignments are not isolated around the
-  in-process run (upstream-documented NOFORK gap); an applet that
-  stdio-buffers stdin and exits early strands those buffered bytes.
+  in-process run (upstream-documented NOFORK gap).
 
 ## Host builtins (`build/ash-hostbuiltin.patch`)
 
