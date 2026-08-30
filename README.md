@@ -57,6 +57,7 @@ const session = await spawn({ env: { COLUMNS: '80', LINES: '24' } });
 session.onOutput((bytes, channel) => render(bytes)); // shell → you
 session.write('echo hi\n');                          // you → shell
 session.resize(100, 40);  // terminal resized: live size + a synthesized SIGWINCH
+session.post('GET /');// hand the RUNNING guest a host request (see the host port)
 session.end();        // stdin EOF
 session.terminate();  // hard kill (exited resolves 137, kill -9 style)
 await session.exited; // exit code — always settles, even after terminate()
@@ -378,6 +379,63 @@ serve({ async host() {
 
 This is also the only way an interactive `spawn()` session gets one.
 
+### The other direction: the host asking the guest
+
+Everything above is the guest calling out. The port also runs **inbound** — the
+host handing a request to a script that is already running — which is what
+turns the awkward case idiomatic: **a dev server is a shell loop.**
+
+```sh
+while read -r req <&3; do
+    printf 'respond %s\n' "$(handle "$req")" > /dev/host
+done 3< /dev/hostreq
+```
+
+```js
+const session = await spawn({ script, requestBufferSize: 65536 });
+session.post('GET /index.php');     // reaches the loop above, parked, in <1ms
+session.endRequests();              // EOF: the loop ends
+```
+
+This is the one direction `postMessage` cannot go. A live session is a single
+synchronous `_start()` frame, so the worker's event loop never turns while the
+shell is running: a message posted into it is not slow, it is *not delivered*.
+A request travels through shared memory the guest reads at its blocking point
+instead — the same mechanism a terminal resize uses.
+
+A request is a **line**, the framing the outbound half already uses. The reply
+is an ordinary outbound verb, because a request the guest is still handling has
+nothing to return yet.
+
+The two things the loop has to be told, it is told in the shell's own terms:
+
+| | what it means |
+|---|---|
+| `EPERM` at open | this session can **never** receive a request — the loop refuses to start |
+| EOF at read | no more are coming — `read` fails and the loop ends |
+
+There is no third answer, deliberately. Every other way a request can fail — a
+newline inside it, one too big for the ring — is refused at `post()`, where the
+host still holds it and can do something about it. A guest parked on a request
+has no write to fail and no `$?` to reach, so an error it could only learn by
+reading is one it cannot act on.
+
+`requestBufferSize` **is** the grant: without it `/dev/hostreq` is `EPERM`, like
+the outbound half with no `host`. The size is also the cap on unread requests —
+`post()` throws `RingOverflowError` when the guest is not consuming, which is
+the host's problem to size.
+
+For `run()`, where nothing can arrive *during* the run because the guest holds
+the thread for its whole life, the same channel is staged up front:
+
+```js
+await run({ inline: true, script, requests: ['GET /a.php', 'GET /b.php'] });
+```
+
+**A blocking verb freezes that guest for its duration** — inbound or outbound,
+the guest is a wasm frame below the call. Familiar from any blocking read, and
+worth knowing before a verb does something slow.
+
 ## API
 
 | import | what |
@@ -385,7 +443,7 @@ This is also the only way an interactive `spawn()` session gets one.
 | `wasi-sh` | `run`, `spawn`, `Session`, `fetchTree`, `WasiShim`, `WasiExit`, ring |
 | `wasi-sh/node` | `run`, `runScript`, `compileWasm`, `readTree` (fs sugar; node-only) |
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
-| `wasi-sh/ring` | `createStdinRing`, `RingWriter`, `RingReader` — the SAB stdin ring |
+| `wasi-sh/ring` | `createRing`, `RingWriter`, `RingReader`, `frameRequest` — the SAB rings |
 | `wasi-sh/fs` | `memoryFs` and the `fs` contract — the filesystem, pluggable |
 | `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
@@ -402,7 +460,9 @@ argv — busybox is a multicall binary, argv[0] is `busybox`), `command`
 `run` also takes `fs` (a store) and `host` (a capability port). Both need
 `inline: true`, since a live object cannot be structured-cloned into a Worker —
 off-thread runs and `spawn` use `serve({ fs, host })` in a worker module
-instead, and passing either to a stock worker throws and says so.
+instead, and passing either to a stock worker throws and says so. `run` takes
+`requests` (the inbound channel, staged up front); `spawn` takes
+`requestBufferSize` and feeds the same channel live with `session.post()`.
 
 **`fetchTree`** assembles `files` from URLs:
 
@@ -418,8 +478,9 @@ const files = await fetchTree({
 
 **Escape hatches**: `worker` / `workerUrl` (bring your own Worker for
 bundler or CSP constraints), `stdinBufferSize` (spawn's ring, default 64 KiB),
-and `WasiShim` itself for full control over stdin transport and execution
-context.
+`requestBufferSize` (spawn's inbound host-request ring; absent means no
+channel), and `WasiShim` itself for full control over stdin transport and
+execution context.
 
 ## Deployment: cross-origin isolation
 

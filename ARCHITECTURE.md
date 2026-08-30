@@ -7,7 +7,7 @@ there; this is how the pieces actually work and why they look the way they do.
 
 ```
 run() / spawn()            main thread (or node)
-   │  postMessage {wasm, files, args, env, sab? , stdin?}
+   │  postMessage {wasm, files, args, env, sab?, reqSab?, stdin?, requests?}
    ▼
 worker.mjs                 Web Worker / worker_threads
    │  WebAssembly.instantiate(module, shim.imports())
@@ -22,6 +22,10 @@ Two stdin transports plug into the same shim `input` contract:
   headers.
 - `spawn()`: a SharedArrayBuffer ring (`ring.mjs`) the worker parks on with
   `Atomics.wait`, so blocking `read` and `read -t` behave like a terminal's.
+
+The host port's inbound half (`/dev/hostreq`) is that same contract aimed the
+other way, with the same two transports behind it — a second ring for `spawn()`,
+a staged queue for `run()`.
 
 ## The WASI shim (`src/shim.mjs`)
 
@@ -151,6 +155,14 @@ event landing between check and wait returns immediately instead of being lost.
 `end()` sets an EOF flag and bumps `seq` (EOF changes no counter, so waiting on
 `head` alone would miss it). The last three words carry terminal geometry —
 their story is below.
+
+**One format, two channels.** The inbound host-request ring is not a near-copy
+of this one, it *is* this one: a request channel needs `head/tail/flags/seq` and
+nothing else, and those are a strict subset of what stdin needs — the terminal
+words simply go unused there. So `RingReader`/`RingWriter` serve both directions
+with no adapter, and the wake mechanics that took a bug fix to get right exist
+in one place. `createRing()` is the neutral name; `createStdinRing` is the same
+function under the name it had when there was only one.
 
 ## Terminal resize: a synthesized SIGWINCH (`Session.resize`)
 
@@ -498,11 +510,72 @@ delivered. Registration is `shim.addDevice(path, device)`, which assigns the
 inode itself so that `ls /dev`, stat and open can never describe different sets
 of names.
 
-**What this is not.** The port is outbound only. Nothing outside the worker can
-*initiate* anything: a live session is one synchronous `_start()` frame, so a
-`postMessage` to a running shell worker is not slow, it is undelivered. Inbound
-needs shared memory polled by the guest at a blocking point — the mechanism
-`winch` already uses at `__wrap_poll` — and that is a separate piece of work.
+## The inbound half (`/dev/hostreq`)
+
+Everything above is the guest calling out. Inbound is the host handing a request
+to a script that is **already running**, and it is a different problem entirely:
+a live session is one synchronous `_start()` frame, so the worker's event loop
+never turns while the shell runs and a `postMessage` into it is not slow — it is
+not delivered (measured: posted at +303 ms, handled at +3020 ms, and only
+because an unrelated wait expired). The request has to arrive through shared
+memory the guest reads at a blocking point.
+
+Which is why this is a **device and not a verb**: a verb is the guest calling
+out, and here the guest is waiting to be told. The whole of a dev server is then
+an ordinary shell loop, on the filesystem the shell already owns:
+
+```sh
+while read -r req <&3; do
+    printf 'respond %s\n' "$(handle "$req")" > /dev/host
+done 3< /dev/hostreq
+```
+```js
+session.post('GET /index.php');   // spawn({ requestBufferSize })
+```
+
+**The channel is `input`'s contract aimed the other way** — park, read, EOF —
+so a `RingReader` over a second ring serves it unchanged, and `readFd`'s stdin
+path is shared rather than copied. `run()` stages the whole queue up front
+instead, because nothing can arrive *during* a run(): the guest holds the thread
+for its entire life.
+
+**Framing is the line the outbound half already settled**, and the reply is an
+ordinary outbound verb — one direction per device, and no second vocabulary in
+the same port. A request the guest is still handling has nothing to return yet,
+which is why `post()` is fire-and-forget.
+
+**End-of-stream and error signalling, in the shell's own terms.** A request
+arriving *at* a parked guest has no write to fail and no `$?` to reach, so the
+delivery shape has to carry its own — and it carries exactly two answers:
+
+| | what it means |
+|---|---|
+| `EPERM` at open | this session can **never** receive a request; the loop refuses to start |
+| EOF at read | no more are coming; `read` fails and the loop ends |
+
+There is no third, deliberately. Every other failure — a newline inside a
+request, one too big for the ring — is refused at the producer, where the host
+still holds it and can do something about it. The ring's capacity *is* the size
+cap, so inbound needs no line cap of its own; overflow means the guest is not
+consuming, which is the host's problem to size.
+
+**Devices got a third capability for this, and it is general**: a device may
+offer `poll(ms)`, and its presence is what stops `poll_oneoff` reporting the fd
+readable on sight. That mattered enough to be a bug already — a queued resize
+was undelivered for as long as you cared to wait because `poll_oneoff` answered
+"readable" immediately and the wait then happened in `fd_read`, where nothing
+dispatches. A device whose read can block is that same trap with a new door. Its
+read may also answer an errno rather than bytes, which is how it says `EAGAIN`
+when an empty read already means EOF.
+
+**Measured:** a guest parked between requests is woken and has handled the
+request in **under a millisecond**, and costs no CPU while parked.
+
+**What this still is not.** Only a guest parked *on the request channel* is
+woken. A shell idling at an interactive prompt is parked on stdin and will not
+notice a request until something else wakes it — which is fine, because a dev
+server is a script, not a prompt. And a blocking verb freezes that guest for its
+duration, inbound or outbound, exactly like a blocking read.
 
 ## Build recipe (`build/build.sh`)
 

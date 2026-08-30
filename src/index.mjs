@@ -14,4 +14,4 @@ export { run } from './run.mjs';
 export { spawn, Session } from './spawn.mjs';
 export { fetchTree } from './files.mjs';
 export { WasiShim, WasiExit } from './shim.mjs';
-export { createStdinRing, RingWriter, RingReader, RingOverflowError } from './ring.mjs';
+export { createRing, createStdinRing, RingWriter, RingReader, RingOverflowError, frameRequest } from './ring.mjs';
