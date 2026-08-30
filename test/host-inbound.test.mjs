@@ -273,7 +273,9 @@ import { Worker } from 'node:worker_threads';
 import { createRing, RingWriter, frameRequest } from '../src/ring.mjs';
 
 // The node twin of src/worker.mjs, with both rings — the same shim wiring,
-// parentPort standing in for postMessage.
+// parentPort standing in for postMessage. (interactive.test.mjs has a
+// stdin-only twin for the terminal cases; serve.test.mjs drives the REAL
+// worker.mjs, which is what keeps either twin's drift from mattering.)
 const TWIN = `
   import { parentPort, workerData } from 'node:worker_threads';
   const { WasiShim, WasiExit } = await import(workerData.shimUrl);
