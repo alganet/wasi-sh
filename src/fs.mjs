@@ -421,6 +421,22 @@ export class MemoryFs {
 //   `proc_exit` calls it — and against an async backend all it can reach is the
 //   cache. Nothing synchronous can await OPFS, so the honest answer is to
 //   report what already failed and let the embedder await the rest.
+//
+// AND ONE LIMIT THAT IS LAW 1 RATHER THAN A GAP TO CLOSE — read this before
+// reaching for it. **A guest that never exits never flushes.** The write-back
+// is a promise chain and promises need the event loop, which a running guest
+// does not give back: a live session is one synchronous `_start()` frame that
+// parks in `Atomics.wait`, so not one microtask runs between its first write
+// and its last. Measured rather than assumed — a shell parked on
+// `/dev/hostreq` wrote a SQLite database through a `WebAccessFS` and OPFS was
+// still empty ten seconds later.
+//
+// So this persists for a guest that ENDS: `run()`, and any embedder that hands
+// the event loop back between sessions. It does NOT persist a long-lived
+// `spawn()`, and no amount of care here would — that one needs a store whose
+// writes leave SYNCHRONOUSLY, which on OPFS means `createSyncAccessHandle()`
+// (worker-only, exclusive per file) or a writer thread the store blocks on
+// through a `SharedArrayBuffer`. Neither is this adapter.
 // ---------------------------------------------------------------------------
 
 /** The sync half a session needs the moment it starts, before anything is awaited. */
@@ -437,6 +453,41 @@ const QUEUEING_METHODS = [
 
 const PREPARED = Symbol.for('wasi-sh.persistentFs');
 
+/**
+ * Prepare a persistent store for a session: hydrate it, and give the writes
+ * behind it somewhere to report a failure.
+ *
+ * `backing` is any store in the contract's shape, which in practice means a
+ * `@zenfs/core` filesystem — this repo takes ZenFS's shape and not ZenFS, so
+ * nothing here imports it and `npm i wasi-sh` still installs exactly one thing.
+ * The backend is the embedder's to choose:
+ *
+ * ```js
+ * import { WebAccess } from '@zenfs/dom';
+ * import { persistentFs } from 'wasi-sh/fs';
+ *
+ * const store = await persistentFs(await WebAccess.create({
+ *   handle: await navigator.storage.getDirectory(),
+ * }), { onError: (err) => console.error('it did not save:', err) });
+ *
+ * await run({ inline: true, fs: store, command: 'echo hi > /a.txt' });
+ * await store.flush();          // and now it is on disk
+ * ```
+ *
+ * **For a session that ENDS.** The write-back needs the event loop and a
+ * running guest never gives it back, so a long-lived `spawn()` fills the cache
+ * and nothing else — see the note over the definitions above, which says what
+ * that one needs instead.
+ *
+ * Returns the SAME object rather than a wrapper, so a second guest of the store
+ * still sees the class it was handed — phasm's `mountStore()` mounts a ZenFS
+ * filesystem directly and wraps anything else, and a wrapper would cost a layer
+ * for nothing.
+ *
+ * @param backing a store to prepare, async-backed or not
+ * @param options.onError called with each write-back failure, as it is seen
+ * @returns backing, hydrated, with `flush()` attached
+ */
 export async function persistentFs(backing, options = {}) {
   if (!backing || typeof backing !== 'object') {
     throw new Error('persistentFs: expected a store, got ' + (backing === null ? 'null' : typeof backing));

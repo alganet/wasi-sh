@@ -146,12 +146,23 @@ import { persistentFs } from 'wasi-sh/fs';
 
 const store = await persistentFs(
   await WebAccess.create({ handle: await navigator.storage.getDirectory() }),
-  { onError: (err) => console.error('the project did not save:', err) },
+  { onError: (err) => console.error('it did not save:', err) },
 );
 
-serve({ async fs() { return store; } });   // in the worker, awaited once
-await store.flush();                       // when the answer is worth having
+await run({ inline: true, fs: store, command: 'echo hi > /a.txt' });
+await store.flush();                       // and now it is on disk
 ```
+
+**It is for a session that ends, and that is law 1 rather than a gap.** The
+write-back is a promise chain, promises need the event loop, and a running
+guest never gives it back — a live session is one synchronous `_start()` frame
+that parks in `Atomics.wait`, so not one microtask runs between its first write
+and its last. Measured: a shell parked on `/dev/hostreq` wrote a SQLite database
+through a `WebAccessFS` and OPFS was still empty ten seconds later. So `run()`
+persists and a long-lived `spawn()` does not; making *that* one persist needs a
+store whose writes leave synchronously — `createSyncAccessHandle()` (worker-only
+and exclusive per file), or a writer thread the store blocks on through a
+`SharedArrayBuffer`. Neither is this.
 
 It does three things, each of which is silent when it is got wrong.
 **Hydration is not automatic** — `WebAccess.create()` loads the index and not

@@ -211,6 +211,35 @@ if (!zenfs) {
     assert.equal(readAll(store, '/srv/async.php'), 'from the async half');
   });
 
+  // The boundary, from the side that works: a REAL shell, writing into a
+  // persistent store, and the bytes still there after the run that made them.
+  // `run()` is the whole scope of this adapter — its guest exits, so the queue
+  // gets the event loop back. A long-lived spawn() never does, and that is law
+  // 1 rather than anything this file could assert its way out of.
+  test('a real shell fills a persistent store, and flush() is when it is on disk', async (t) => {
+    const { existsSync } = await import('node:fs');
+    if (!existsSync(new URL('../dist/busybox.wasm', import.meta.url))) {
+      t.skip('no dist/busybox.wasm — run npm run build:wasm');
+      return;
+    }
+    const backing = makeBacking(zenfs);
+    const { run } = await import('../src/run.mjs');
+    const store = await persistentFs(await backing.make());
+    const r = await run({
+      inline: true,
+      fs: store,
+      script: 'mkdir -p /srv && printf \'<?php echo "hi";\' > /srv/index.php',
+    });
+    assert.equal(r.exitCode, 0, r.stderr);
+    await store.flush();
+    assert.equal(DEC.decode(backing.bytes.get('/srv/index.php')), '<?php echo "hi";');
+
+    // And a second session over the same backend opens what the first left.
+    const next = await persistentFs(await backing.make());
+    const again = await run({ inline: true, fs: next, command: 'cat /srv/index.php' });
+    assert.equal(again.stdout, '<?php echo "hi";');
+  });
+
   // Same claim fs-zenfs.test.mjs makes about InMemory, one layer out: the
   // deviations are the backend's, and preparing it adds none.
   const KNOWN_DEVIATIONS = new Map([
