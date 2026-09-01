@@ -527,6 +527,164 @@ test('a slashed unknown name is 127, not a dead shell', async (t) => {
   }
 });
 
+// ─── shebangs, and the `env` that makes them useful ──────────────────────────
+// On Linux the "#!" line is resolved inside execve(), in the kernel. There is
+// no kernel here, so ash reads it itself (build/ash-shebang.patch) and splices
+// the interpreter — by basename — in front of the command. `env` is a shell
+// builtin for the same reason: the applet ends in execve(), which is ENOSYS.
+//
+// Probed at runtime rather than through the import table: this patch adds no
+// wasm import, so an older dist/busybox.wasm is only visible in behaviour.
+let shebangReady;
+before(async () => {
+  shebangReady = (await sh('type env')).stdout.includes('shell builtin');
+});
+const skipUnlessShebang = (t) => {
+  if (shebangReady) return false;
+  t.skip('dist/busybox.wasm predates shebang dispatch — run npm run build:wasm');
+  return true;
+};
+// `greet` echoes the argv it was handed, so each test can see exactly what the
+// interpreter received — the script path and its arguments, in that order.
+const greeter = {
+  greet: (ctx) => { ctx.stdout(`greet[${ctx.argv.slice(1).join('|')}]`); return 0; },
+};
+
+test('a #! file resolves through env to a host builtin, with the script path first', async (t) => {
+  if (skipUnlessShebang(t) || skipUnlessHostBuiltins(t)) return;
+  const r = await sh('./tool a b', { builtins: greeter, files: { '/tool': '#!/usr/bin/env greet\nignored\n' } });
+  assert.equal(r.stdout, 'greet[./tool|a|b]');
+  assert.equal(r.exitCode, 0);
+});
+
+test('the interpreter is taken by basename, so a bare #!/path/to/x works too', async (t) => {
+  if (skipUnlessShebang(t) || skipUnlessHostBuiltins(t)) return;
+  const r = await sh('./tool a', { builtins: greeter, files: { '/tool': '#!/opt/nowhere/greet\n' } });
+  assert.equal(r.stdout, 'greet[./tool|a]');
+});
+
+test('a #! line carries at most one interpreter argument, Linux-style', async (t) => {
+  if (skipUnlessShebang(t) || skipUnlessHostBuiltins(t)) return;
+  const one = await sh('./tool z', { builtins: greeter, files: { '/tool': '#!/usr/bin/greet -x\n' } });
+  assert.equal(one.stdout, 'greet[-x|./tool|z]');
+  // Two words after the interpreter are ONE argument, not two — which is why
+  // `#!/usr/bin/env -S` exists on Linux. Here that lands on a name with a space.
+  const two = await sh('./tool z', { builtins: greeter, files: { '/tool': '#!/usr/bin/env greet -a -b\n' } });
+  assert.equal(two.exitCode, 127);
+  assert.match(two.stderr, /greet -a -b: not found/);
+});
+
+test('a #! file resolves to an applet as readily as to a host builtin', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('./tool', { files: { '/tool': '#!/bin/cat\npayload\n' } });
+  assert.equal(r.stdout, '#!/bin/cat\npayload\n', 'cat was handed the script path');
+});
+
+test('a #! file resolves to a shell function, which shadows everything else', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('greet() { echo "fn $*"; }\n./tool a\n', { files: { '/tool': '#!/usr/bin/greet\n' } });
+  assert.equal(r.stdout, 'fn ./tool a\n');
+});
+
+test('a #! naming an interpreter that does not exist is 127 naming the interpreter', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('./tool; echo "after=$?"', { files: { '/tool': '#!/usr/bin/nosuchthing\n' } });
+  assert.equal(r.stdout, 'after=127\n');
+  assert.match(r.stderr, /nosuchthing: not found/, 'the script path is the least useful thing to name here');
+});
+
+// Nothing but `env` can lead back into the shebang reader — every other
+// interpreter is re-dispatched as a bare name and so can never take
+// find_command's slash short circuit again. This is the one file that can:
+// one called `env` whose own #! line names env.
+test('a self-referential shebang is refused, not recursed, and names the file', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('./env; echo "after=$?"', { files: { '/env': '#!/usr/bin/env\n' } });
+  assert.equal(r.stdout, 'after=126\n');
+  assert.match(r.stderr, /\.\/env: bad interpreter: #! loop/);
+});
+
+test('a #! line longer than the cap is refused rather than truncated', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('./tool; echo "after=$?"', { files: { '/tool': `#!/usr/bin/${'x'.repeat(200)}\n` } });
+  assert.equal(r.stdout, 'after=126\n');
+  assert.match(r.stderr, /#! line too long/);
+});
+
+test('a #! with no interpreter after it is refused', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('./tool; echo "after=$?"', { files: { '/tool': '#!\nx\n' } });
+  assert.equal(r.stdout, 'after=126\n');
+  assert.match(r.stderr, /no interpreter after #!/);
+});
+
+// busybox ash is not reentrant — ash_main() re-initialises all three globals
+// structs and never restores them, so a nested shell takes the outer one's
+// variables and script position with it (true of `sh script.sh` typed by hand
+// too). Refuse loudly rather than make `./deploy.sh` the common way to hit it.
+test('a #! naming the shell itself is refused, and the caller survives', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('./deploy.sh; echo "after=$?"\necho still-here\n',
+    { files: { '/deploy.sh': '#!/bin/sh\necho hi\n' } });
+  assert.equal(r.stdout, 'after=126\nstill-here\n');
+  assert.match(r.stderr, /sh cannot run inside this shell/);
+});
+
+// The guard above this section says a slashed unknown name is 127. These say
+// the shebang reader did not swallow that: a file with no "#!" is not a
+// command, however readable it is.
+test('a file with no #! is still 127, and still does not abort the script', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  for (const body of ['plain text\n', '', '#', '#!']) {
+    const r = await sh('./tool; echo "after=$?"', { files: { '/tool': body } });
+    const expected = body === '#!' ? 'after=126\n' : 'after=127\n';
+    assert.equal(r.stdout, expected, `body ${JSON.stringify(body)}`);
+    assert.equal(r.exitCode, 0);
+  }
+});
+
+test('env sets a variable for one command only', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('FOO=outer\nexport FOO\nenv FOO=inner printenv FOO\nprintenv FOO\n');
+  assert.equal(r.stdout, 'inner\nouter\n');
+});
+
+test('bare env still prints the environment', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('export ZZ=1\nenv | grep "^ZZ="\n');
+  assert.equal(r.stdout, 'ZZ=1\n');
+});
+
+test('env -i empties the environment, and -u drops one name', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const cleared = await sh('export ZZ=1\nenv -i printenv | wc -l\nprintenv ZZ\n');
+  assert.equal(cleared.stdout, '0\n1\n', '-i is scoped to the one command');
+  const kept = await sh('env -i FOO=kept printenv\n');
+  assert.equal(kept.stdout, 'FOO=kept\n', '-i comes first, so a later assignment survives it');
+  for (const spelling of ['-u ZZ', '-uZZ']) {
+    const r = await sh(`export ZZ=1\nenv ${spelling} printenv | grep -c "^ZZ="\nprintenv ZZ\n`);
+    assert.equal(r.stdout, '0\n1\n', `${spelling} drops it for the command and puts it back after`);
+  }
+});
+
+test('env stops at the command word: what follows is argv, not an assignment', async (t) => {
+  if (skipUnlessShebang(t) || skipUnlessHostBuiltins(t)) return;
+  const r = await sh('env greet FOO=1', { builtins: greeter });
+  assert.equal(r.stdout, 'greet[FOO=1]');
+});
+
+test('a shell function named env shadows the builtin', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('env() { echo "mine $*"; }\nenv FOO=1 true\n');
+  assert.equal(r.stdout, 'mine FOO=1 true\n');
+});
+
+test('type and command -v tell the truth about env', async (t) => {
+  if (skipUnlessShebang(t)) return;
+  const r = await sh('type env\ncommand -v env\n');
+  assert.equal(r.stdout, 'env is a shell builtin\nenv\n');
+});
+
 // Drift guard. --import-undefined means any unresolved __host_* symbol silently
 // becomes a wasm import, so a typo or a new hook links cleanly and only fails at
 // instantiate ("function import requires a callable") — in production, for every

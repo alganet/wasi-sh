@@ -1,0 +1,447 @@
+wasi-sh: read the "#!" line, and an `env` that does not exec.
+
+Applied AFTER ash-hostbuiltin.patch, which it depends on: the slash short
+circuit it hooks is the one that patch stopped from killing the shell, and
+the interpreter it re-dispatches usually lands on CMDHOST.
+
+On Linux a "#!" line is resolved by execve(), in the kernel. There is no
+kernel here and no exec of any kind, so `./vendor/bin/phpunit` was a plain
+127 even with every piece it needs registered. Two things had to change
+together, because either alone is useless:
+
+  1. evalcommand()'s prefix loop reads the "#!" line of a slashed name that
+     resolved to nothing and splices the interpreter in front of the command,
+     by BASENAME — /usr/bin/env, /bin/env and env are one command here, and
+     none of those directories exist. Resolving the interpreter as a bare
+     name is also what makes recursion impossible: it can never take the
+     slash short circuit again.
+
+  2. `env` becomes a shell builtin (CONFIG_ENV=n in build/busybox.config).
+     The applet ends in execve() == ENOSYS, so `#!/usr/bin/env php` — how
+     every PHP project spells its interpreter — resolved to a command that
+     could not run anything. As a builtin it strips itself the way `command`
+     does and hands the command word back to find_command(), which is the
+     one place that reaches functions, builtins, applets and host builtins.
+
+`env` is the only route back into shebang_expand(), and only for a file
+called `env` whose own "#!" line names env; that one is refused rather than
+recursed, with 126 and a message naming the file.
+
+What counts as executable is A READABLE FILE WHOSE FIRST TWO BYTES ARE "#!".
+The shim FS carries permission bits but does not enforce them and there is
+no chmod, so test_exec() always fails and no other rule is available. See
+ARCHITECTURE.md, which this patch's behaviour supersedes.
+
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -9282,6 +9282,275 @@
+ 	return *lastp;
+ }
+ 
++/* wasi-sh: put TEXT in front of ARGLIST, as one more word of the command.
++ * ARGLIST is never empty here (evalcommand only enters the loop below once
++ * fill_arglist has produced a first word), so ->lastp still points at the tail
++ * and needs no fixing up. */
++static void
++arglist_unshift(struct arglist *arglist, const char *text)
++{
++	struct strlist *sp = stzalloc(sizeof(*sp));
++
++	sp->text = sstrdup(text);
++	sp->next = arglist->list;
++	arglist->list = sp;
++}
++
++/* wasi-sh: shebang dispatch.
++ *
++ * On Linux the "#!" line is resolved by execve(), in the kernel. There is no
++ * kernel here and no exec of any kind, so the shell has to do it or nobody
++ * does: without this, `./vendor/bin/phpunit` is a plain 127 even when every
++ * piece it needs is present.
++ *
++ * WHAT COUNTS AS EXECUTABLE. Nothing the filesystem can answer: the shim FS
++ * carries permission bits but does not enforce them, there is no chmod, and
++ * test_exec() therefore always fails. So the rule is the only one available —
++ * A READABLE FILE WHOSE FIRST TWO BYTES ARE "#!" — and it is deliberate, not
++ * emergent. `./notes.txt` runs if it happens to start with one.
++ *
++ * The line is parsed the way Linux parses it: at most SHEBANG_MAX bytes,
++ * interpreter plus AT MOST ONE argument (the rest of the line, verbatim,
++ * as a single word). A trailing CR is dropped, which Linux does not do —
++ * these files arrive over HTTP and out of zips, and a CRLF `#!` line is a
++ * mistake with no other plausible reading.
++ *
++ * The interpreter is re-dispatched by its BASENAME: /usr/bin/env, /bin/env and
++ * env are the same command here, and none of the directories in a shebang
++ * exist in this filesystem. That also means the interpreter is always looked
++ * up as a bare name, so it can never take find_command()'s slash short circuit
++ * and can never be read as a "#!" file itself. The only way back into this
++ * function is through the `env` builtin below, which is why one level is
++ * enough — see the DEPTH refusal.
++ *
++ * Returns 1 if ARGLIST was rewritten and the caller should resolve again,
++ * 0 if NAME is not a shebang file (the caller's existing 127 stands), or
++ * -1 if it is one that must not run — message already printed. */
++#define SHEBANG_MAX 127         /* Linux's BINPRM_BUF_SIZE - 1 */
++
++static int
++shebang_expand(struct arglist *arglist, int depth)
++{
++	/* One byte more than the cap, so a line that is exactly SHEBANG_MAX long
++	 * can be told apart from one that is longer. */
++	char buf[SHEBANG_MAX + 2];
++	char *name = arglist->list->text;
++	char *interp;
++	char *arg;
++	char *end;
++	int fd;
++	int n;
++	int total;
++
++	fd = open(name, O_RDONLY);
++	if (fd < 0)
++		return 0;
++	total = 0;
++	while (total <= SHEBANG_MAX) {
++		n = read(fd, buf + total, SHEBANG_MAX + 1 - total);
++		if (n <= 0)
++			break;
++		total += n;
++	}
++	close(fd);
++	if (total < 2 || buf[0] != '#' || buf[1] != '!')
++		return 0;
++	buf[total] = '\0';
++
++	/* memchr, not strchr: a file that is not text may carry a NUL before its
++	 * newline, and the line still ends where the newline is. */
++	end = memchr(buf, '\n', total);
++	if (!end)
++		end = buf + total;      /* end of file ends the last line */
++	if (end - buf > SHEBANG_MAX) {
++		/* A "#!" line longer than the cap is a refusal, not a bigger
++		 * buffer: Linux truncates it silently and runs something the
++		 * author did not write. */
++		ash_msg("%s: bad interpreter: #! line too long", name);
++		return -1;
++	}
++	while (end > buf && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
++		end--;
++	*end = '\0';
++
++	interp = buf + 2;
++	while (*interp == ' ' || *interp == '\t')
++		interp++;
++	arg = interp;
++	while (*arg && *arg != ' ' && *arg != '\t')
++		arg++;
++	if (*arg) {
++		*arg++ = '\0';
++		while (*arg == ' ' || *arg == '\t')
++			arg++;
++	}
++	if (!*interp) {
++		ash_msg("%s: bad interpreter: no interpreter after #!", name);
++		return -1;
++	}
++	interp = (char *) bb_basename(interp);
++
++	if (depth) {
++		/* Only `env` can bring us back here (every other interpreter is
++		 * resolved as a bare name), and it does it for exactly one file:
++		 * one called `env` whose own #! line names env. Refuse rather
++		 * than recurse; the message names the file because the file is
++		 * the thing that is wrong. */
++		ash_msg("%s: bad interpreter: #! loop", name);
++		return -1;
++	}
++	if (strcmp(interp, "sh") == 0 || strcmp(interp, "ash") == 0) {
++		/* busybox ash is not reentrant: ash_main() re-INIT_G()s all
++		 * three globals structs and never restores them, so a nested
++		 * shell takes the outer one's variables, functions and script
++		 * position with it — an interactive session simply ends. That
++		 * is true of `sh script.sh` typed by hand too, but making
++		 * `./deploy.sh` reach it silently would turn a rare footgun
++		 * into the common path. Refuse loudly instead.
++		 * (Delete this once a nested ash can be made to survive.) */
++		ash_msg("%s: bad interpreter: %s cannot run inside this shell", name, interp);
++		return -1;
++	}
++
++	if (*arg)
++		arglist_unshift(arglist, arg);
++	arglist_unshift(arglist, interp);
++	return 1;
++}
++
++/* wasi-sh: `env` as a shell builtin.
++ *
++ * The busybox applet cannot work here — it ends in execve(), which is ENOSYS —
++ * and `env` is not optional decoration: `#!/usr/bin/env php` is how a PHP
++ * project spells its interpreter, so shebang_expand() above lands on `env` and
++ * needs it to lead somewhere. A builtin re-enters find_command() through
++ * evalcommand()'s prefix loop, which is the one place that can reach shell
++ * functions, ash builtins, applets and host builtins alike.
++ *
++ * This consumes `env` and everything up to the command word, exactly the way
++ * parse_command_args() consumes `command`, and hands back the two kinds of
++ * environment edit for evalcommand() to apply once pushlocalvars() has run:
++ *   ENVVARS  VAR=val words, and the bare names of -u
++ *   CLEAR    -i (or a lone -)
++ * Returns DO_NOFUNC if a command word follows, 0 if not. Returning 0 KEEPS
++ * whatever was recorded so far: evalcommand() applies it either way, and then
++ * envcmd() prints the environment those edits produced — which is exactly what
++ * `env -i`, `env -u ZZ` and `env FOO=1` with no command are supposed to show.
++ *
++ * NOT IMPLEMENTED: options other than -i, -u, -- and a lone -. They end the
++ * option scan, so `env -0 cmd` reports `-0: not found` rather than a usage
++ * error. Nothing in scope here passes one. */
++static int
++parse_env_args(struct arglist *arglist, union node **argpp,
++		struct arglist *envvars, smallint *clear)
++{
++	struct strlist *sp = arglist->list;
++	char *cp, c;
++
++#define NEXTWORD() do { \
++	sp = sp->next ? sp->next : fill_arglist(arglist, argpp); \
++	if (!sp) return 0; \
++} while (0)
++#define RECORD(word) do { \
++	struct strlist *r = stzalloc(sizeof(*r)); \
++	r->text = sstrdup(word); \
++	*envvars->lastp = r; \
++	envvars->lastp = &r->next; \
++} while (0)
++
++	for (;;) {
++		NEXTWORD();
++		cp = sp->text;
++		if (*cp++ != '-')
++			break;
++		c = *cp++;
++		if (!c) {               /* a lone "-" is BSD env's -i */
++			*clear = 1;
++			continue;
++		}
++		if (c == '-' && !*cp) { /* "--" ends the options */
++			NEXTWORD();
++			break;
++		}
++		do {
++			switch (c) {
++			case 'i':
++				*clear = 1;
++				break;
++			case 'u':
++				if (!*cp) {     /* "-u NAME", not "-uNAME" */
++					NEXTWORD();
++					cp = sp->text;
++				}
++				RECORD(cp);     /* a bare name: an unset */
++				cp += strlen(cp);
++				break;
++			default:
++				/* Not ours. Let it be the command word and fail
++				 * as one, rather than inventing a usage error. */
++				goto done;
++			}
++			c = *cp++;
++		} while (c);
++	}
++	/* Assignments sit between the options and the command word. */
++	while (sp->text[0] != '=' && *endofname(sp->text) == '=') {
++		RECORD(sp->text);
++		NEXTWORD();
++	}
++ done:
++	arglist->list = sp;
++	return DO_NOFUNC;
++#undef NEXTWORD
++#undef RECORD
++}
++
++static void mklocal(char *name, int flags);
++
++/* wasi-sh: `env -i`. Unsets every exported variable for the duration of one
++ * command, through the same localvar scope that carries `env`'s VAR=val, so
++ * poplocalvars() puts them all back. The names are copied out of listvars()'
++ * answer before anything is unset: that answer lives in the string stack, and
++ * mklocal() allocates there too. */
++static void
++env_clear_exported(void)
++{
++	char **ep;
++	char **epend;
++	char **names;
++	int n = 0;
++	int i;
++
++	INTOFF;
++	ep = listvars(VEXPORT, VUNSET, /*strlist:*/ NULL, &epend);
++	names = ckmalloc((epend - ep + 1) * sizeof(names[0]));
++	for (; ep < epend; ep++) {
++		const char *eq = endofname(*ep);
++		names[n++] = xstrndup(*ep, eq - *ep);
++	}
++	for (i = 0; i < n; i++) {
++		mklocal(names[i], 0);
++		free(names[i]);
++	}
++	free(names);
++	INTON;
++}
++
++/* wasi-sh: `env` with no command word. Every -i, -u and VAR=val it was given
++ * has already been applied to this command's localvar scope by evalcommand(),
++ * so there is nothing left to parse: print what the environment now is. */
++static int FAST_FUNC
++envcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
++{
++	char **ep;
++	char **epend;
++
++	ep = listvars(VEXPORT, VUNSET, /*strlist:*/ NULL, &epend);
++	for (; ep < epend; ep++)
++		out1fmt("%s\n", *ep);
++	return 0;
++}
++
+ #if ENABLE_ASH_CMDCMD
+ /* Is it "command [-p] PROG ARGS" bltin, no other opts? Return ptr to "PROG" if yes */
+ static int
+@@ -10958,11 +11227,19 @@
+ #if ENABLE_ASH_ECHO
+ 	{ BUILTIN_REGULAR       "echo"    +1, echocmd    },
+ #endif
+-#define EVALCMD (COMMANDCMD + \
++#define ENVCMD (COMMANDCMD + \
+ 				/* command */	1 * ENABLE_ASH_CMDCMD + \
+ 				/* continue */	1 + \
+ 				/* echo */	1 * ENABLE_ASH_ECHO + \
+ 				0)
++	/* wasi-sh: `env` is a shell builtin here, not the busybox applet
++	 * (CONFIG_ENV=n in build/busybox.config). The applet ends in execve(),
++	 * which is ENOSYS; a builtin can hand the command word back to
++	 * find_command(). Kept in the table's ASCII order, between echo and
++	 * eval, because find_builtin() bsearch()es it. */
++	{ BUILTIN_REGULAR       "env"     +1, envcmd     },
++#define EVALCMD (ENVCMD + \
++				/* env */	1)
+ 	{ BUILTIN_SPEC_REG      "eval"    +1, NULL       }, /*evalcmd() has a differing prototype*/
+ #define EXECCMD (EVALCMD + \
+ 				/* eval */	1)
+@@ -11115,6 +11392,14 @@
+ 	smallint cmd_is_exec;
+ 	int vflags;
+ 	int vlocal;
++	/* wasi-sh: shebang dispatch and `env`. envlist/env_clear carry what
++	 * parse_env_args() consumed until pushlocalvars() has run; shebang_depth
++	 * and shebang_err carry shebang_expand()'s verdict to the dispatch
++	 * switch, which is the only place that can turn it into an exit status. */
++	struct arglist envlist;
++	smallint env_clear;
++	int shebang_depth;
++	int shebang_err;
+ 
+ 	errlinno = lineno = cmd->ncmd.linno;
+ 
+@@ -11132,6 +11417,11 @@
+ 	*varlist.lastp = NULL;
+ 	arglist.lastp = &arglist.list;
+ 	*arglist.lastp = NULL;
++	envlist.lastp = &envlist.list;          /* wasi-sh */
++	*envlist.lastp = NULL;
++	env_clear = 0;
++	shebang_depth = 0;
++	shebang_err = 0;
+ 
+ 	cmd_flag = 0;
+ 	cmd_is_exec = 0;
+@@ -11150,6 +11440,24 @@
+ 			find_command(arglist.list->text, &cmdentry,
+ 					cmd_flag | DO_REGBLTIN, pathval());
+ 
++			/* wasi-sh: a name with a slash resolves to CMDNORMAL
++			 * with u.index == -1 (find_command()'s slash short
++			 * circuit) and has nowhere left to go — there is no
++			 * exec in this build. Before giving up on it, read its
++			 * "#!" line: that is what makes `./vendor/bin/phpunit`
++			 * a command rather than a 127. A refusal is remembered,
++			 * not raised, because only the dispatch below can set
++			 * an exit status without killing the script. */
++			if (cmdentry.cmdtype == CMDNORMAL) {
++				int n = shebang_expand(&arglist, shebang_depth);
++				if (n > 0) {
++					shebang_depth++;
++					continue;
++				}
++				if (n < 0)
++					shebang_err = 126;
++			}
++
+ 			vlocal++;
+ 
+ 			/* implement bltin and command here */
+@@ -11162,6 +11470,15 @@
+ 				vlocal = !spclbltin;
+ 			}
+ 			cmd_is_exec = cmdentry.u.cmd == EXECCMD;
++			/* wasi-sh: `env [-i] [-u NAME]... [VAR=val]... cmd`,
++			 * stripped here exactly like `command`, so the command
++			 * word goes back through find_command() and can be a
++			 * function, a builtin, an applet or a host builtin. */
++			if (cmdentry.u.cmd == ENVCMD) {
++				if (parse_env_args(&arglist, &argp, &envlist, &env_clear))
++					continue;
++				break;
++			}
+ #if ENABLE_ASH_CMDCMD
+ 			if (cmdentry.u.cmd != COMMANDCMD)
+ 				break;
+@@ -11241,6 +11558,29 @@
+ 			setvareq((*spp)->text, vflags);
+ 	}
+ 
++	/* wasi-sh: and now `env`'s, which had to wait for pushlocalvars() above.
++	 * -i first, so `env -i FOO=1 cmd` keeps FOO. A recorded word with an
++	 * `=` is an assignment, a bare name is a -u. They are NOT added to
++	 * varlist: mklocal() puts them in vartab with VEXPORT, which is where
++	 * the applet and host-builtin arms below read the environment from, and
++	 * listing them twice would hand a duplicate to the command. */
++	if (env_clear || envlist.list) {
++		const struct strlist *esp;
++
++		if (env_clear && vlocal)
++			env_clear_exported();
++		for (esp = envlist.list; esp; esp = esp->next) {
++			int isassign = (*endofname(esp->text) == '=');
++
++			if (vlocal)
++				mklocal(esp->text, isassign ? VEXPORT : 0);
++			else if (isassign)
++				setvareq(esp->text, vflags);
++			else
++				unsetvar(esp->text);
++		}
++	}
++
+ 	/* Print the command if xflag is set. */
+ 	if (xflag && !inps4) {
+ 		const char *pfx = "";
+@@ -11382,6 +11722,15 @@
+ 		 * reaches the echo. Report it the way a path miss is reported
+ 		 * instead: a plain 127 "not found", and carry on.
+ 		 * (Delete this block if exec ever becomes possible.) */
++		/* wasi-sh: a "#!" file we refused (loop, over-long line, no
++		 * interpreter, a nested shell). shebang_expand() already said
++		 * which and named the file; 126 is "found, but cannot be run",
++		 * which is what a real shell reports for a bad interpreter. */
++		if (shebang_err) {
++			status = shebang_err;
++			flush_stdout_stderr();
++			goto bail;
++		}
+ 		ash_msg("%s: %s", argv[0], errmsg(ENOENT, E_EXEC));
+ 		status = 127;
+ 		flush_stdout_stderr();
