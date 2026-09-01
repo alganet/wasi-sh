@@ -15,8 +15,13 @@ import { compileWasm } from '../src/node.mjs';
 let wasm;
 before(async () => { wasm = await compileWasm(); });
 
-const HOSTB_READY = () => WebAssembly.Module.imports(wasm)
-  .some((i) => i.module === 'env' && i.name === '__host_builtin_run');
+const imported = (name) => WebAssembly.Module.imports(wasm)
+  .some((i) => i.module === 'env' && i.name === name);
+const HOSTB_READY = () => imported('__host_builtin_run');
+// The applet half is a second, later hook: a wasm that predates it answers
+// nothing at a safe point, so those tests would sit at their deadline rather
+// than skip. Gate them on the import they actually need.
+const INTR_READY = () => imported('__host_interrupt');
 
 // The node twin of src/worker.mjs, with three host builtins. `spin` is a
 // runtime that will not stop on its own — the showstopper case from MOAR §4.4,
@@ -62,14 +67,14 @@ const TWIN = `
   parentPort.postMessage({ type: 'exit', code, out });
 `;
 
-function spawnTwin(script) {
+function spawnTwin(script, files = {}) {
   const sab = createRing();
   const writer = new RingWriter(sab);
   const worker = new Worker(TWIN, {
     eval: true,
     workerData: {
       module: wasm,
-      files: { '/t.sh': script },
+      files: { ...files, '/t.sh': script },
       args: ['busybox', 'sh', '/t.sh'],
       env: { PATH: '/', LC_ALL: 'C' },
       sab,
@@ -90,7 +95,30 @@ function spawnTwin(script) {
   // Resolve once the guest has printed `re` — the builtin is running NOW, which
   // is the only moment an interrupt means anything.
   const awaitOutput = (re) => new Promise((resolve) => { waiters.push({ re, resolve }); check(); });
-  return { writer, exited, awaitOutput };
+  // The applet tests below run commands that do not stop on their own — that is
+  // the whole point of them — so an undelivered interrupt is a HANG, and a test
+  // that hangs reports nothing. Bound it here rather than in each test.
+  const finish = async (ms = 8000) => {
+    let timer;
+    const late = new Promise((r) => { timer = setTimeout(() => r(null), ms); });
+    const m = await Promise.race([exited, late]);
+    clearTimeout(timer);
+    if (m === null) { worker.terminate(); assert.fail(`no interrupt was delivered within ${ms}ms — the command still holds the guest`); }
+    return m;
+  };
+  return { writer, exited, awaitOutput, finish };
+}
+
+// The cue-then-post shape every "was it interrupted" test below shares. The
+// count is read when the applet STARTS, so an interrupt only means something if
+// it is posted after that — `echo` is an ash builtin and runs before the applet
+// exists, and the round trip through the parent's event loop takes far longer
+// than the shell needs to reach the next command. The extra pause makes that
+// ordering a margin rather than an argument.
+async function interruptOnce(twin) {
+  await twin.awaitOutput(/^go$/m);
+  await new Promise((r) => setTimeout(r, 30));
+  twin.writer.interrupt();
 }
 
 test('session.interrupt() gets a busy host builtin back, and the shell survives', async (t) => {
@@ -134,6 +162,105 @@ test('an interrupt with nothing running does not cancel the command after it', a
   writer.interrupt();                     // ^C with nothing running
   const m = await exited;
   assert.match(m.out, /rc=7/, 'brief ran to completion; it did not inherit the earlier ^C');
+});
+
+// ---- the applet half: the same count, read by the guest itself -------------
+// A host builtin opts in by calling ctx.interrupted(). An applet cannot: it is
+// busybox's code, not the embedder's. So the safe points are the shim's —
+// wrapped read/write/readv/writev, plus the two applet loops that can spin
+// without touching a descriptor — and the bail is die_func, the longjmp
+// run_nofork_applet already installs for a dying xfunc. Each of these is a
+// command that does NOT stop on its own; against the previous binary every one
+// of them runs to its own end and answers something other than 130.
+
+test('an applet writing through stdio is interrupted, and the shell survives', async (t) => {
+  if (!INTR_READY()) { t.skip('dist/busybox.wasm predates the applet interrupt — run npm run build:wasm'); return; }
+  // seq goes out through printf, so this is the writev path: wasi-libc's
+  // __stdio_write calls writev, and wrapping write alone would leave every
+  // applet that printf()s uninterruptible.
+  const twin = spawnTwin('echo go; seq 1 2000000000 > /dev/null; echo "rc=$?"; echo alive');
+  await interruptOnce(twin);
+  const m = await twin.finish();
+  assert.match(m.out, /rc=130/, 'the applet bailed at a safe point with 128+SIGINT');
+  assert.match(m.out, /alive/, 'the shell ran the next command — this is not terminate()');
+  assert.equal(m.code, 0, 'and exited normally');
+});
+
+test('an applet reading through libbb is interrupted', async (t) => {
+  if (!INTR_READY()) { t.skip('dist/busybox.wasm predates the applet interrupt — run npm run build:wasm'); return; }
+  // cat copies with safe_read/full_write rather than stdio, so this is the
+  // read/write pair. Bounded work rather than an endless command on purpose: a
+  // build where the wrap did not take answers rc=0 in a few seconds and says
+  // so, which is a better failure than the deadline expiring.
+  const big = new Uint8Array(4 * 1024 * 1024).fill(0x61);
+  const twin = spawnTwin(`echo go; cat ${'/big '.repeat(2000)}> /dev/null; echo "rc=$?"; echo alive`, { '/big': big });
+  await interruptOnce(twin);
+  const t0 = Date.now();
+  const m = await twin.finish();
+  assert.match(m.out, /rc=130/, 'the copy loop stopped at its next read');
+  assert.match(m.out, /alive/, 'and the shell kept its filesystem and its next command');
+  assert.ok(Date.now() - t0 < 2000, 'it stopped where it was, not at the end of 8 GB');
+});
+
+test("what an interrupted applet had buffered goes where the applet was writing", async (t) => {
+  if (!INTR_READY()) { t.skip('dist/busybox.wasm predates the applet interrupt — run npm run build:wasm'); return; }
+  // The bail is a longjmp past the flush, and a shell's redirections are popped
+  // when the command returns — so buffered output left for later is written
+  // into whatever the NEXT command has on fd 1. Up to a full stdio block of
+  // `seq` digits landed in `/b.txt` in place of `hi`, and on the terminal in
+  // place of nothing.
+  const twin = spawnTwin(
+    'echo go; seq 1 2000000000 > /a.txt; echo "rc=$?"; echo hi > /b.txt; cat /b.txt; echo alive');
+  await interruptOnce(twin);
+  const m = await twin.finish();
+  assert.match(m.out, /rc=130/);
+  assert.match(m.out, /^hi$/m, '/b.txt is what the command after the ^C put there');
+  assert.equal(/[0-9]{4,}/.test(m.out), false, `no digits leaked onto the terminal: ${JSON.stringify(m.out)}`);
+});
+
+// There is no test for bb_intr_done()'s other half — the window between an
+// applet RETURNING and the flush that delivers what it buffered, where a ^C
+// would turn a command that had already finished into a 130. It is a handful of
+// instructions wide and nothing on this side can aim at it; the guard costs one
+// store and the failure it prevents is a wrong answer, which is the trade that
+// decides it.
+
+test("awk's interpreter loop is a safe point of its own", async (t) => {
+  if (!INTR_READY()) { t.skip('dist/busybox.wasm predates the applet interrupt — run npm run build:wasm'); return; }
+  // The motivating case, and the one the wrapped descriptors cannot reach: a
+  // loop that never touches one. awk prints its own cue and flushes it, because
+  // stdout here is not a tty and stdio would otherwise hold the line.
+  const twin = spawnTwin(`awk 'BEGIN { print "go"; fflush(); for (;;) i++ }'; echo "rc=$?"; echo alive`);
+  await interruptOnce(twin);
+  const m = await twin.finish();
+  assert.match(m.out, /rc=130/, 'the interpreter checked between two statements');
+  assert.match(m.out, /alive/, 'and the shell survived it');
+});
+
+test("sed's branch target is a safe point of its own", async (t) => {
+  if (!INTR_READY()) { t.skip('dist/busybox.wasm predates the applet interrupt — run npm run build:wasm'); return; }
+  // `b` with no label jumps to the end of the script and starts the cycle over
+  // without reading a line or printing one — the second loop in this build that
+  // no descriptor sees.
+  const twin = spawnTwin(`echo go; printf 'x\\n' | sed ':a;ba'; echo "rc=$?"; echo alive`);
+  await interruptOnce(twin);
+  const m = await twin.finish();
+  assert.match(m.out, /rc=130/, 'the cycle stopped at its branch target');
+  assert.match(m.out, /alive/, 'and the shell survived it');
+});
+
+test('an interrupt with nothing running does not cancel the applet after it', async (t) => {
+  if (!INTR_READY()) { t.skip('dist/busybox.wasm predates the applet interrupt — run npm run build:wasm'); return; }
+  // The count-not-a-flag invariant again, one layer down: the applet takes its
+  // baseline when run_nofork_applet enters, so a ^C already in the count is one
+  // it was never sent. `read -t 1` puts the shell demonstrably between commands
+  // while the interrupt is posted.
+  const twin = spawnTwin('echo mark; read -t 1 _; seq 1 3; echo "rc=$?"');
+  await twin.awaitOutput(/mark/);
+  twin.writer.interrupt();
+  const m = await twin.finish();
+  assert.match(m.out, /1\n2\n3\n/, 'seq ran in full');
+  assert.match(m.out, /rc=0/, 'and did not inherit the earlier ^C');
 });
 
 test('session.interrupt() hands the ^C to the stdin ring, not to postMessage', async () => {

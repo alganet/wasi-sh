@@ -1,0 +1,111 @@
+wasi-sh: deliver a cooperative ^C to a running applet.
+
+There are no signals in wasm, so an applet that will not stop holds the
+worker and terminate() is the only way out — which takes the filesystem
+and every warm instance with it. The host raises a monotonic COUNT in the
+stdin ring (src/ring.mjs) and this side compares it at safe points; a
+difference bails through die_func, the longjmp run_nofork_applet already
+installs for a dying xfunc, with status 130 (128+SIGINT).
+
+Nothing here knows about wasm. bb_intr_enter/leave/check live in
+build/shim/wasistubs.c, which owns the env.__host_interrupt import, and
+the shim also supplies the safe points that cost no applet anything:
+read/write/readv/writev are wrapped at libc, so every applet that reads
+its input or prints its output is interruptible without being told.
+
+The two hunks that name an applet are the two loops in this build that
+can run for ever without touching a descriptor — awk's interpreter and
+sed's branch target — where the wrapped I/O never comes round. Every
+other applet needs no edit at all. Those two use bb_intr_poll() rather
+than the check itself: a cross-TU call plus an import on every node cost
+13% of awk's throughput, measured, and sampling one turn in 256 costs
+nothing and delays a ^C by microseconds.
+
+Applied last and unconditionally. It needs nothing from the other two
+patches, and its context avoids every line they touch, so --plain (which
+skips ash-forkfree.patch) applies it just the same.
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -1573,6 +1573,20 @@
+ extern smallint logmode;
+ extern uint8_t xfunc_error_retval;
+ extern void (*die_func)(void);
++/* wasi-sh: the cooperative interrupt's guest side. All three live in the shim
++ * (build/shim/wasistubs.c), which owns the env.__host_interrupt wasm import so
++ * that nothing here has to know one exists. bb_intr_check() is a SAFE POINT: it
++ * either returns or longjmps out through die_func with status 130. */
++void bb_intr_enter(void);
++void bb_intr_done(void);
++void bb_intr_leave(void);
++void bb_intr_check(void);
++/* The same safe point for a loop too hot to pay for one every turn: a
++ * decrement and a branch here, the real check every 256th. An interpreter's
++ * innermost loop measured 13% slower with the call in it, and a ^C that lands
++ * a few microseconds later is one nobody can tell from immediate. */
++extern unsigned bb_intr_ticks;
++static ALWAYS_INLINE void bb_intr_poll(void) { if (!--bb_intr_ticks) bb_intr_check(); }
+ void xfunc_die(void) NORETURN FAST_FUNC;
+ #if !ENABLE_SHOW_USAGE
+ #define bb_show_usage() xfunc_die()
+--- a/libbb/vfork_daemon_rexec.c
++++ b/libbb/vfork_daemon_rexec.c
+@@ -106,4 +106,9 @@
+ 
+ 	save_nofork_data(&old);
++	/* wasi-sh: from here to bb_intr_leave() below, a ^C posted by the host
++	 * cancels this command. Nested (xargs, find -exec) is counted, not
++	 * re-armed: the baseline belongs to the outermost applet, and a fresh one
++	 * per child would silently drop an interrupt posted before it started. */
++	bb_intr_enter();
+ 
+ 	logmode = LOGMODE_STDIO;
+@@ -133,8 +138,21 @@
+ 		rc = applet_main[applet_no](argc, tmp_argv);
+ 
++		/* wasi-sh: the applet has returned, so its status is decided and
++		 * what is left is delivering what it buffered. A ^C landing in the
++		 * flush below would cancel a command that had already finished. */
++		bb_intr_done();
+ 		/* Important for shells: `which CMD` was failing */
+ 		fflush_all();
++		bb_intr_leave();
+ 	} else {
+ 		/* xfunc died in NOFORK applet */
++		/* wasi-sh: and a DYING applet's buffered output has to leave here
++		 * too, which upstream never needed: the redirections it ran under
++		 * are still installed at this point and are gone by the time the
++		 * shell would flush, so `seq … > f` interrupted used to write its
++		 * last block into whatever the NEXT command had on fd 1. */
++		bb_intr_done();
++		fflush_all();
++		bb_intr_leave();
+ 	}
+ 
+--- a/editors/awk.c
++++ b/editors/awk.c
+@@ -3016,6 +3016,11 @@
+ 		node *op1;
+ 		var *old_Fields_ptr;
+ 
++		/* wasi-sh: a safe point. awk is one of the two applets here with a
++		 * loop that can run for ever without touching a descriptor, so the
++		 * read/write safe points never come round for `while (1) x++`. */
++		bb_intr_poll();
++
+ 		opinfo = op->info;
+ 		opn = (opinfo & OPNMASK);
+ 		g_lineno = op->lineno;
+--- a/editors/sed.c
++++ b/editors/sed.c
+@@ -1136,6 +1136,11 @@
+ 	for (sed_cmd = G.sed_cmd_head; sed_cmd; sed_cmd = sed_cmd->next) {
+ 		int old_matched, matched;
+ 
++		/* wasi-sh: the other loop that needs no descriptor. `b` moves
++		 * sed_cmd inside this loop rather than restarting the cycle, so
++		 * `sed ':a;ba'` never reads a line, prints one, or leaves here. */
++		bb_intr_poll();
++
+ 		old_matched = sed_cmd->in_match;
+ 		if (!old_matched)
+ 			sed_cmd->end_line = sed_cmd->end_line_orig;

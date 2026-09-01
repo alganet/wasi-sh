@@ -252,9 +252,10 @@ drains looks exactly like one that saved.
   grows slowly and wasm memory is never returned — plan to
   `session.terminate()` and respawn long-lived sessions eventually.
 - **A busy command can only be interrupted if it agrees to be.**
-  `session.interrupt()` delivers a cooperative ^C (below), which a host builtin
-  can act on — but a busybox applet cannot yet, so a long `awk` still holds the
-  worker until it finishes (`terminate()` remains the answer there).
+  `session.interrupt()` delivers a cooperative ^C (below). Applets and host
+  builtins both stop; the *shell's* own loops do not, so `while :; do :; done`
+  typed at the prompt still wants `terminate()`, and so does a command parked
+  in a blocking read.
 - **No symlinks, permissions, or timestamps** in the sandbox FS (`ln` is
   deliberately absent; `ls -l` shows placeholders).
 - A tool that fails or even calls `exit` only sets `$?` — the shell and
@@ -349,9 +350,17 @@ term.attachCustomKeyEventHandler((e) => {          // ^C → interrupt
 Note the `commandRunning` guard. At the prompt, `^C` is a byte the shell wants
 for its own line editing, so a terminal that swallows `0x03` unconditionally
 takes it away from the guest. And *cooperative* is the whole contract: it
-cancels what chose to look. Host builtins can (`ctx.interrupted()`, below);
-busybox applets cannot yet, so `terminate()` is still the answer for a runaway
-`awk`.
+cancels what chose to look, and the count says what "look" means — a ^C posted
+while nothing is running cancels nothing, rather than waiting to cancel the next
+thing you type.
+
+**Applets look on your behalf.** A runaway `seq`, `cat`, `grep`, `sort`, `awk`
+or `sed` stops at its next read, write or loop turn and the shell reads 130 in
+`$?`, with its filesystem and every warm instance intact. **Host builtins look
+for themselves** — `ctx.interrupted()`, below. What is *not* reached is the
+shell itself: a loop written in shell runs no applet, and a command parked in a
+blocking read has no bytes to wake it. `terminate()` is still the answer for
+those two.
 
 Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`

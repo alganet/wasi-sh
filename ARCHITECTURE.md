@@ -33,11 +33,11 @@ a staged queue for `run()`.
 A minimal preview1 implementation (27 imports total) plus `env.*` hooks: four
 that back busybox's fork-free machinery (`__host_pipe`/`__host_dup`/`__host_dup2`
 /`__host_trace`), two for terminal geometry (`__host_winsize`/`__host_winch`,
-see "Terminal resize" below), and two for host builtins
-(`__host_builtin_lookup`/`__host_builtin_run`, see "Host builtins" below).
-Eight in total — and still eight with the host port and the cooperative
-interrupt, which are a device and a ring word rather than imports (see "The host
-port" and "Cooperative interrupt" below).
+see "Terminal resize" below), two for host builtins
+(`__host_builtin_lookup`/`__host_builtin_run`, see "Host builtins" below), and
+one for the cooperative interrupt (`__host_interrupt`, below). Nine in total —
+and the host port added none of them: it is a pair of devices reached through
+`path_open`, not a hook.
 
 **Filesystem.** A pluggable store (see "The `fs` contract" below), defaulting
 to `memoryFs(files)` — so a shim with no `fs` is the sealed in-memory sandbox
@@ -242,11 +242,35 @@ opted in would be `terminate()` wearing a nicer name.
   the user never typed. With a count, work reads the value at entry and compares
   at its own safe points: an interrupt reaches exactly what was in flight when
   it was posted.
-- **Where the check goes.** `__host_builtin_run` records the count before
-  dispatch and hands the handler `ctx.interrupted()`. The handler runs on the
-  guest's own stack, so nothing can unwind it from outside — polling is not a
-  simplification, it is the only shape available. Returning 130 (128 + SIGINT)
-  gives the script the `$?` it expects.
+- **Where the check goes, for a host builtin.** `__host_builtin_run` records the
+  count before dispatch and hands the handler `ctx.interrupted()`. The handler
+  runs on the guest's own stack, so nothing can unwind it from outside —
+  polling is not a simplification, it is the only shape available. Returning
+  130 (128 + SIGINT) gives the script the `$?` it expects.
+- **Where the check goes, for an applet.** An applet is busybox's code, not the
+  embedder's, so it cannot opt in and something has to opt in for it.
+  `env.__host_interrupt` (the ninth import) reads the same count;
+  `run_nofork_applet` records the baseline at the *outermost* applet, since
+  `xargs` and `find -exec` nest through the same function and a fresh baseline
+  per child would drop an interrupt posted before it started; and the bail is
+  `die_func`, the longjmp that function already installs for a dying xfunc,
+  which restores every global the applet scribbled on. `xfunc_error_retval` is
+  130, so the shell reads the same `$?` a builtin would have returned. See
+  `build/applet-interrupt.patch` and `build/shim/wasistubs.c`.
+- **The safe points are the shim's, not the applets'.** `read`, `write`,
+  `readv` and `writev` are wrapped at libc, so every applet that reads its input
+  or prints its output is interruptible without an edit: `read`/`write` carry
+  libbb's own loops and `readv`/`writev` carry stdio's, which is what wasi-libc
+  puts under `printf`. The check is **before** the call rather than after, on
+  both paths — a longjmp out of the middle of stdio's flush leaves bytes the
+  `FILE` still believes are unwritten, and the next flush would emit them a
+  second time. Two loops in this build spin without touching a descriptor and
+  get a check of their own: `awk`'s interpreter and `sed`'s branch target.
+  Those two **sample** rather than check — `bb_intr_poll()` is a decrement and
+  a branch, with the real check every 256th turn. A cross-TU call plus an
+  import on every AST node cost **13% of awk's throughput**, measured; sampling
+  costs nothing measurable and delays a ^C by microseconds. On the I/O paths
+  the check is unsampled, because a read or a write already dwarfs it.
 - **It does not end a blocking read.** The wake returns from `Atomics.wait`, but
   no bytes have appeared, so `pollReadable`/`readBlocking` re-park. An
   interrupt is not stdin input, and making a read fail on one would need the
@@ -255,10 +279,12 @@ opted in would be `terminate()` wearing a nicer name.
   `run()` and any fixed stdin degrade to a permanently false `interrupted()` —
   the same "no info rather than an error" contract `winsize` follows.
 
-**Busybox applets cannot be interrupted yet.** That half needs the check in C —
-a count comparison at applet and loop boundaries, bailing through the existing
-`die_func` longjmp — and a wasm rebuild. Until then a runaway `awk` still wants
-`terminate()`. The transport is the same one either half reads.
+**What is still not reached.** The *shell* is not: `while :; do :; done` typed
+at the prompt runs no applet, and ash's own way out of a loop is its `EXINT`
+exception, which kills a non-interactive shell outright rather than the command
+in it — a different mechanism with different semantics, not a missing line. Nor
+is a command parked in a blocking `read`, for the reason above. `terminate()` is
+still the answer for both.
 
 ## Fork-free ash (`build/ash-forkfree.patch`)
 
@@ -664,16 +690,19 @@ duration, inbound or outbound, exactly like a blocking read.
 
 Pinned busybox tarball (SHA-256-verified) + the fork-free patch + the
 host-builtin patch (applied unconditionally: it depends on none of the
-fork-free machinery, and carries the slashed-name fix) + an
-ash-plus-applets config, cross-compiled with zig cc (or wasi-sdk) to plain
-wasm32-wasi. Notable quirks, each earned the hard way:
+fork-free machinery, and carries the slashed-name fix) + the applet-interrupt
+patch (also unconditional; its context is pristine, so it composes with the
+other two in any order) + an ash-plus-applets config, cross-compiled with zig
+cc (or wasi-sdk) to plain wasm32-wasi. Notable quirks, each earned the hard
+way:
 
 - ash needs setjmp/longjmp: `-mexception-handling -mllvm -wasm-enable-sjlj`
   plus `-mllvm -wasm-use-legacy-eh=false` for the standard EH encoding.
 - kbuild's per-directory `ld -r` maps to `wasm-ld --relocatable`; the final
   link is raw `wasm-ld` with `--import-undefined` (leaves the `env.__host_*`
-  hooks as imports), `--wrap fcntl` (F_DUPFD → `__host_dup`), and
-  `--wrap exit` (applet exit containment, above).
+  hooks as imports), `--wrap fcntl` (F_DUPFD → `__host_dup`),
+  `--wrap exit` (applet exit containment, above) and
+  `--wrap read/write/readv/writev` (the interrupt's safe points, above).
 - `libbb/xconnect.o` is dropped from Kbuild.src (socket code; no sockets in
   wasi preview1).
 - **Signal-mask stubs must never write through their pointers**: wasi-libc's

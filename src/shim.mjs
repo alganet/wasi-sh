@@ -458,6 +458,14 @@ export class WasiShim {
         // Both degrade to "no info" when input has no winsize (run() mode).
         __host_winsize:(rowsPtr,colsPtr)=>{ const ws=(w.input&&w.input.winsize)?w.input.winsize():{rows:0,cols:0}; w.dv().setUint32(rowsPtr,ws.rows>>>0,true); w.dv().setUint32(colsPtr,ws.cols>>>0,true); },
         __host_winch:()=> (w.input&&w.input.takeWinch&&w.input.takeWinch())?1:0,
+        // The cooperative interrupt, read by the GUEST rather than raised at
+        // it: a monotonic count the applet in flight compares against the value
+        // it started at (build/shim/wasistubs.c, build/applet-interrupt.patch).
+        // Nothing is consumed here, so an interrupt posted while no applet is
+        // running has nobody to cancel and cancels nobody. Degrades to a
+        // constant 0 without an interrupt channel — run(), a fixed stdin — which
+        // is the same "no info" contract the two hooks above have.
+        __host_interrupt:()=> (w.input&&w.input.interruptCount)?w.input.interruptCount():0,
         // ---- host builtins: the shell's command namespace, extended in JS ----
         // ash resolves a name against functions, builtins, then the applet
         // table; these two hooks sit where the PATH search (which can never

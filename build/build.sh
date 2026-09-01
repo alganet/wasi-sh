@@ -124,6 +124,13 @@ fi
 # "can't fork" and status 2 instead of reporting 127.
 patch -p1 -d "$BB" < "$here/ash-hostbuiltin.patch"
 
+# Cooperative interrupt, applet side: run_nofork_applet arms a baseline, and
+# the safe points (wrapped read/write/readv/writev below, plus awk's and sed's
+# own loops) bail through die_func with 130 when the host's count has moved.
+# Also UNCONDITIONAL: it needs nothing from the two patches above and its
+# context avoids every line they touch, so --plain applies it just the same.
+patch -p1 -d "$BB" < "$here/applet-interrupt.patch"
+
 # --- configure (ash-only + LFS + read-frac + math-base) ------------------------
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null
@@ -247,6 +254,11 @@ fi
 #   waits in poll(); __wrap_poll runs winch_dispatch() after every poll so a
 #   host-posted resize fires ash's captured WINCH handler. Covers ppoll.c too
 #   (its poll() call is wrapped as well).
+# --wrap read/write/readv/writev: the safe points of the cooperative interrupt.
+#   read/write carry libbb's own loops (safe_read, full_write) and readv/writev
+#   carry stdio's — wasi-libc's __stdio_write goes through writev, so wrapping
+#   write alone leaves everything that printf()s uninterruptible. Wrapped at
+#   libc so no applet needs an edit; see wasistubs.c's bb_intr_check().
 #
 # --strip-debug: DWARF dominated this binary — about 1.05 MB of a 1.55 MB
 #   module, two thirds of what every browser had to download, for debug info
@@ -256,6 +268,7 @@ fi
 #   and keeps wasm stack traces readable. Build with --debug to keep DWARF.
 OUT="$work/busybox.wasm"
 $WASM_LD --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
+  --wrap read --wrap write --wrap readv --wrap writev \
   --wrap __wasilibc_fd_renumber \
   $([ "$DEBUG" = yes ] || echo --strip-debug) \
   "$CRT" "$BB/libbb/appletlib.o" "$BB/applets/applets.o" \
