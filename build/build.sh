@@ -144,6 +144,11 @@ patch -p1 -d "$BB" < "$here/ash-nested-shell.patch"
 # context avoids every line they touch, so --plain applies it just the same.
 patch -p1 -d "$BB" < "$here/applet-interrupt.patch"
 
+# The "#!" rule, extended to the PATH search. Applied LAST so no earlier patch
+# has to apply over it: it edits find_command(), which ash-hostbuiltin.patch
+# also touches, and shebang_expand(), which ash-shebang.patch introduces.
+patch -p1 -d "$BB" < "$here/ash-shebang-path.patch"
+
 # --- configure (ash-only + LFS + read-frac + math-base) ------------------------
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null
