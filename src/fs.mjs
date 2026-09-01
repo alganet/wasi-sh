@@ -451,6 +451,13 @@ const QUEUEING_METHODS = [
   'writeSync', 'touchSync',
 ];
 
+/**
+ * Of those, the ones the backend cannot do against an index entry alone —
+ * every one of them ends in `remove()` or a read of the real file. See the
+ * `hollow` set in `persistentFs`.
+ */
+const NEEDS_A_REAL_FILE = new Set(['unlinkSync', 'renameSync', 'linkSync', 'rmdirSync']);
+
 const PREPARED = Symbol.for('wasi-sh.persistentFs');
 
 /**
@@ -585,9 +592,54 @@ export async function persistentFs(backing, options = {}) {
     queue.catch(record);
   };
 
+  // Files the backend has an INDEX ENTRY for and no file behind.
+  //
+  // `IndexFS.mkdir` calls `this._mkdir?.()` and `IndexFS.createFile` calls
+  // nothing — there is no `_createFile` hook for a backend to implement — so
+  // an index-backed async store materialises a directory and does not
+  // materialise an empty file. `@zenfs/dom`'s `WebAccessFS` creates the OPFS
+  // entry lazily, inside `write()`, so a file nothing ever writes to lives in
+  // the index and the sync cache and nowhere a reload can find it.
+  //
+  // Two things follow, and both were seen in a browser:
+  //
+  //   * `touch a` at a prompt does not survive the tab. Nothing wrote the
+  //     file, so OPFS never got one, and the next hydrate reads a directory it
+  //     is not in.
+  //   * `rm a` FAILS THE STORE. `remove()` is `removeEntry()` on a name the
+  //     directory has never had — NotFoundError — and `IndexFS.rename` removes
+  //     the source too, so `mv` is the same call. That failure latches here and
+  //     the guest raises it at its next write, so `touch a; rm a` leaves every
+  //     later `mkdir` an I/O error for the rest of the session.
+  //
+  // The fix is to write the file once with nothing in it, which is the
+  // smallest call that makes the backend produce a handle. LAZILY, at the
+  // points that need the file to be real: the ordinary shape is a create with
+  // a write right behind it — that is every file of a seeded project — and
+  // materialising eagerly would put a second write-back on each of them for a
+  // tree where none was needed.
+  //
+  // ZENFS.md finding 10. Drop this the day `createFile` reaches the backend.
+  const hollow = new Set();
+  const materialize = (path) => {
+    if (!hollow.delete(path)) return;
+    // Through `backing.writeSync` rather than the captured original, so the
+    // wrapper below still sees it and the queue is still watched.
+    try { backing.writeSync(path, EMPTY, 0); }
+    catch (err) { record(err); }
+  };
+  const materializeUnder = (root) => {
+    if (!hollow.size) return;
+    if (hollow.has(root)) { materialize(root); return; }
+    for (const path of [...hollow]) if (path.startsWith(`${root}/`)) materialize(path);
+  };
+  const materializeAll = () => { for (const path of [...hollow]) materialize(path); };
+
   // A store with nothing asynchronous behind it queues nothing, so there is
   // nothing to watch and its writes throw from the call itself. Wrapping every
-  // method to watch a queue that will never exist is pure cost, so don't.
+  // method to watch a queue that will never exist is pure cost, so don't — and
+  // a synchronous backend has no hollow files either, since its `createFile`
+  // IS the write.
   if (backing._promise && typeof backing._promise.catch === 'function') {
     for (const method of QUEUEING_METHODS) {
       const original = backing[method];
@@ -598,8 +650,21 @@ export async function persistentFs(backing, options = {}) {
       const named = `persistentFs__after_${method.slice(0, -4)}`;
       backing[method] = {
         [named]: (...args) => {
-          try { return original.apply(backing, args); }
-          finally { watch(); }
+          // Anything that asks the backend to touch the FILE, rather than the
+          // index in front of it, gets the hollow ones under its path written
+          // out first. `rmdirSync` is on the list for completeness: a store
+          // that refuses a non-empty rmdir can never reach it, and one that
+          // allows it would otherwise leave a hollow entry under a directory
+          // that is gone.
+          if (NEEDS_A_REAL_FILE.has(method)) materializeUnder(String(args[0]));
+          try {
+            const result = original.apply(backing, args);
+            // Only on the way OUT, so a create the cache refused is not
+            // remembered as a file needing a write.
+            if (method === 'createFileSync') hollow.add(String(args[0]));
+            else if (method === 'writeSync') hollow.delete(String(args[0]));
+            return result;
+          } finally { watch(); }
         },
       }[named];
     }
@@ -617,6 +682,9 @@ export async function persistentFs(backing, options = {}) {
    */
   Object.defineProperty(backing, 'flush', {
     value: async function flush() {
+      // Before the sync, not after: materializing QUEUES a write, and this
+      // call's whole promise is that the queue is empty when it returns.
+      materializeAll();
       if (typeof backing.sync === 'function') await backing.sync();
       watch();
       // One turn, so a rejection the line above only just attached to has been
@@ -635,6 +703,7 @@ export async function persistentFs(backing, options = {}) {
   // has a real one to do.
   const syncSync = backing.syncSync;
   backing.syncSync = function persistentFs__flushPoint() {
+    materializeAll();
     if (typeof syncSync === 'function') syncSync.call(backing);
     raise();
   };

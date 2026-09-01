@@ -50,6 +50,24 @@ async function runScenario() {
       fs.writeSync('/a.txt', ENC.encode('sync me'), 0);
       fs.syncSync();
       say('synced');
+    } else if (scenario === 'empty-file') {
+      fs.createFileSync('/empty.txt', NEW_FILE);
+      fs.syncSync();
+      say('made');
+    } else if (scenario === 'touch-then-remove') {
+      // What a prompt does: `touch a; rm a`. Both halves are ordinary calls
+      // and the guest never learns that the backend saw neither.
+      fs.createFileSync('/scratch.txt', NEW_FILE);
+      fs.unlinkSync('/scratch.txt');
+      fs.syncSync();
+      // The store has to still take writes. A write-back failure latches, and
+      // journalFs raises it at the NEXT mutation — so this is the call that
+      // used to be EIO, with `mkdir: I/O error` at the prompt behind it.
+      fs.mkdirSync('/after', NEW_DIR);
+      fs.createFileSync('/after/ok.txt', NEW_FILE);
+      fs.writeSync('/after/ok.txt', ENC.encode('still working'), 0);
+      fs.syncSync();
+      say('survived');
     } else if (scenario === 'reports-a-failure') {
       fs.createFileSync('/nope.txt', NEW_FILE);
       fs.writeSync('/nope.txt', ENC.encode('too much'), 0);

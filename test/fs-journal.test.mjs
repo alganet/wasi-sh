@@ -108,6 +108,35 @@ if (!zenfs) {
     await writer.stop();
   });
 
+  // The dev-environment shape of ZENFS.md finding 10: an empty file exists in
+  // the guest's cache and in the backend's index, and nowhere a reload can
+  // find it.
+  test('an empty file the guest made is on the backend too', async () => {
+    const backing = makeBacking(zenfs);
+    const writer = await journalWriter(await backing.make());
+    const guest = startGuest('empty-file', writer.sab, writer.snapshot);
+    assert.equal(await guest.next(), 'made');
+    assert.ok(backing.bytes.has('/empty.txt'), 'the backend never heard of the file');
+    await guest.done();
+    await writer.stop();
+  });
+
+  // And the failure that made it more than a missing file: the backend is
+  // asked to remove a name it never had, that failure latches, and the store
+  // refuses every write after it. At a prompt: `touch a; rm a`, and then
+  // `mkdir b` is an I/O error.
+  test('a file created and removed does not stop the store', async () => {
+    const backing = makeBacking(zenfs);
+    const seen = [];
+    const writer = await journalWriter(await backing.make(), { onError: (err) => seen.push(err) });
+    const guest = startGuest('touch-then-remove', writer.sab, writer.snapshot);
+    assert.equal(await guest.next(), 'survived');
+    assert.deepEqual(seen.map((err) => err.message), []);
+    assert.equal(DEC.decode(backing.bytes.get('/after/ok.txt')), 'still working');
+    await guest.done();
+    await writer.stop();
+  });
+
   test('a write-back that fails reaches the guest, with the reason', async () => {
     const backing = makeBacking(zenfs);
     const raw = await backing.make();

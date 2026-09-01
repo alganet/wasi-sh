@@ -37,7 +37,16 @@ export function makeBacking(core, seed = {}) {
       next.set(old); next.set(buffer, offset);
       bytes.set(path, next);
     }
-    async remove(path) { bytes.delete(path); }
+    // Faithful to OPFS on purpose: `removeEntry()` on a name the directory
+    // does not have throws NotFoundError, and a backend whose `remove` is a
+    // `Map.delete` cannot show what that costs. See ZENFS.md finding 10.
+    async remove(path) {
+      if (!bytes.has(path)) {
+        throw Object.assign(new Error('A requested file or directory could not be found at the time an operation was processed.'),
+          { code: 'ENOENT', errno: 2, path });
+      }
+      bytes.delete(path);
+    }
     removeSync() { /* the cache does the synchronous half */ }
     async _mkdir(path) { bytes.set(path, null); }
   }
