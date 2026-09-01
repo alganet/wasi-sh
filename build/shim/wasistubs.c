@@ -208,6 +208,96 @@ void __wrap_exit(int code){
   if (die_func) { xfunc_error_retval = (unsigned char)code; die_func(); }
   __real_exit(code);
 }
+
+/* ---- cooperative interrupt: the applet half (see ARCHITECTURE.md) ----
+ * wasm cannot be signalled, so a ^C is a monotonic COUNT the host raises in
+ * the stdin ring and a wake (ring.mjs, Session.interrupt()). __host_interrupt()
+ * reads it. A count rather than a flag because there is nothing to consume it:
+ * the work in flight records the value it started at and compares, so an
+ * interrupt reaches exactly that work and an interrupt posted while nothing is
+ * running cancels nothing. Identical to what ctx.interrupted() gives a host
+ * builtin, one layer down.
+ *
+ * The bail is busybox's own: die_func is the longjmp run_nofork_applet
+ * installs for a dying xfunc, and every global the applet scribbled on is
+ * restored on the way out. 130 is 128+SIGINT, which is what a script reads in
+ * $? for an interrupted command.
+ *
+ * enter/done/leave are called by build/applet-interrupt.patch, at
+ * run_nofork_applet and NOT at the shell — outside an applet die_func is NULL
+ * and there is nothing here to longjmp to. Nesting is counted because xargs and
+ * find -exec run their children through the same function: a nested baseline
+ * would hand the child a fresh count and lose an interrupt posted before it
+ * started. */
+extern int __host_interrupt(void);
+static int intr_count0;      /* the count when the OUTERMOST applet started */
+static unsigned intr_depth;  /* applet nesting (xargs, find -exec) */
+static int intr_quiet;       /* this frame is past the point of cancelling */
+static int intr_partial;     /* the last real write was short: a retry is live */
+/* The sampling counter behind bb_intr_poll() (libbb.h). An interpreter's
+ * innermost loop cannot afford a cross-TU call plus an import on every turn —
+ * measured at 13% of awk's throughput — and does not need one: 256 turns is a
+ * few microseconds, which is not a latency anybody can perceive in a ^C. The
+ * I/O safe points call bb_intr_check() directly, because a read or a write is
+ * already orders of magnitude dearer than the check. */
+unsigned bb_intr_ticks = 1;
+#define INTR_SAMPLE 256
+void bb_intr_enter(void){ bb_intr_ticks = 1; intr_partial = 0; if (intr_depth++ == 0) intr_count0 = __host_interrupt(); }
+/* No more cancelling in this frame. Raised by a bail on its way out, so the
+ * unwinding frame cannot fire again on its own cleanup, and by the patch once
+ * the applet has RETURNED: its status is decided and its buffered output still
+ * has to reach the descriptors it ran under, so a ^C landing during that flush
+ * would throw away a command that had already finished. */
+void bb_intr_done(void){ intr_quiet = 1; }
+void bb_intr_leave(void){ if (intr_depth) intr_depth--; intr_quiet = 0; }
+void bb_intr_check(void){
+  bb_intr_ticks = INTR_SAMPLE;
+  if (!intr_depth || intr_quiet || intr_partial || !die_func) return;
+  if (__host_interrupt() == intr_count0) return;
+  intr_quiet = 1;
+  xfunc_error_retval = 130;
+  die_func();                /* longjmp — does not return */
+}
+
+/* The safe points. read/write carry libbb's own loops (safe_read, full_write);
+ * readv/writev carry stdio's, which is what every applet that printf()s goes
+ * through — miss those and `seq 1 100000000` is uninterruptible. Wrapped at
+ * libc rather than in busybox so no applet needs to know this exists.
+ *
+ * Checked BEFORE the call, never after: a longjmp out of the middle of stdio's
+ * flush leaves bytes the FILE still believes are unwritten, and the next flush
+ * emits them a second time. Bailing first leaves the buffer untouched, and
+ * run_nofork_applet flushes it once on its way out — output produced before the
+ * ^C reaches the descriptors the command ran under, not the next command's.
+ *
+ * Never mid-retry either, which is the same hazard one loop out. A short write
+ * is real here — the shim reports one when a store refuses part of a gather —
+ * and __stdio_write retries the remainder WITHOUT advancing f->wpos, so a bail
+ * on the second turn would leave the FILE holding bytes that had already gone
+ * out. So a short answer parks the check until a write completes. */
+#include <sys/uio.h>   /* iovec + ssize_t; NOT unistd.h, whose getlogin_r
+                        * prototype collides with the stub defined above */
+static ssize_t intr_wrote(ssize_t r, size_t want){
+  intr_partial = (r >= 0 && (size_t)r < want);
+  return r;
+}
+extern ssize_t __real_read(int, void *, size_t);
+ssize_t __wrap_read(int fd, void *buf, size_t n){ bb_intr_check(); return __real_read(fd, buf, n); }
+extern ssize_t __real_readv(int, const struct iovec *, int);
+ssize_t __wrap_readv(int fd, const struct iovec *v, int c){ bb_intr_check(); return __real_readv(fd, v, c); }
+extern ssize_t __real_write(int, const void *, size_t);
+ssize_t __wrap_write(int fd, const void *buf, size_t n){
+  if (!intr_partial) bb_intr_check();
+  return intr_wrote(__real_write(fd, buf, n), n);
+}
+extern ssize_t __real_writev(int, const struct iovec *, int);
+ssize_t __wrap_writev(int fd, const struct iovec *v, int c){
+  size_t want = 0; int i;
+  if (!intr_partial) bb_intr_check();
+  for (i = 0; i < c; i++) want += v[i].iov_len;
+  return intr_wrote(__real_writev(fd, v, c), want);
+}
+
 /* sed -i and mktemp need mkstemp; emulate with O_CREAT|O_EXCL retries
  * (the shim's path_open enforces EXCL). */
 int mkstemp(char *t){
