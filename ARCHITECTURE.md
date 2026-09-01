@@ -574,15 +574,34 @@ calls `ash_main()` again inside the same instance. Two things were wrong:
   scratch.
 
 That state is written once as an X-macro (`ASH_STATE_LIST`) so the save and the
-restore cannot drift apart, and `build/build.sh` **re-derives the same list from
-the patched source and fails the build** if a busybox update adds a mutable
-static that is not named — the alternative is a nested shell that quietly
-corrupts one more thing than it used to. Nesting is capped at 8: there is no
-process to fall over and no fork to fail, so a script that runs itself would
-recurse until the wasm stack traps, which is unrecoverable and takes the
-session, the filesystem and every warm instance with it. What is *not* undone is
-the nested shell's own allocations — a few KB abandoned per nested shell, the
-same bargain every applet in this build makes.
+restore cannot drift apart, and `build/build.sh` **checks it against what the
+compiler says `ash.c` has, and fails the build** on a mutable global that is not
+named. It asks clang, not the source: LLVM IR marks every static `internal
+global` and read-only data `internal constant`, with every `#if` already
+resolved. Reading the source was tried first and was worse than useless — a
+regex over declarations matched only those ending in `;`, so every static with a
+trailing comment was invisible (three were), and a function-local static was
+invisible by construction (two were), all while reporting that nothing had
+drifted. A function-local static cannot be named in the list at all, so the
+guard calls those out by name and they get hoisted; `setinteractive()`'s two
+were.
+
+The list is **complete, not minimal**, and deliberately so. Much of it is scratch
+that happens to be dead across the call — `parsecmd()` re-initialises the
+parser's state at every entry, and the expander's is rebuilt per word — so
+trimming it to what demonstrably breaks would pass every test today and quietly
+stop covering whatever changes tomorrow. Completeness is a property the guard can
+check; minimality is not.
+
+Nesting is capped at 8: there is no process to fall over and no fork to fail, so
+a script that runs itself would recurse until the wasm stack traps, which is
+unrecoverable and takes the session, the filesystem and every warm instance with
+it. What is *not* undone is the nested shell's own allocations — a few KB
+abandoned per nested shell, the same bargain every applet in this build makes.
+One assumption is worth naming: `ttyfd` is a descriptor, and putting a number
+back does not reopen anything. That is sound only while a nested shell cannot
+close it, which holds because `setjobctl(0)` returns early unless job control is
+on and it never is — there is no `/dev/tty` to acquire.
 
 **This supersedes an earlier design statement.** Host builtins used to be
 deliberately unreachable by path, on the grounds that a virtual `/bin` would
