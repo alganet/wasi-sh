@@ -891,8 +891,15 @@ export class JournalFs {
     if (seq === this.#seenErr) return;
     this.#seenErr = seq;
     const len = Math.min(Atomics.load(this.#ctrl, J_ERR_LEN), J_ERR_BYTES);
+    // `.slice()` matters, and it is not a copy for tidiness. The error region
+    // is inside the journal's SharedArrayBuffer, and `TextDecoder.decode()`
+    // REFUSES a view backed by one in Firefox — Chrome allows it, which is why
+    // this only ever failed on one browser and only on the path that reports a
+    // failure. The thrown TypeError then replaced the EIO this exists to
+    // deliver, so the guest was told the wrong thing at exactly the moment it
+    // most needed the right one.
     const message = len
-      ? J_DEC.decode(new Uint8Array(this.#ctrl.buffer, J_HEADER_BYTES, len))
+      ? J_DEC.decode(new Uint8Array(this.#ctrl.buffer, J_HEADER_BYTES, len).slice())
       : 'the writer did not say why';
     throw jError('EIO', `journalFs: a write did not reach the backing store: ${message}`);
   }
