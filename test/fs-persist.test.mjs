@@ -78,6 +78,50 @@ if (!zenfs) {
     assert.equal(DEC.decode(bytes.get('/srv/index.php')), '<?php echo "edited";');
   });
 
+  // An EMPTY file is the one thing an index-backed async store does not
+  // persist by itself: `IndexFS.mkdir` calls a `_mkdir` hook and
+  // `IndexFS.createFile` calls nothing, so a directory reaches the backend and
+  // a file that is never written reaches the index and stops there. In a
+  // browser that is `touch a`, reload, and `a` is gone. ZENFS.md finding 10.
+  test('an empty file reaches the backing store, not only the index', async () => {
+    const { bytes, make } = makeBacking(zenfs);
+    const store = await persistentFs(await make());
+    store.createFileSync('/empty.txt', NEW_FILE);
+    await store.flush();
+    assert.ok(bytes.has('/empty.txt'), 'the backend never heard of the file');
+    assert.equal(bytes.get('/empty.txt').length, 0);
+  });
+
+  // And the same divergence the other way round: the backend is asked to
+  // remove a name it never had, which is a NotFoundError from OPFS and a
+  // latched failure here — one that stops every later write of the session.
+  test('a file created and removed again does not fail the write-back', async () => {
+    const { bytes, make } = makeBacking(zenfs);
+    const store = await persistentFs(await make());
+    store.createFileSync('/scratch.txt', NEW_FILE);
+    store.unlinkSync('/scratch.txt');
+    await store.flush();
+    assert.ok(!bytes.has('/scratch.txt'));
+    // The store must still work: a latched failure is raised at the next
+    // flush point, so this is where "poisoned for the rest of the session"
+    // would show up.
+    store.createFileSync('/after.txt', NEW_FILE);
+    store.writeSync('/after.txt', ENC.encode('still working'), 0);
+    await store.flush();
+    assert.equal(DEC.decode(bytes.get('/after.txt')), 'still working');
+  });
+
+  // `IndexFS.rename` removes the source, so it fails on a hollow file for the
+  // same reason unlink does.
+  test('an empty file can be renamed, which the backend removes to do', async () => {
+    const { bytes, make } = makeBacking(zenfs);
+    const store = await persistentFs(await make());
+    store.createFileSync('/from.txt', NEW_FILE);
+    store.renameSync('/from.txt', '/to.txt');
+    await store.flush();
+    assert.ok(bytes.has('/to.txt') && !bytes.has('/from.txt'));
+  });
+
   test('a store outlives the session that filled it', async () => {
     const backing = makeBacking(zenfs);
     const first = await persistentFs(await backing.make());
