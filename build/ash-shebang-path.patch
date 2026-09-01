@@ -1,0 +1,145 @@
+wasi-sh: apply the "#!" rule to the PATH search too.
+
+Applied AFTER ash-shebang.patch, whose rule this extends to the one place that
+patch did not reach. That patch made `./vendor/bin/phpunit` runnable by reading
+the "#!" line of a SLASHED name. A bare name goes down a different road —
+find_command()'s PATH search — and that road ends at test_exec(), which cannot
+succeed in this build: the shim FS carries permission bits, nothing enforces
+them, WASI preview1's filestat has no mode field to report them through, and
+there is no chmod applet to set one. Every file therefore stats as mode 0, and
+`ls -l` shows ---------- for regular files and d--------- for directories.
+
+So `composer` was EACCES while `./composer` ran — the same file, two answers,
+and the difference visible only as "Permission denied" on a file the shell had
+just written itself.
+
+Two changes, both needed:
+
+  1. find_command()'s PATH loop accepts a candidate that test_exec() rejected
+     when it is a readable file whose first two bytes are "#!". Without this
+     the search reports EACCES and prints its own message before anything
+     downstream could rescue the command.
+
+  2. shebang_expand() resolves a slashless name against PATH before reading it.
+     find_command() does not keep the path it found, so this walks PATH again —
+     only for a command that would otherwise have failed. It rewrites the
+     command word to the resolved path, because that is what the interpreter
+     must be handed: execve() passes the resolved path, and an interpreter
+     given a bare name opens it relative to the cwd and fails.
+
+Recursion is bounded by the depth cap ash-shebang.patch already enforces:
+shebang_expand() refuses at depth > 0, so exactly one level is ever expanded
+whatever the interpreter turns out to be. What changes is that a bare name can
+now BE a "#!" file, which that patch's header calls structurally impossible;
+the cap, not the impossibility, is what holds after this.
+
+--- a/shell/ash.c
++++ b/shell/ash.c
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -8818,6 +8818,30 @@
+  * Resolve a command name.  If you change this routine, you may have to
+  * change the shellexec routine as well.
+  */
++/* wasi-sh: is PATH a file this shell is willing to run?
++ *
++ * The same rule ash-shebang.patch already applies to a slashed name -- A
++ * READABLE FILE WHOSE FIRST TWO BYTES ARE "#!" -- and it is here for the same
++ * reason: the shim FS carries permission bits but nothing enforces them, WASI's
++ * filestat has no mode field to report them through, and there is no chmod. So
++ * test_exec() answers no for every file that ever existed, and without this the
++ * PATH search rejects a perfectly good script with EACCES.
++ */
++static int
++is_shebang_file(const char *fullname)
++{
++	char two[2];
++	int fd;
++	ssize_t n;
++
++	fd = open(fullname, O_RDONLY);
++	if (fd < 0)
++		return 0;
++	n = read(fd, two, 2);
++	close(fd);
++	return n == 2 && two[0] == '#' && two[1] == '!';
++}
++
+ static void
+ find_command(char *name, struct cmdentry *entry, int act, const char *path)
+ {
+@@ -8992,7 +9016,11 @@
+ 			goto success;
+ 		}
+ 		e = EACCES;     /* if we fail, this will be the error */
+-		if (!test_exec(/*fullname,*/ &statb))
++		/* wasi-sh: test_exec() cannot succeed here (see is_shebang_file
++		 * above), so a "#!" file is the only thing that can rescue a
++		 * PATH candidate. Without this, a script on PATH is EACCES while
++		 * the same file run as ./script is fine -- one file, two answers. */
++		if (!test_exec(/*fullname,*/ &statb) && !is_shebang_file(fullname))
+ 			continue;
+ 		TRACE(("searchexec \"%s\" returns \"%s\"\n", name, fullname));
+ 		if (!updatetbl) {
+@@ -9371,6 +9399,43 @@
+ 	int n;
+ 	int total;
+ 
++	/* wasi-sh: a name with no slash was found by find_command()'s PATH
++	 * search, which does not keep the path it found. Walk it again rather
++	 * than thread the answer through: this runs only for a command that
++	 * would otherwise have failed, and it is what lets the interpreter be
++	 * handed the RESOLVED path -- a script found on PATH must reach its
++	 * interpreter as /the/full/path, exactly as execve() would have passed
++	 * it, or the interpreter opens it relative to the cwd and fails. */
++	if (!strchr(name, '/')) {
++		const char *path = pathval();
++		/* An applet is this shell's own command and keeps winning over a
++		 * file that happens to share its name — the same order as before
++		 * this patch, and the order every other lookup here uses. */
++		if (find_applet_by_name(name) >= 0)
++			return 0;
++		char *found = NULL;
++		int len;
++
++		while ((len = padvance(&path, name)) >= 0) {
++			if (pathopt)            /* a %builtin/%func entry, not a file */
++				continue;
++			if (!is_shebang_file(stackblock()))
++				continue;
++			/* stalloc() commits the space padvance() just grew and
++			 * returns that same pointer, which is the only way to
++			 * keep it: the block is temporary until committed, and
++			 * the next allocation is free to move it out from under
++			 * a copy taken with sstrdup(). ash does this in
++			 * find_command()'s %func branch for the same reason. */
++			found = stalloc(len);
++			break;
++		}
++		if (!found)
++			return 0;
++		name = found;
++		arglist->list->text = found;
++	}
++
+ 	fd = open(name, O_RDONLY);
+ 	if (fd < 0)
+ 		return 0;
+@@ -11471,7 +11536,16 @@
+ 			 * a command rather than a 127. A refusal is remembered,
+ 			 * not raised, because only the dispatch below can set
+ 			 * an exit status without killing the script. */
+-			if (cmdentry.cmdtype == CMDNORMAL) {
++			/* wasi-sh: CMDUNKNOWN too, for a name with no slash.
++			 * This find_command() passes DO_REGBLTIN, which makes it
++			 * give up before the applet lookup and before the PATH
++			 * search, so a script sitting on PATH gets here as
++			 * "unknown" rather than as CMDNORMAL. It is silent (no
++			 * DO_ERR), so trying is free: the real resolution, with
++			 * its message, happens further down. */
++			if (cmdentry.cmdtype == CMDNORMAL
++			 || cmdentry.cmdtype == CMDUNKNOWN
++			) {
+ 				int n = shebang_expand(&arglist, shebang_depth);
+ 				if (n > 0) {
+ 					shebang_depth++;

@@ -533,10 +533,19 @@ redirections and pipeline dup2s are the ones already installed.
   them, there is no `chmod`, and `test_exec()` therefore always fails. So
   `./notes.txt` runs if it happens to start with one. This is chosen, not
   emergent.
+- **A name on `PATH` counts too** (`build/ash-shebang-path.patch`). The rule
+  above is the same one `find_command`'s `PATH` search needs, and for the same
+  reason: `test_exec()` cannot succeed, so without it `composer` is
+  `Permission denied` while `./composer` runs — one file, two answers. The
+  search accepts a `#!` candidate, and the prefix loop reads a slashless name
+  too, resolving it against `PATH` first so the interpreter is handed the
+  RESOLVED path, as `execve()` would have passed it. An applet still wins over a
+  file of the same name, which is the order every other lookup here uses.
 - **The interpreter is resolved by basename.** `/usr/bin/env`, `/bin/env` and
-  `env` are one command here, and none of those directories exist. It is also
-  what makes recursion impossible: a bare name can never take the slash short
-  circuit again, so it can never be read as a `#!` file itself.
+  `env` are one command here, and none of those directories exist. Recursion is
+  bounded by the depth cap — `shebang_expand()` refuses at depth > 0, so exactly
+  one level is ever expanded. Before the `PATH` patch above this was structural
+  rather than bounded, because a bare name could not be a `#!` file at all.
 - **`env` is a shell builtin** (`CONFIG_ENV=n`), not the applet, which ends in
   `execve()`. It strips itself the way `command` does — `-i`, `-u NAME`, `--`,
   then `VAR=val` words — and hands the command word back to `find_command`. The
