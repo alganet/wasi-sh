@@ -515,9 +515,54 @@ entering quietly.
 `find_command`'s slash short circuit, reached `vforkexec()`, and died on
 `vfork() == ENOSYS` with `can't fork` and status 2 — which is `EXERROR`, so it
 *aborted the whole script*: `./x.sh; echo $?` never reached the echo. It now
-reports 127 like any other miss and carries on. Host builtins are deliberately
-**not** reachable by path; a virtual `/bin` would imply `[ -x ]`, shebangs and
-PATH ordering, none of which exist here.
+reports 127 like any other miss and carries on.
+
+**Shebangs, and the `env` that makes them useful** (`build/ash-shebang.patch`).
+That slash short circuit is also where a `#!` line has to be read. On Linux
+`execve()` resolves it, in the kernel; there is no kernel here, so it is the
+shell's job or nobody's, and without it `./vendor/bin/phpunit` is a plain 127
+even when every piece it needs is registered. `evalcommand`'s prefix loop — the
+one that already strips `command` — now reads the first line of a slashed name
+that resolved to nothing and splices the interpreter in front, then resolves
+again. That second pass is an ordinary `find_command`, so the interpreter can be
+a shell function, an ash builtin, an applet or a host builtin, and the
+redirections and pipeline dup2s are the ones already installed.
+
+- **Executable means: a readable file whose first two bytes are `#!`.** No other
+  rule is available — the shim FS carries permission bits but does not enforce
+  them, there is no `chmod`, and `test_exec()` therefore always fails. So
+  `./notes.txt` runs if it happens to start with one. This is chosen, not
+  emergent.
+- **The interpreter is resolved by basename.** `/usr/bin/env`, `/bin/env` and
+  `env` are one command here, and none of those directories exist. It is also
+  what makes recursion impossible: a bare name can never take the slash short
+  circuit again, so it can never be read as a `#!` file itself.
+- **`env` is a shell builtin** (`CONFIG_ENV=n`), not the applet, which ends in
+  `execve()`. It strips itself the way `command` does — `-i`, `-u NAME`, `--`,
+  then `VAR=val` words — and hands the command word back to `find_command`. The
+  variable edits are applied through `mklocal()` in the command's own localvar
+  scope, so they are scoped to it exactly like `FOO=bar cmd`. With no command
+  word it prints the environment. Options it does not know end the option scan
+  and become the command name, so `env -0 x` reports `-0: not found` rather than
+  a usage error.
+- **`env` is also the only way back into the reader**, and only for a file named
+  `env` whose own `#!` line names `env`. That one is refused with 126 and a
+  message naming the file, rather than recursed.
+- **A `#!` line naming `sh` or `ash` is refused**, with 126. busybox ash is not
+  reentrant: `ash_main()` re-runs all three `INIT_G()`s and never restores them,
+  so a nested shell leaves with the outer one's variables, functions and script
+  position — an interactive session simply ends. That is already true of
+  `sh script.sh` typed by hand; making `./deploy.sh` the ordinary way to reach
+  it would be worse than saying no.
+
+**This supersedes an earlier design statement.** Host builtins used to be
+deliberately unreachable by path, on the grounds that a virtual `/bin` would
+imply `[ -x ]`, shebangs and PATH ordering, none of which existed. Two of those
+three now do: there is a rule for executable and there is shebang resolution.
+PATH ordering deliberately still does not — the path search remains dead code
+(`test_exec()` always fails), a bare `foo` never finds a file, and host builtins
+are still resolved by name only. Making files findable by path would put PATH
+order in front of the host table, which is a different and worse trade.
 
 **What still does not work**, because host builtins are builtins: `exec cmd`
 (`shellexec` never consults the table — note `exec date` *does* work via its

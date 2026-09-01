@@ -277,10 +277,18 @@ get it wrong:
 ## Scope and drawbacks — read before depending on it
 
 - **No processes, ever.** There is no fork/exec: no external programs, no
-  backgrounding (`&`), no job control, and no exec-wrappers — `env CMD`,
-  `nohup`, `nice`, `time`, `timeout` cannot work. Networking (`wget`, `nc`),
-  `/proc` tools (`ps`, `top`), and interactive full-screen tools (`vi`,
-  `less`) are out of scope.
+  backgrounding (`&`), no job control, and no exec-wrappers — `nohup`, `nice`,
+  `time`, `timeout` cannot work. Networking (`wget`, `nc`), `/proc` tools
+  (`ps`, `top`), and interactive full-screen tools (`vi`, `less`) are out of
+  scope.
+- **Shebangs are read, but there is still no exec.** `./bin/thing` works when
+  its `#!` line names something this shell can already reach — a host builtin,
+  an applet, a function — because ash reads the line itself and re-resolves the
+  interpreter by basename; `env` is a shell builtin here for the same reason, so
+  `#!/usr/bin/env php` and `env FOO=bar cmd` both work. Executable means *a
+  readable file starting with `#!`*: there are no permission bits to consult.
+  A `#!` line naming `sh` or `ash` is refused — busybox ash is not reentrant, so
+  a nested shell would take the outer one's state with it.
 - **Pipelines run sequentially**, each stage buffering fully before the next
   starts. Finite pipelines are fine; an infinite producer (`yes | head`)
   never terminates, and there's no backpressure.

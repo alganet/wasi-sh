@@ -124,6 +124,13 @@ fi
 # "can't fork" and status 2 instead of reporting 127.
 patch -p1 -d "$BB" < "$here/ash-hostbuiltin.patch"
 
+# Shebang dispatch, and `env` as a shell builtin rather than the applet. Also
+# UNCONDITIONAL, but it does depend on ash-hostbuiltin.patch above: it hooks
+# the same slash short circuit, and the interpreter it re-dispatches is usually
+# a host builtin. Pairs with CONFIG_ENV=n in busybox.config — the applet ends
+# in execve(), which is ENOSYS here.
+patch -p1 -d "$BB" < "$here/ash-shebang.patch"
+
 # Cooperative interrupt, applet side: run_nofork_applet arms a baseline, and
 # the safe points (wrapped read/write/readv/writev below, plus awk's and sed's
 # own loops) bail through die_func with 130 when the host's count has moved.
