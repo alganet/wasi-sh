@@ -25,9 +25,15 @@ instance, and two things went wrong there:
      here-documents, the expander's scratch.
 
 The state is written once as an X-macro so the save and the restore cannot
-drift apart, and build/build.sh re-derives the same list from the patched
-source: a busybox update that adds a mutable static fails the build instead
-of quietly corrupting one more thing.
+drift apart, and build/build.sh checks it against what the COMPILER says
+ash.c has — LLVM IR marks a static `internal global` and read-only data
+`internal constant`, with every #if already resolved. A busybox update that
+adds a mutable global fails the build instead of quietly widening what a
+nested shell takes from its caller.
+
+The list is complete, not minimal. Much of it is scratch that is dead across
+this call (parsecmd() re-initialises the parser's at every entry), but
+completeness is the property the guard can check and minimality is not.
 
 Nesting is capped at 8. There is no process to fall over and no fork to
 fail, so a script that runs itself would recurse until the wasm stack traps
@@ -89,7 +95,39 @@ nested shell. That is the bargain every applet in this build makes.
   * Returns 1 if ARGLIST was rewritten and the caller should resolve again,
   * 0 if NAME is not a shebang file (the caller's existing 127 stands), or
   * -1 if it is one that must not run — message already printed. */
-@@ -11682,7 +11711,7 @@
+@@ -10471,11 +10500,20 @@
+ /*
+  * Controls whether the shell is interactive or not.
+  */
++/* wasi-sh: hoisted out of setinteractive() so the nested-shell state list at
++ * the end of this file can name them. Both are per-shell, not per-process:
++ * is_interactive short-circuits setsignal(), so an outer interactive shell
++ * left holding a nested shell's value would skip the signal reset on its next
++ * `set +i`; and each shell prints its own banner, as a separate `sh` process
++ * would. */
++static smallint is_interactive;
++#if !ENABLE_FEATURE_SH_EXTRA_QUIET
++static smallint did_banner;
++#endif
++
+ static void
+ setinteractive(int on)
+ {
+-	static smallint is_interactive;
+-
+ 	if (++on == is_interactive)
+ 		return;
+ 	is_interactive = on;
+@@ -10485,8 +10523,6 @@
+ 	if (is_interactive > 1) {
+ #if !ENABLE_FEATURE_SH_EXTRA_QUIET
+ 		/* Looks like they want an interactive shell */
+-		static smallint did_banner;
+-
+ 		if (!did_banner) {
+ 			/* note: ash and hush share this string */
+ 			out1fmt("\n\n%s %s\n"
+@@ -11682,7 +11718,7 @@
  			 * and/or wait for user input ineligible for NOFORK:
  			 * for example, "yes" or "rm" (rm -i waits for input).
  			 */
@@ -98,7 +136,7 @@ nested shell. That is the bargain every applet in this build makes.
  			environ = sv_environ;
  			/*
  			 * Try enabling NOFORK for "yes" applet.
-@@ -15409,6 +15438,18 @@
+@@ -15409,6 +15445,18 @@
  	 */
  	setjobctl(0);
  	flush_stdout_stderr();
@@ -117,7 +155,7 @@ nested shell. That is the bargain every applet in this build makes.
  	_exit(exitstatus);
  	/* NOTREACHED */
  }
-@@ -15580,6 +15621,143 @@
+@@ -15580,6 +15628,171 @@
  extern int etext();
  #endif
  
@@ -145,10 +183,24 @@ nested shell. That is the bargain every applet in this build makes.
 + *    scratch.
 + *
 + * ASH_STATE_LIST IS the shell's whole mutable state, written once so that the
-+ * save and the restore cannot drift apart. build/build.sh re-derives the same
-+ * list from the patched source and fails the build when a busybox update adds
-+ * a mutable static that is not named here — the alternative is a nested shell
-+ * that quietly corrupts one more thing than it used to.
++ * save and the restore cannot drift apart. build/build.sh checks it against
++ * what the COMPILER says this file has — clang names every static `internal
++ * global` in LLVM IR, and read-only data `internal constant` — and fails the
++ * build on a mutable global that is not listed. Reading the source instead was
++ * tried and was worse than useless: a regex over declarations missed every
++ * static with a trailing comment, and could not see a function-local one at
++ * all, while reporting that all was well.
++ *
++ * A function-local static cannot be named here, so this file must not have
++ * one; the guard says so by name when it finds one (they appear in the IR as
++ * `function.variable`). setinteractive()'s two were hoisted for that reason.
++ *
++ * The list is COMPLETE, not minimal, and that is the point. Much of it is
++ * scratch that happens to be dead across this call — parsecmd() re-initialises
++ * the parser's, and the expander's is rebuilt per word — so trimming it to what
++ * demonstrably breaks would pass every test today and quietly stop covering
++ * whatever changes tomorrow. Completeness is the property the guard can check;
++ * minimality is not. Do not trim it.
 + *
 + * What is NOT undone: the nested shell's own allocations. Its globals, hash
 + * table and string stack are abandoned, a few KB per nested shell. That is the
@@ -171,7 +223,14 @@ nested shell. That is the bargain every applet in this build makes.
 +# define ASH_STATE_ALIAS(F)
 +#endif
 +#if JOBS
-+/* shell_tty_info is deliberately absent: it sits inside an `#if 0` upstream. */
++/* shell_tty_info is deliberately absent: it sits inside an `#if 0` upstream.
++ *
++ * ttyfd is a DESCRIPTOR, and putting a number back does not reopen anything —
++ * so this is only sound while a nested shell cannot close it. It cannot here:
++ * setjobctl(0) returns early unless job control is on, and it never is, because
++ * there is no /dev/tty to acquire (every session starts "can't access tty; job
++ * control turned off"). If a tty ever appears, a nested shell's exitshell()
++ * would close the outer's ttyfd and this restore would hand back a closed fd. */
 +# define ASH_STATE_JOBS(F) \
 +	F(jobctl) F(initialpgrp) F(ttyfd) F(jobtab) F(njobs) F(curjob)
 +#else
@@ -182,12 +241,17 @@ nested shell. That is the bargain every applet in this build makes.
 +#else
 +# define ASH_STATE_MAIL(F)
 +#endif
++#if !ENABLE_FEATURE_SH_EXTRA_QUIET
++# define ASH_STATE_QUIET(F)     F(did_banner)
++#else
++# define ASH_STATE_QUIET(F)
++#endif
 +
 +/* The three globals pointers are not in the list below: they are declared
 + * BB_GLOBAL_CONST, so a __typeof__ member of one cannot be assigned to. They
 + * go through busybox's own ASSIGN_CONST_PTR, which is what INIT_G() uses. */
 +#define ASH_STATE_LIST(F) \
-+	F(argptr) F(optptr) F(pathopt) \
++	F(argptr) F(optptr) F(optionarg) F(pathopt) \
 +	F(doprompt) F(needprompt) \
 +	ASH_STATE_DEBUG(F) \
 +	ASH_STATE_EDITING(F) \
@@ -201,7 +265,9 @@ nested shell. That is the bargain every applet in this build makes.
 +	F(localvar_stack) \
 +	F(checkkwd) \
 +	ASH_STATE_MAIL(F) \
-+	F(tokpushback) F(heredoclist) F(wordtext) \
++	ASH_STATE_QUIET(F) \
++	F(is_interactive) \
++	F(tokpushback) F(lasttoken) F(quoteflag) F(heredoclist) F(wordtext) \
 +	F(backquotelist) F(redirnode) F(heredoc)
 +
 +struct ash_state {

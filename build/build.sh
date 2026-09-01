@@ -136,38 +136,6 @@ patch -p1 -d "$BB" < "$here/ash-shebang.patch"
 # it fixes (a nested `sh` ends the whole instance) is reachable by typing.
 patch -p1 -d "$BB" < "$here/ash-nested-shell.patch"
 
-# Drift guard for the patch above. ASH_STATE_LIST() must name every mutable
-# file-scope static in ash.c: one it misses is state a nested shell silently
-# takes from its caller, which is invisible until a script does something odd
-# in a way nobody connects back to here. Re-derive the list from the patched
-# source and compare. `static const` is skipped (read-only), and so are the few
-# the config compiles out — those sit behind the same #if in both places, so
-# this compares NAMES and lets the compiler enforce the guards.
-ash_statics() {
-	sed -n 's/^static \([A-Za-z_][A-Za-z0-9_ *]*[ *]\)\([A-Za-z_][A-Za-z0-9_]*\)\(\[[^]]*\]\)\?\( *=[^;]*\)\?;$/\2/p' \
-	  "$BB/shell/ash.c" | sort -u
-}
-ash_state_list() {
-	# The whole nested-shell block, so the #if'd sub-lists count too.
-	sed -n '/^\/\* ============ Nested shells/,/^struct ash_state {/p' "$BB/shell/ash.c" \
-	  | grep -o 'F(\([A-Za-z_][A-Za-z0-9_]*\))' | sed 's/F(\(.*\))/\1/' | sort -u
-}
-ash_statics > "$work/ash-statics"
-ash_state_list > "$work/ash-state"
-# profile_buf is a profiler's output buffer, not shell state; ash_nest_depth is
-# the nesting counter itself, which MUST survive the restore; shell_tty_info
-# sits inside an `#if 0` upstream (a bash tty-restore feature ash never turned
-# on) and is not compiled at all.
-missing=$(comm -23 "$work/ash-statics" "$work/ash-state" \
-	  | grep -vxE 'profile_buf|ash_nest_depth|shell_tty_info' || true)
-if [ -n "$missing" ]; then
-	echo "ash.c has mutable statics missing from ASH_STATE_LIST():" >&2
-	echo "$missing" >&2
-	echo "A nested shell would take these from its caller. Add them to" >&2
-	echo "build/ash-nested-shell.patch, or add an exemption in build/build.sh." >&2
-	exit 1
-fi
-echo "ash state guard: $(wc -l < "$work/ash-state") names, no drift"
 
 # Cooperative interrupt, applet side: run_nofork_applet arms a baseline, and
 # the safe points (wrapped read/write/readv/writev below, plus awk's and sed's
@@ -228,6 +196,48 @@ make -C "$BB" -j"$cores" CC=zcc LD=zld HOSTCC=cc AR="$AR_CMD" \
 for need in "$BB/libbb/lib.a" "$BB/shell/lib.a" "$BB/libbb/appletlib.o" "$BB/applets/applets.o"; do
 	[ -f "$need" ] || { echo "compile failed: missing $need — see $work/make.log" >&2; exit 1; }
 done
+
+# --- nested-shell state guard ---------------------------------------------------
+# ASH_STATE_LIST() in ash-nested-shell.patch has to name every mutable global in
+# ash.c: one it misses is state a nested shell silently takes from its caller,
+# which surfaces later as a script doing something odd that nobody connects back
+# to a `sh` three lines earlier.
+#
+# Ask the COMPILER what the file has, not a regex over the source. Clang names
+# each static `internal global` in LLVM IR and read-only data `internal
+# constant`, having already resolved every #if — so this needs no knowledge of
+# which config symbols are on. Reading the source was tried first and was worse
+# than useless: it matched only declarations ending in `;`, so every static with
+# a trailing comment was invisible (three were), and a function-local static was
+# invisible by construction (two were) — while reporting no drift.
+#
+# -O0 so that nothing is optimised away, -w because warnings are the make step's
+# business, and the flags are kbuild's minus the ones that cannot change which
+# globals exist.
+echo "checking ash's mutable globals against ASH_STATE_LIST()…"
+( cd "$BB" && zcc -std=gnu99 -Iinclude -Ilibbb -include include/autoconf.h \
+	-D_GNU_SOURCE -DNDEBUG -DBB_VER='"'"$BB_VER"'"' \
+	-DKBUILD_BASENAME='"ash"' -DKBUILD_MODNAME='"ash"' \
+	-w -O0 -S -emit-llvm -o "$work/ash.ll" shell/ash.c ) \
+  || { echo "could not emit LLVM IR for shell/ash.c" >&2; exit 1; }
+sed -n 's/^@\([A-Za-z_][A-Za-z0-9_.]*\) = internal [a-z_ ]*global .*/\1/p' \
+  "$work/ash.ll" | sort -u > "$work/ash-globals"
+sed -n '/^\/\* ============ Nested shells/,/^struct ash_state {/p' "$BB/shell/ash.c" \
+  | grep -o 'F([A-Za-z_][A-Za-z0-9_]*)' | sed 's/F(\(.*\))/\1/' | sort -u > "$work/ash-state"
+# ash_nest_depth is the nesting counter itself: it MUST survive the restore.
+missing=$(comm -23 "$work/ash-globals" "$work/ash-state" | grep -vx 'ash_nest_depth' || true)
+if [ -n "$missing" ]; then
+	echo "ash.c has mutable globals that ASH_STATE_LIST() does not name:" >&2
+	echo "$missing" | sed 's/^/  /' >&2
+	case "$missing" in *.*)
+		echo "A name of the form FUNC.VAR is a function-local static, which" >&2
+		echo "cannot be named in the list at all — hoist it to file scope." >&2 ;;
+	esac
+	echo "A nested shell would take these from its caller. See" >&2
+	echo "build/ash-nested-shell.patch." >&2
+	exit 1
+fi
+echo "  $(wc -l < "$work/ash-globals") mutable globals, all accounted for"
 
 # --- shim objects + setjmp runtime ---------------------------------------------
 zcc -O2 -c "$SHIM/wasistubs.c" -o "$work/wasistubs.o"
