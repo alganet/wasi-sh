@@ -1112,6 +1112,31 @@ export async function journalWriter(backing, options = {}) {
     return out;
   };
 
+  // Resizing has to be done by CONTENT, not by metadata, and that is a
+  // backend defect rather than a preference. `@zenfs/core`'s `IndexFS.touch`
+  // updates the index inode and nothing else (2.6.3), so a truncate leaves the
+  // real file its old length: within the session the cache agrees with itself,
+  // and the next hydrate rebuilds the index from the file that is actually
+  // there and hands back the OLD BYTES PAST THE NEW END. Measured through
+  // OPFS, on the commonest write a shell makes — `echo x > file` leaves
+  // `x` followed by whatever the file used to say, after a reload.
+  //
+  // So a resize is replayed as an exact rewrite. Removing and recreating is
+  // safe HERE and nowhere else: this store is the writer's alone, no guest
+  // holds a descriptor on it, and no inode of it is ever observed. The same
+  // fix inside `persistentFs` would change an ino under a running shell.
+  const applyResize = (path, metadata) => {
+    const before = store.statSync(path);
+    if (before.size === metadata.size) { store.touchSync(path, metadata); return; }
+    const keep = Math.min(metadata.size, before.size);
+    const bytes = new Uint8Array(metadata.size);      // a shorter file, or a zero hole
+    if (keep) store.readSync(path, bytes.subarray(0, keep), 0, keep);
+    store.unlinkSync(path);
+    store.createFileSync(path, { mode: before.mode & 0o7777, uid: before.uid, gid: before.gid });
+    if (bytes.length) store.writeSync(path, bytes, 0);
+    store.touchSync(path, metadata);
+  };
+
   const applyOne = (header, payload) => {
     switch (header.op) {
       case 'createFileSync': return void store.createFileSync(header.path, header.options);
@@ -1120,7 +1145,9 @@ export async function journalWriter(backing, options = {}) {
       case 'unlinkSync': return void store.unlinkSync(header.path);
       case 'renameSync': return void store.renameSync(header.from, header.to);
       case 'linkSync': return void store.linkSync(header.target, header.link);
-      case 'touchSync': return void store.touchSync(header.path, header.metadata);
+      case 'touchSync': return void (header.metadata && header.metadata.size !== undefined
+        ? applyResize(header.path, header.metadata)
+        : store.touchSync(header.path, header.metadata));
       case 'writeSync': return void store.writeSync(header.path, payload, header.offset);
       // Not reachable from the store above, and worth saying so out loud: a
       // frame nobody wrote means the two sides are different versions.
