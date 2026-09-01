@@ -620,3 +620,575 @@ export async function persistentFs(backing, options = {}) {
 
   return backing;
 }
+
+// ---------------------------------------------------------------------------
+// A store that can be written from INSIDE a running guest.
+//
+// `persistentFs` above is hydrate-and-flush, and law 1 puts a ceiling on it:
+// the write-back is a promise chain, promises need the event loop, and a live
+// session is one synchronous `_start()` frame parked in `Atomics.wait`. So it
+// persists a session that ENDS. A dev environment's session never does — the
+// shell sits on `/dev/hostreq` for the life of the tab — and behind one, every
+// write reaches the cache and nothing else. Measured, not assumed: a shell
+// parked on `/dev/hostreq` wrote a SQLite database through a `WebAccessFS` and
+// OPFS was still empty ten seconds later.
+//
+// What that needs is a store whose writes LEAVE synchronously. They cannot
+// *land* synchronously — no browser API writes to a disk without awaiting —
+// but they can leave the guest's thread, and a second thread whose event loop
+// is free can land them. That is what these two are:
+//
+//   journalFs(...)      the store the session runs on. Reads come out of a
+//                       synchronous cache; every mutation is applied to the
+//                       cache and then APPENDED, synchronously, to a journal
+//                       in a SharedArrayBuffer. It never awaits and never
+//                       blocks, except for back-pressure when the journal is
+//                       full and at syncSync().
+//   journalWriter(...)  runs on another thread, owns the backing store, and
+//                       replays the journal into it. It parks in
+//                       `Atomics.waitAsync`, NOT `Atomics.wait`, which is the
+//                       whole trick: the wait is a promise, so the event loop
+//                       the backend needs stays free.
+//
+// This is the stdin ring aimed the other way — the same monotonic head/tail
+// and the same seq wakeup word — with the two roles swapped: here the producer
+// is the one on a worker (so it may block) and the consumer is the one that
+// must not.
+//
+// ONE HOLDER OF THE BACKEND, and that is deliberate. The writer thread is the
+// only thing that touches it; the guest's side never opens it at all. Two
+// holders of one backing image is the shape that corrupts a
+// `@zenfs/core` SingleBuffer (see MOAR §5), and a cache that is authoritative
+// for reads has nothing to race with. The cost is stated where it bites: a
+// change made to the backend by somebody else — another tab, the user's file
+// manager — is invisible to a session already running.
+// ---------------------------------------------------------------------------
+
+// Header words, then the error region, then the journal itself.
+const J_HEAD = 0;      // monotonic bytes appended, written by the store
+const J_TAIL = 1;      // monotonic bytes APPLIED, written by the writer
+const J_SEQ = 2;       // wakeup sequence, bumped by both sides
+const J_ERR_SEQ = 3;   // bumped once per failure the writer records
+const J_ERR_LEN = 4;   // bytes of the message below
+const J_STATE = 5;     // 0 unstarted, 1 draining, 2 stopped
+const J_WORDS = 8;
+const J_HEADER_BYTES = J_WORDS * 4;
+// A message, not a log: enough for a quota error with a path, truncated past
+// that. The reason travels because a store that fails without one is the
+// failure persistentFs exists to stop happening twice.
+const J_ERR_BYTES = 512;
+const J_PREFIX = J_HEADER_BYTES + J_ERR_BYTES;
+
+const J_UNSTARTED = 0, J_DRAINING = 1, J_STOPPED = 2;
+
+// Below this a single ordinary write does not fit beside its header and every
+// write would be chunked into uselessness. 64 KiB is the stdin ring's default
+// and the same reasoning applies.
+const J_MIN_BYTES = 65536;
+const J_DEFAULT_BYTES = 1 << 20;
+
+const J_DEC = new TextDecoder();
+
+/**
+ * Create the journal's SharedArrayBuffer. Sized for `bytes` of journal
+ * capacity — the header and the error region are on top, so `bufferSize` means
+ * what it says.
+ */
+export function createJournal(bytes = J_DEFAULT_BYTES) {
+  const size = Math.max(J_MIN_BYTES, bytes | 0);
+  return new SharedArrayBuffer(J_PREFIX + size);
+}
+
+// head and tail are monotonic byte counters in Int32 cells, so after 2 GiB
+// through the journal they wrap — and a dev environment's session is exactly
+// the one that runs long enough to. Two's complement makes that harmless
+// PROVIDED every comparison goes through the difference: `(a - b) | 0` is the
+// real distance whenever it is under 2 GiB, which the journal's capacity
+// guarantees, while `a >= b` on the raw values is wrong the moment one side
+// has wrapped and the other has not. Nothing here compares them directly.
+const jBehind = (a, b) => (a - b) | 0;
+// And the same wrap makes a raw `%` negative, which would index backwards
+// into the buffer.
+const jIndex = (position, capacity) => ((position % capacity) + capacity) % capacity;
+
+/** The one wakeup, used by both sides: bump seq, notify everybody on it. */
+function jWake(ctrl) {
+  Atomics.add(ctrl, J_SEQ, 1);
+  Atomics.notify(ctrl, J_SEQ);
+}
+
+function jError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  err.errno = ERRNO[code];
+  return err;
+}
+
+/**
+ * Walk a store into a plain, structured-cloneable snapshot.
+ *
+ * Depth-first and parents-first, so applying it back needs no sorting. Hard
+ * links do not survive — a snapshot is keyed by path, so two names for one
+ * inode come back as two files — which is worth knowing and is not worth an
+ * inode table for: nothing in a shell session makes one but `ln`.
+ */
+function snapshotStore(store, path = '/', out = []) {
+  const st = store.statSync(path);
+  const entry = {
+    path, mode: st.mode, uid: st.uid, gid: st.gid,
+    atimeMs: st.atimeMs, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs,
+  };
+  if (isDir(st.mode)) {
+    out.push(entry);
+    for (const name of store.readdirSync(path)) {
+      snapshotStore(store, path === '/' ? `/${name}` : `${path}/${name}`, out);
+    }
+  } else if (isFile(st.mode)) {
+    const data = new Uint8Array(st.size);
+    if (st.size) store.readSync(path, data, 0, st.size);
+    entry.data = data;
+    out.push(entry);
+  }
+  // Anything else — a device node somebody put in a backing store — is left
+  // out rather than guessed at: the shim owns /dev and would shadow it anyway.
+  return out;
+}
+
+/** Replay a snapshot into a fresh cache. */
+function applySnapshot(cache, snapshot) {
+  for (const entry of snapshot) {
+    const { path, data } = entry;
+    const options = { mode: entry.mode & 0o7777, uid: entry.uid, gid: entry.gid };
+    if (data === undefined) {
+      // '/' is there by construction and '/tmp' is there by MemoryFs's
+      // constructor, so a snapshot carrying either is applied as metadata
+      // rather than as a second mkdir.
+      if (path !== '/') { try { cache.mkdirSync(path, options); } catch (err) { if (err.code !== 'EEXIST') throw err; } }
+    } else {
+      cache.createFileSync(path, options);
+      if (data.length) cache.writeSync(path, data, 0);
+    }
+    cache.touchSync(path, {
+      mode: entry.mode & 0o7777, uid: entry.uid, gid: entry.gid,
+      atimeMs: entry.atimeMs, mtimeMs: entry.mtimeMs, ctimeMs: entry.ctimeMs,
+    });
+  }
+}
+
+// A journal frame is a length-prefixed pair: a JSON header naming the call and
+// its arguments, and the raw bytes of a write beside it rather than inside it.
+// Base64 in the JSON would cost 33% of every byte a guest writes, and this
+// channel is not line-oriented the way /dev/host is — a frame carries its own
+// length, so a payload with a newline in it is not a second frame.
+function encodeFrame(header, payload) {
+  const json = ENC.encode(JSON.stringify(header));
+  const frame = new Uint8Array(8 + json.length + (payload ? payload.length : 0));
+  new DataView(frame.buffer).setUint32(0, json.length, true);
+  new DataView(frame.buffer).setUint32(4, payload ? payload.length : 0, true);
+  frame.set(json, 8);
+  if (payload) frame.set(payload, 8 + json.length);
+  return frame;
+}
+
+/**
+ * The store a running session writes through: a synchronous cache, plus a
+ * journal of every mutation appended to shared memory for another thread to
+ * apply.
+ *
+ * `sab` is the buffer a {@link journalWriter} created and posted, and
+ * `snapshot` is the tree it read out of the backing store — so the session
+ * starts on what is really there, and the writer stays the only holder of the
+ * backend.
+ *
+ * ```js
+ * // in the guest's worker
+ * const { sab, snapshot } = await handshakeWithTheWriterWorker();
+ * serve({ fs: () => journalFs(sab, snapshot) });
+ * ```
+ *
+ * WORKER-ONLY, and it says so rather than failing later: appending under
+ * back-pressure and `syncSync()` both park in `Atomics.wait`, which the main
+ * thread refuses. That is the same rule the shell itself lives under.
+ *
+ * @param sab the journal buffer from `journalWriter().sab`
+ * @param snapshot the tree from `journalWriter().snapshot`
+ * @param options.timeout ms to wait for the writer before giving up (default 10000)
+ */
+export function journalFs(sab, snapshot = [], options = {}) {
+  return new JournalFs(sab, snapshot, options);
+}
+
+export class JournalFs {
+  #ctrl; #data; #cap; #timeout; #seenErr;
+
+  constructor(sab, snapshot = [], options = {}) {
+    if (!(sab instanceof SharedArrayBuffer)) {
+      throw new Error(
+        'journalFs: expected the SharedArrayBuffer from journalWriter().sab. The journal is '
+        + 'shared memory by construction — a store whose writes leave the thread synchronously '
+        + 'has nowhere else to put them.'
+      );
+    }
+    this.#ctrl = new Int32Array(sab, 0, J_WORDS);
+    this.#data = new Uint8Array(sab, J_PREFIX);
+    this.#cap = sab.byteLength - J_PREFIX;
+    this.#timeout = options.timeout ?? 10000;
+    // The failure count at construction, not zero: a writer that failed while
+    // hydrating has already recorded one, and starting "unseen" would raise it
+    // at the first write as though that write had caused it.
+    this.#seenErr = Atomics.load(this.#ctrl, J_ERR_SEQ);
+
+    // Probe rather than sniff for a worker. `Atomics.wait` throws on a thread
+    // that may not block whatever the value is, so a mismatched compare — which
+    // returns 'not-equal' without waiting anywhere it is allowed — tells us
+    // exactly what we need to know and costs nothing.
+    try { Atomics.wait(this.#ctrl, J_SEQ, Atomics.load(this.#ctrl, J_SEQ) + 1, 0); }
+    catch {
+      throw new Error(
+        'journalFs: this thread may not block, so it cannot be the one a guest runs on. '
+        + 'The store parks in Atomics.wait for back-pressure and at syncSync(), which the main '
+        + 'thread refuses — build it inside the worker, from serve({ fs }).'
+      );
+    }
+
+    // A writer that has not started, or has stopped, cannot be told anything —
+    // and a store built against one would take writes into a cache nothing
+    // drains, which is exactly the silent half-persistence this replaces. Said
+    // here, once, rather than as a surprise at the first write.
+    const state = Atomics.load(this.#ctrl, J_STATE);
+    if (state !== J_DRAINING) {
+      throw new Error(
+        `journalFs: the journal writer is ${state === J_STOPPED ? 'stopped' : 'not running'}, so nothing `
+        + 'written here would ever be persisted. Build the store from the buffer a live journalWriter() '
+        + 'handed over, and keep that writer running for as long as the session.'
+      );
+    }
+
+    this.cache = new MemoryFs();
+    applySnapshot(this.cache, snapshot);
+    // MemoryFs makes /tmp and a backing store that has never seen a shell has
+    // not, so the two would disagree from the first frame — every op under
+    // /tmp arriving at a directory the writer does not have. One rule here,
+    // and it is that everything the cache holds is journaled: seed the mkdir
+    // rather than making /tmp the one path that is exempt.
+    if (!snapshot.some((entry) => entry.path === '/tmp')) {
+      const frame = encodeFrame({ op: 'mkdirSync', path: '/tmp', options: { mode: DEFAULT_DIR_MODE, uid: 0, gid: 0 } });
+      this.#reserve(frame.length);
+      this.#commit(frame);
+    }
+  }
+
+  // ---- the journal ----
+
+  #state() { return Atomics.load(this.#ctrl, J_STATE); }
+
+  // Raise what the writer reported, at most once per failure. The message
+  // travels through the buffer rather than being reconstructed here: a store
+  // that says "a write did not reach the backend" and cannot say which one or
+  // why is the failure `persistentFs` was built to stop being silent.
+  #raise() {
+    const seq = Atomics.load(this.#ctrl, J_ERR_SEQ);
+    if (seq === this.#seenErr) return;
+    this.#seenErr = seq;
+    const len = Math.min(Atomics.load(this.#ctrl, J_ERR_LEN), J_ERR_BYTES);
+    const message = len
+      ? J_DEC.decode(new Uint8Array(this.#ctrl.buffer, J_HEADER_BYTES, len))
+      : 'the writer did not say why';
+    throw jError('EIO', `journalFs: a write did not reach the backing store: ${message}`);
+  }
+
+  // Wait until `cond()`, parking on seq. Returns false when the deadline
+  // passed — a stopped or wedged writer must not become an infinite hang
+  // inside a guest's `write()`.
+  #waitFor(cond) {
+    const deadline = Date.now() + this.#timeout;
+    for (;;) {
+      const seq = Atomics.load(this.#ctrl, J_SEQ);
+      if (cond()) return true;
+      const left = deadline - Date.now();
+      if (left <= 0) return cond();
+      Atomics.wait(this.#ctrl, J_SEQ, seq, Math.min(left, 1000));
+    }
+  }
+
+  #free() {
+    return this.#cap - jBehind(Atomics.load(this.#ctrl, J_HEAD), Atomics.load(this.#ctrl, J_TAIL));
+  }
+
+  // Reserving and committing are two steps so that a journal which cannot take
+  // the frame refuses BEFORE the cache has been changed. One step, and a
+  // stopped writer left the guest holding a file the backend will never hear
+  // about — the two halves diverging silently, which is the failure this whole
+  // seam exists to make impossible. Nothing else produces into this journal,
+  // so space that is free when reserved is still free when committed.
+  #reserve(length) {
+    if (length > this.#cap) {
+      // Unreachable for a write, which is chunked to fit; reachable for a path
+      // long enough that its header alone overflows, which is a store failure
+      // with a name of its own.
+      throw jError('ENAMETOOLONG', `journalFs: this operation does not fit in a ${this.#cap}-byte journal; raise bufferSize`);
+    }
+    if (this.#state() === J_STOPPED) {
+      throw jError('EIO', 'journalFs: the journal writer has stopped, so nothing more can be persisted');
+    }
+    if (this.#free() < length && !this.#waitFor(() => this.#free() >= length)) {
+      throw jError('EIO',
+        `journalFs: the journal writer did not drain within ${this.#timeout}ms — `
+        + `${length} bytes to append, ${this.#free()} free. It is stopped, wedged, or on a thread `
+        + 'whose event loop is blocked, which is the one thing it may not be.');
+    }
+  }
+
+  #commit(frame) {
+    const head = Atomics.load(this.#ctrl, J_HEAD);
+    const at = jIndex(head, this.#cap);
+    const first = Math.min(frame.length, this.#cap - at);
+    this.#data.set(frame.subarray(0, first), at);
+    if (first < frame.length) this.#data.set(frame.subarray(first), 0);
+    Atomics.store(this.#ctrl, J_HEAD, (head + frame.length) | 0);
+    jWake(this.#ctrl);
+  }
+
+  // Every mutation goes through here, and the ORDER is the contract: room is
+  // taken first so a journal that cannot accept the frame refuses before
+  // anything has changed, and the CACHE decides second — so a call the cache
+  // refuses (EEXIST, ENOENT, EISDIR) is never committed, and the writer only
+  // ever replays operations that already succeeded against a store in the same
+  // state it is in.
+  #mutate(apply, header, payload) {
+    this.#raise();
+    const frame = encodeFrame(header, payload);
+    this.#reserve(frame.length);
+    const result = apply();
+    this.#commit(frame);
+    return result;
+  }
+
+  // ---- the contract: reads are the cache, unchanged ----
+
+  statSync(path) { return this.cache.statSync(path); }
+  readdirSync(path) { return this.cache.readdirSync(path); }
+  readSync(path, buffer, start, end) { return this.cache.readSync(path, buffer, start, end); }
+
+  // ---- the contract: writes are the cache, and then the journal ----
+
+  createFileSync(path, options = {}) {
+    return this.#mutate(() => this.cache.createFileSync(path, options), { op: 'createFileSync', path, options });
+  }
+
+  mkdirSync(path, options = {}) {
+    return this.#mutate(() => this.cache.mkdirSync(path, options), { op: 'mkdirSync', path, options });
+  }
+
+  rmdirSync(path) { return this.#mutate(() => this.cache.rmdirSync(path), { op: 'rmdirSync', path }); }
+  unlinkSync(path) { return this.#mutate(() => this.cache.unlinkSync(path), { op: 'unlinkSync', path }); }
+  renameSync(from, to) { return this.#mutate(() => this.cache.renameSync(from, to), { op: 'renameSync', from, to }); }
+  linkSync(target, link) { return this.#mutate(() => this.cache.linkSync(target, link), { op: 'linkSync', target, link }); }
+  touchSync(path, metadata = {}) { return this.#mutate(() => this.cache.touchSync(path, metadata), { op: 'touchSync', path, metadata }); }
+
+  writeSync(path, buffer, offset) {
+    this.#raise();
+    // A write bigger than the journal is split by OFFSET, which the contract
+    // already makes safe: writes are positional, so the pieces are ordinary
+    // writes that happen to be adjacent, applied in order. Nothing else in the
+    // contract can exceed the buffer, since only a write carries bytes. The
+    // header is measured at the LAST offset the split will use, which is the
+    // longest one it can print.
+    const room = this.#cap - 8 - ENC.encode(JSON.stringify({ op: 'writeSync', path, offset: offset + buffer.length })).length;
+    if (room <= 0) {
+      throw jError('ENAMETOOLONG', `journalFs: '${path}' leaves no room for its own bytes in a ${this.#cap}-byte journal; raise bufferSize`);
+    }
+    const starts = [];
+    for (let at = 0; at < buffer.length || at === 0; at += room) {
+      starts.push(at);
+      if (!buffer.length) break;
+    }
+    // Encoded one chunk at a time, never all of them: holding every frame
+    // would cost a second copy of the whole write, and the writes this store
+    // exists for are a project's, not a line's.
+    const frameAt = (at) => encodeFrame({ op: 'writeSync', path, offset: offset + at },
+      buffer.subarray(at, Math.min(at + room, buffer.length)));
+    // Only the first frame is reserved before the cache changes. A split write
+    // is several journal entries and the journal is smaller than the write by
+    // definition, so the rest genuinely wait on the writer — a failure part way
+    // through leaves the backend holding a PREFIX of the file and raises,
+    // which is the honest outcome and the reason it raises rather than
+    // returning.
+    const first = frameAt(starts[0]);
+    this.#reserve(first.length);
+    this.cache.writeSync(path, buffer, offset);
+    this.#commit(first);
+    for (const at of starts.slice(1)) {
+      const frame = frameAt(at);
+      this.#reserve(frame.length);
+      this.#commit(frame);
+    }
+  }
+
+  /**
+   * Block until everything appended so far has been APPLIED to the backing
+   * store, and raise the first failure.
+   *
+   * The verb `persistentFs` could not have: the writer advances the tail only
+   * after its own flush resolved, so tail === head means the bytes are on the
+   * disk and not merely queued for it. This is what makes the shim's
+   * `proc_exit` flush point tell the truth for a persistent store.
+   */
+  syncSync() {
+    const head = Atomics.load(this.#ctrl, J_HEAD);
+    const applied = () => jBehind(Atomics.load(this.#ctrl, J_TAIL), head) >= 0;
+    const settled = this.#waitFor(() => applied() || this.#state() === J_STOPPED);
+    this.#raise();
+    if (!settled) {
+      throw jError('EIO', `journalFs: the journal writer did not finish within ${this.#timeout}ms, so what is written is not known to have been saved`);
+    }
+    if (!applied()) {
+      throw jError('EIO', 'journalFs: the journal writer stopped with writes still unapplied');
+    }
+  }
+}
+
+/**
+ * Run the other half, on a thread whose event loop is free: own the backing
+ * store, hand out a snapshot of it, and apply everything the guest journals.
+ *
+ * ```js
+ * // in a worker of its own — NOT the one the shell runs in
+ * import { WebAccess } from '@zenfs/dom';
+ * import { journalWriter } from 'wasi-sh/fs';
+ *
+ * const writer = await journalWriter(
+ *   await WebAccess.create({ handle: await navigator.storage.getDirectory() }),
+ *   { onError: (err) => report(err) },
+ * );
+ * postMessage({ sab: writer.sab, snapshot: writer.snapshot });
+ * ```
+ *
+ * It parks in `Atomics.waitAsync`, so the wait is a promise and the backend's
+ * own promises still run — which is the entire difference between this and
+ * putting `persistentFs` behind a live session. A thread that parked in
+ * `Atomics.wait` here would reproduce law 1 exactly one thread further along.
+ *
+ * @param backing the store to persist into, prepared with {@link persistentFs}
+ * @param options.bufferSize journal capacity in bytes (default 1 MiB)
+ * @param options.sab an existing journal buffer, when the page made it
+ * @param options.onError called with each failure, as it happens
+ */
+export async function journalWriter(backing, options = {}) {
+  // NO `onError` through to persistentFs, deliberately. It reports a failure as
+  // it happens and `flush()` raises the same one straight after, and the drain
+  // below flushes every batch — so passing it on made one failed write arrive
+  // at the embedder twice. The flush is the timely report here.
+  const store = await persistentFs(backing);
+  const sab = options.sab ?? createJournal(options.bufferSize);
+  const ctrl = new Int32Array(sab, 0, J_WORDS);
+  const data = new Uint8Array(sab, J_PREFIX);
+  const cap = sab.byteLength - J_PREFIX;
+  const snapshot = snapshotStore(store);
+
+  // The failure the guest is told about, and the only channel it has: a
+  // message in the buffer plus a count, so a store on the other thread can
+  // raise the REASON rather than "something failed". Truncated to fit, since a
+  // fixed region is what shared memory offers and a partial message beats a
+  // generic one.
+  const report = (err) => {
+    const text = `${(err && err.message) || err}`;
+    const bytes = ENC.encode(text).subarray(0, J_ERR_BYTES);
+    new Uint8Array(sab, J_HEADER_BYTES, J_ERR_BYTES).set(bytes);
+    Atomics.store(ctrl, J_ERR_LEN, bytes.length);
+    Atomics.add(ctrl, J_ERR_SEQ, 1);
+    if (options.onError) { try { options.onError(err); } catch { /* a reporter that throws must not take the drain with it */ } }
+    jWake(ctrl);
+  };
+
+  // A frame may wrap the end of the journal, so bytes come out through here
+  // rather than through a subarray the caller might assume is contiguous.
+  const take = (from, length) => {
+    const at = jIndex(from, cap);
+    if (at + length <= cap) return data.slice(at, at + length);
+    const out = new Uint8Array(length);
+    out.set(data.subarray(at));
+    out.set(data.subarray(0, length - (cap - at)), cap - at);
+    return out;
+  };
+
+  const applyOne = (header, payload) => {
+    switch (header.op) {
+      case 'createFileSync': return void store.createFileSync(header.path, header.options);
+      case 'mkdirSync': return void store.mkdirSync(header.path, header.options);
+      case 'rmdirSync': return void store.rmdirSync(header.path);
+      case 'unlinkSync': return void store.unlinkSync(header.path);
+      case 'renameSync': return void store.renameSync(header.from, header.to);
+      case 'linkSync': return void store.linkSync(header.target, header.link);
+      case 'touchSync': return void store.touchSync(header.path, header.metadata);
+      case 'writeSync': return void store.writeSync(header.path, payload, header.offset);
+      // Not reachable from the store above, and worth saying so out loud: a
+      // frame nobody wrote means the two sides are different versions.
+      default: throw new Error(`unknown journal operation '${header.op}'`);
+    }
+  };
+
+  let running = true;
+  Atomics.store(ctrl, J_STATE, J_DRAINING);
+
+  const drain = async () => {
+    try {
+      while (running) {
+        const seq = Atomics.load(ctrl, J_SEQ);
+        const head = Atomics.load(ctrl, J_HEAD);
+        let tail = Atomics.load(ctrl, J_TAIL);
+        if (jBehind(head, tail) <= 0) {
+          await Atomics.waitAsync(ctrl, J_SEQ, seq, 1000).value;
+          continue;
+        }
+        while (jBehind(head, tail) > 0) {
+          const prefix = take(tail, 8);
+          const view = new DataView(prefix.buffer, prefix.byteOffset);
+          const jsonLen = view.getUint32(0, true), binLen = view.getUint32(4, true);
+          const body = take(tail + 8, jsonLen + binLen);
+          tail = (tail + 8 + jsonLen + binLen) | 0;
+          // One bad operation must not end persistence for every later one: the
+          // frame is spent either way, so it is reported and the drain carries
+          // on. Stopping here would wedge the guest against a full journal for a
+          // failure it may not even be able to act on.
+          try {
+            applyOne(JSON.parse(J_DEC.decode(body.subarray(0, jsonLen))), body.subarray(jsonLen));
+          } catch (err) { report(err); }
+        }
+        // The flush comes BEFORE the tail moves, so a drained journal on the
+        // other side means applied-and-flushed rather than merely dequeued.
+        // That is what lets journalFs.syncSync() be a true flush point.
+        try { await store.flush(); }
+        catch (err) { report(err); }
+        Atomics.store(ctrl, J_TAIL, tail);
+        jWake(ctrl);
+      }
+    } catch (err) {
+      // Nothing above is expected to throw — every call that can is caught
+      // where it is made. If one does anyway, the guest must learn it here:
+      // a writer that died quietly leaves the store waiting out its timeout on
+      // every single write, which reads as a filesystem that has gone slow
+      // rather than one that has stopped saving.
+      report(err);
+    } finally {
+      Atomics.store(ctrl, J_STATE, J_STOPPED);
+      jWake(ctrl);
+    }
+  };
+
+  const done = drain();
+
+  return {
+    sab,
+    snapshot,
+    store,
+    /** Stop draining and settle once the loop has left. */
+    async stop() { running = false; jWake(ctrl); await done; },
+    /** Resolves when everything appended so far has been applied and flushed. */
+    async idle() {
+      while (jBehind(Atomics.load(ctrl, J_HEAD), Atomics.load(ctrl, J_TAIL)) > 0 && Atomics.load(ctrl, J_STATE) !== J_STOPPED) {
+        await Atomics.waitAsync(ctrl, J_SEQ, Atomics.load(ctrl, J_SEQ), 50).value;
+      }
+    },
+  };
+}

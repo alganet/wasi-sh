@@ -18,6 +18,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { persistentFs } from '../src/fs.mjs';
 import { conformanceCases } from '../src/fs-conformance.mjs';
+import { makeBacking } from './backing.mjs';
 
 let zenfs = null;
 try {
@@ -28,50 +29,6 @@ try {
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
-
-/**
- * A backend shaped like WebAccessFS: asynchronous underneath, a Map for the
- * bytes, and a lever to make one write-back fail.
- */
-function makeBacking(core, seed = {}) {
-  const bytes = new Map([['/', null]]);
-  class MapBacking extends core.Async(core.IndexFS) {
-    _sync = core.InMemory.create({ label: 'persist-cache' });
-    failOn = null;
-    constructor() { super(0x6d617062, 'mapbacking'); }
-    async _load() {
-      for (const [path, data] of bytes) {
-        this.index.set(path, new core.Inode(data === null
-          ? { mode: 0o755 | core.constants.S_IFDIR, size: 0 }
-          : { mode: 0o644 | core.constants.S_IFREG, size: data.length, mtimeMs: Date.now() }));
-      }
-    }
-    async stat(path) { return super.stat(path); }
-    async readdir(path) { return super.readdir(path); }
-    async read(path, buffer, offset, end) {
-      const data = bytes.get(path);
-      if (data == null) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT', errno: 2 });
-      buffer.set(data.subarray(offset, end));
-    }
-    async write(path, buffer, offset) {
-      if (this.failOn === path) throw Object.assign(new Error('quota exceeded'), { code: 'ENOSPC', errno: 28, path });
-      const old = bytes.get(path) || new Uint8Array(0);
-      const next = new Uint8Array(Math.max(old.length, offset + buffer.length));
-      next.set(old); next.set(buffer, offset);
-      bytes.set(path, next);
-    }
-    async remove(path) { bytes.delete(path); }
-    removeSync() { /* the cache does the synchronous half */ }
-    async _mkdir(path) { bytes.set(path, null); }
-  }
-  for (const [path, text] of Object.entries(seed)) {
-    const parts = path.split('/').slice(1, -1);
-    let dir = '';
-    for (const p of parts) { dir += '/' + p; if (!bytes.has(dir)) bytes.set(dir, null); }
-    bytes.set(path, ENC.encode(text));
-  }
-  return { bytes, make: async () => { const fs = new MapBacking(); await fs._load(); return fs; } };
-}
 
 const readAll = (fs, path) => {
   const { size } = fs.statSync(path);

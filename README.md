@@ -159,10 +159,8 @@ guest never gives it back — a live session is one synchronous `_start()` frame
 that parks in `Atomics.wait`, so not one microtask runs between its first write
 and its last. Measured: a shell parked on `/dev/hostreq` wrote a SQLite database
 through a `WebAccessFS` and OPFS was still empty ten seconds later. So `run()`
-persists and a long-lived `spawn()` does not; making *that* one persist needs a
-store whose writes leave synchronously — `createSyncAccessHandle()` (worker-only
-and exclusive per file), or a writer thread the store blocks on through a
-`SharedArrayBuffer`. Neither is this.
+persists and a long-lived `spawn()` does not. **`journalFs()` below is the one
+that does.**
 
 It does three things, each of which is silent when it is got wrong.
 **Hydration is not automatic** — `WebAccess.create()` loads the index and not
@@ -180,6 +178,63 @@ a `writeSync` the guest sees as **0 ms**, its write-back **~13 ms** behind it.
 The cache costs roughly 6× the project's size in heap. Sync access handles
 (`createSyncAccessHandle`) are not used and are worker-only; they are the door
 left open for a live SQLite file, not this.
+
+### Persisting a session that never ends
+
+A dev environment's shell sits on `/dev/hostreq` for the life of the tab, so
+there is no exit for hydrate-and-flush to hang a drain on. `journalFs()` is the
+store for that one: writes cannot *land* synchronously — no browser API reaches
+a disk without awaiting — but they can **leave the guest's thread**
+synchronously, and a second thread whose event loop is free lands them.
+
+```js
+// writer.worker.mjs — a worker of its own, NOT the one the shell runs in
+import { WebAccess } from '@zenfs/dom';
+import { journalWriter } from 'wasi-sh/fs';
+
+const writer = await journalWriter(
+  await WebAccess.create({ handle: await navigator.storage.getDirectory() }),
+  { onError: (err) => console.error('it did not save:', err) },
+);
+postMessage({ sab: writer.sab, snapshot: writer.snapshot });
+```
+
+```js
+// the shell's worker
+import { serve } from 'wasi-sh/worker';
+import { journalFs } from 'wasi-sh/fs';
+
+const { sab, snapshot } = await theWriterHandsThisOver;
+serve({ fs: () => journalFs(sab, snapshot) });
+```
+
+Reads come out of a synchronous cache seeded from `snapshot`; every mutation is
+appended to a journal in the shared buffer, and the writer replays it into the
+backing store. The writer parks in **`Atomics.waitAsync`**, not `Atomics.wait`
+— the wait is a promise, so the backend's own promises still run. A writer that
+blocked would reproduce law 1 one thread further along.
+
+Three things follow from the shape, and each is the reason for a rule:
+
+- **The writer is the only holder of the backend.** The guest's side never
+  opens it. Two holders of one backing image is what corrupts a `@zenfs/core`
+  `SingleBuffer`, and a cache that is authoritative for reads has nothing to
+  race with. The cost, stated where it bites: a change another tab makes to the
+  backend is invisible to a session already running.
+- **`syncSync()` is a true flush point here** — the one thing `persistentFs`
+  cannot offer. The writer advances the journal's tail only after its own flush
+  resolved, so a drained journal means the bytes are on the disk rather than
+  queued for it, and the shim's `proc_exit` finally tells the truth.
+- **Worker-only, and it says so at construction.** Back-pressure and
+  `syncSync()` both park in `Atomics.wait`, which the main thread refuses — the
+  same rule the shell already lives under. It needs cross-origin isolation, as
+  `spawn()` does.
+
+A failure reaches the guest with its reason attached: the writer puts the
+message in the shared buffer and the store raises it — as an `EIO` — at the
+next call, once per failure. A writer that has stopped fails the next write
+*before* the cache moves, because a write that succeeds into a cache nothing
+drains looks exactly like one that saved.
 
 ## Scope and drawbacks — read before depending on it
 
@@ -572,7 +627,7 @@ driven from the page.
 | `wasi-sh/node` | `run`, `runScript`, `compileWasm`, `readTree` (fs sugar; node-only) |
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
 | `wasi-sh/ring` | `createRing`, `RingWriter`, `RingReader`, `frameRequest` — the SAB rings |
-| `wasi-sh/fs` | `memoryFs`, `persistentFs` and the `fs` contract — the filesystem, pluggable |
+| `wasi-sh/fs` | `memoryFs`, `persistentFs`, `journalFs`/`journalWriter` and the `fs` contract — the filesystem, pluggable |
 | `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
 | `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register builtins, a store, a host port |

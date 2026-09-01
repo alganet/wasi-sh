@@ -150,3 +150,97 @@ export function persistentFs<T extends FileSystem>(
   backing: T,
   options?: PersistentOptions,
 ): Promise<PersistentFileSystem<T>>;
+
+/** A tree read out of a backing store, ready to seed a session's cache. */
+export interface JournalSnapshotEntry extends Partial<InodeLike> {
+  path: string;
+  mode: number;
+  uid: number;
+  gid: number;
+  /** Present for files, absent for directories. */
+  data?: Uint8Array;
+}
+
+/** Allocate the journal's shared buffer. Sized for `bytes` of journal capacity. */
+export function createJournal(bytes?: number): SharedArrayBuffer;
+
+export interface JournalFsOptions {
+  /** ms to wait for the writer before failing a call (default 10000). */
+  timeout?: number;
+}
+
+/**
+ * The store a RUNNING session writes through: reads out of a synchronous
+ * cache, and every mutation appended to a journal in shared memory for
+ * {@link journalWriter} to apply on another thread.
+ *
+ * This is what `persistentFs` cannot be. Hydrate-and-flush needs the event
+ * loop to drain its write-back, and a live session is one synchronous
+ * `_start()` frame parked in `Atomics.wait` — so it persists a session that
+ * ENDS, and a dev environment's session never does.
+ *
+ * WORKER-ONLY: appending under back-pressure and `syncSync()` both park in
+ * `Atomics.wait`, which the main thread refuses.
+ */
+export function journalFs(
+  sab: SharedArrayBuffer,
+  snapshot?: JournalSnapshotEntry[],
+  options?: JournalFsOptions,
+): JournalFs;
+
+export class JournalFs implements FileSystem {
+  constructor(sab: SharedArrayBuffer, snapshot?: JournalSnapshotEntry[], options?: JournalFsOptions);
+  /** The synchronous cache every read is answered from. */
+  readonly cache: MemoryFs;
+  statSync(path: string): InodeLike;
+  readdirSync(path: string): string[];
+  createFileSync(path: string, options?: Partial<InodeLike>): InodeLike;
+  mkdirSync(path: string, options?: Partial<InodeLike>): InodeLike;
+  rmdirSync(path: string): void;
+  unlinkSync(path: string): void;
+  renameSync(from: string, to: string): void;
+  linkSync(target: string, link: string): void;
+  readSync(path: string, buffer: Uint8Array, start: number, end: number): void;
+  writeSync(path: string, buffer: Uint8Array, offset: number): void;
+  touchSync(path: string, metadata: Partial<InodeLike>): void;
+  /**
+   * Block until everything appended so far has been APPLIED to the backing
+   * store, and raise the first failure. A true flush point, which
+   * `persistentFs`'s cannot be: nothing synchronous can await OPFS, but it can
+   * wait for the thread that did.
+   */
+  syncSync(): void;
+}
+
+export interface JournalWriterOptions extends PersistentOptions {
+  /** Journal capacity in bytes (default 1 MiB). */
+  bufferSize?: number;
+  /** An existing journal buffer, when the page allocated it. */
+  sab?: SharedArrayBuffer;
+}
+
+export interface JournalWriter<T> {
+  /** The buffer to hand the guest's worker. */
+  readonly sab: SharedArrayBuffer;
+  /** The tree the session starts on. */
+  readonly snapshot: JournalSnapshotEntry[];
+  /** The backing store, prepared by {@link persistentFs}. */
+  readonly store: PersistentFileSystem<T>;
+  /** Stop draining; settles once the loop has left. */
+  stop(): Promise<void>;
+  /** Resolves when everything appended so far has been applied and flushed. */
+  idle(): Promise<void>;
+}
+
+/**
+ * Run the other half, on a thread whose event loop is free: own the backing
+ * store, hand out a snapshot of it, and apply everything the guest journals.
+ *
+ * It parks in `Atomics.waitAsync`, so the backend's own promises still run —
+ * which is the entire difference between this and putting `persistentFs`
+ * behind a live session.
+ */
+export function journalWriter<T extends FileSystem>(
+  backing: T,
+  options?: JournalWriterOptions,
+): Promise<JournalWriter<T>>;
