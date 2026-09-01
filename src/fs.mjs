@@ -1422,6 +1422,22 @@ export async function journalWriter(backing, options = {}) {
     },
     /** Stop draining and settle once the loop has left. */
     async stop() { running = false; jWake(ctrl); await done; },
+    /**
+     * Bytes appended but not yet applied and flushed.
+     *
+     * `idle()` answers "is it safe yet"; this answers "how far off", so a
+     * caller can say what it is waiting for instead of only that it is waiting.
+     * Cheap enough to poll: two atomic loads and no wait.
+     *
+     * It moves in STEPS, not smoothly: the tail advances once per applied
+     * batch, so a large append can read the same figure for the whole drain and
+     * then go straight to zero. Good for "6.9 MB still to write", wrong for a
+     * progress bar — which is a lesson learned by building the bar first.
+     */
+    pending() {
+      const behind = jBehind(Atomics.load(ctrl, J_HEAD), Atomics.load(ctrl, J_TAIL));
+      return behind > 0 ? behind : 0;
+    },
     /** Resolves when everything appended so far has been applied and flushed. */
     async idle() {
       while (jBehind(Atomics.load(ctrl, J_HEAD), Atomics.load(ctrl, J_TAIL)) > 0 && Atomics.load(ctrl, J_STATE) !== J_STOPPED) {
