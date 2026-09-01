@@ -287,8 +287,7 @@ get it wrong:
   interpreter by basename; `env` is a shell builtin here for the same reason, so
   `#!/usr/bin/env php` and `env FOO=bar cmd` both work. Executable means *a
   readable file starting with `#!`*: there are no permission bits to consult.
-  A `#!` line naming `sh` or `ash` is refused — busybox ash is not reentrant, so
-  a nested shell would take the outer one's state with it.
+  `#!/bin/sh` works too: a shell can now run inside a shell, capped at 8 deep.
 - **Pipelines run sequentially**, each stage buffering fully before the next
   starts. Finite pipelines are fine; an infinite producer (`yes | head`)
   never terminates, and there's no backpressure.

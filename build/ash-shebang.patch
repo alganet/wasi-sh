@@ -34,7 +34,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
 
 --- a/shell/ash.c
 +++ b/shell/ash.c
-@@ -9282,6 +9282,275 @@
+@@ -9282,6 +9282,262 @@
  	return *lastp;
  }
  
@@ -155,19 +155,6 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
 +		ash_msg("%s: bad interpreter: #! loop", name);
 +		return -1;
 +	}
-+	if (strcmp(interp, "sh") == 0 || strcmp(interp, "ash") == 0) {
-+		/* busybox ash is not reentrant: ash_main() re-INIT_G()s all
-+		 * three globals structs and never restores them, so a nested
-+		 * shell takes the outer one's variables, functions and script
-+		 * position with it — an interactive session simply ends. That
-+		 * is true of `sh script.sh` typed by hand too, but making
-+		 * `./deploy.sh` reach it silently would turn a rare footgun
-+		 * into the common path. Refuse loudly instead.
-+		 * (Delete this once a nested ash can be made to survive.) */
-+		ash_msg("%s: bad interpreter: %s cannot run inside this shell", name, interp);
-+		return -1;
-+	}
-+
 +	if (*arg)
 +		arglist_unshift(arglist, arg);
 +	arglist_unshift(arglist, interp);
@@ -310,7 +297,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  #if ENABLE_ASH_CMDCMD
  /* Is it "command [-p] PROG ARGS" bltin, no other opts? Return ptr to "PROG" if yes */
  static int
-@@ -10958,11 +11227,19 @@
+@@ -10958,11 +11214,19 @@
  #if ENABLE_ASH_ECHO
  	{ BUILTIN_REGULAR       "echo"    +1, echocmd    },
  #endif
@@ -331,7 +318,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  	{ BUILTIN_SPEC_REG      "eval"    +1, NULL       }, /*evalcmd() has a differing prototype*/
  #define EXECCMD (EVALCMD + \
  				/* eval */	1)
-@@ -11115,6 +11392,14 @@
+@@ -11115,6 +11379,14 @@
  	smallint cmd_is_exec;
  	int vflags;
  	int vlocal;
@@ -346,7 +333,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  
  	errlinno = lineno = cmd->ncmd.linno;
  
-@@ -11132,6 +11417,11 @@
+@@ -11132,6 +11404,11 @@
  	*varlist.lastp = NULL;
  	arglist.lastp = &arglist.list;
  	*arglist.lastp = NULL;
@@ -358,7 +345,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  
  	cmd_flag = 0;
  	cmd_is_exec = 0;
-@@ -11150,6 +11440,24 @@
+@@ -11150,6 +11427,24 @@
  			find_command(arglist.list->text, &cmdentry,
  					cmd_flag | DO_REGBLTIN, pathval());
  
@@ -383,7 +370,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  			vlocal++;
  
  			/* implement bltin and command here */
-@@ -11162,6 +11470,15 @@
+@@ -11162,6 +11457,15 @@
  				vlocal = !spclbltin;
  			}
  			cmd_is_exec = cmdentry.u.cmd == EXECCMD;
@@ -399,7 +386,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  #if ENABLE_ASH_CMDCMD
  			if (cmdentry.u.cmd != COMMANDCMD)
  				break;
-@@ -11241,6 +11558,29 @@
+@@ -11241,6 +11545,29 @@
  			setvareq((*spp)->text, vflags);
  	}
  
@@ -429,7 +416,7 @@ ARCHITECTURE.md, which this patch's behaviour supersedes.
  	/* Print the command if xflag is set. */
  	if (xflag && !inps4) {
  		const char *pfx = "";
-@@ -11382,6 +11722,15 @@
+@@ -11382,6 +11709,15 @@
  		 * reaches the echo. Report it the way a path miss is reported
  		 * instead: a plain 127 "not found", and carry on.
  		 * (Delete this block if exec ever becomes possible.) */

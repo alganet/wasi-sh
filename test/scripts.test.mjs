@@ -618,16 +618,95 @@ test('a #! with no interpreter after it is refused', async (t) => {
   assert.match(r.stderr, /no interpreter after #!/);
 });
 
-// busybox ash is not reentrant — ash_main() re-initialises all three globals
-// structs and never restores them, so a nested shell takes the outer one's
-// variables and script position with it (true of `sh script.sh` typed by hand
-// too). Refuse loudly rather than make `./deploy.sh` the common way to hit it.
-test('a #! naming the shell itself is refused, and the caller survives', async (t) => {
-  if (skipUnlessShebang(t)) return;
-  const r = await sh('./deploy.sh; echo "after=$?"\necho still-here\n',
-    { files: { '/deploy.sh': '#!/bin/sh\necho hi\n' } });
-  assert.equal(r.stdout, 'after=126\nstill-here\n');
-  assert.match(r.stderr, /sh cannot run inside this shell/);
+// ─── a shell inside a shell ──────────────────────────────────────────────────
+// `#!/bin/sh` is the most common shebang there is and it lands on the `sh`
+// applet, which is this shell again. That used to end the whole instance:
+// exitshell() finishes with _exit(), which is proc_exit here, and ash_main()
+// re-runs every INIT_G() over the outer shell's state. build/ash-nested-shell.patch
+// routes a nested shell's exit back out and hands the outer shell its state back.
+// (`sh -c …` typed by hand hit exactly the same wall.)
+const nestedReady = async () => (await sh("echo a; sh -c 'echo n'; echo b")).stdout === 'a\nn\nb\n';
+let nestedOk;
+before(async () => { nestedOk = await nestedReady(); });
+const skipUnlessNested = (t) => {
+  if (nestedOk) return false;
+  t.skip('dist/busybox.wasm predates nested shells — run npm run build:wasm');
+  return true;
+};
+
+test('a nested shell runs and the caller carries on', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const r = await sh("echo a\nsh -c 'echo n'\necho b\necho c\n");
+  assert.equal(r.stdout, 'a\nn\nb\nc\n', 'the outer script used to stop at n');
+  assert.equal(r.exitCode, 0);
+});
+
+test('a #!/bin/sh script runs, with its arguments and its exit status', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const r = await sh('./deploy.sh a b; echo "s=$?"\necho still-here\n',
+    { files: { '/deploy.sh': '#!/bin/sh\necho "deploy $*"\nexit 7\n' } });
+  assert.equal(r.stdout, 'deploy a b\ns=7\nstill-here\n');
+});
+
+test('the outer shell keeps everything a nested one would have taken', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const r = await sh([
+    'X=outer',
+    "alias q='echo aliased'",
+    'f() { echo fn; }',
+    'set -- p1 p2',
+    "sh -c 'echo n'",
+    'echo "X=$X"',
+    'f',
+    'alias q',
+    'echo "args=$*"',
+  ].join('\n') + '\n');
+  assert.equal(r.stdout, "n\nX=outer\nfn\nq='echo aliased'\nargs=p1 p2\n");
+});
+
+test('a nested shell keeps its own state to itself', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const r = await sh([
+    'export V=1',
+    "sh -c 'export V=2; g() { :; }; alias z=:'",
+    'echo "V=$V"',
+    'g 2>/dev/null; echo "g=$?"',
+    'alias z 2>/dev/null; echo "z=$?"',
+  ].join('\n') + '\n');
+  assert.equal(r.stdout, 'V=1\ng=127\nz=1\n');
+});
+
+test('a nested shell composes: pipelines, $( ), redirection, loops', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const piped = await sh("sh -c 'echo n' | tr a-z A-Z\necho after\n");
+  assert.equal(piped.stdout, 'N\nafter\n');
+  const subst = await sh("x=$(sh -c 'echo n')\necho \"got=$x\"\n");
+  assert.equal(subst.stdout, 'got=n\n');
+  const looped = await sh('for i in 1 2 3; do sh -c "echo n$i"; done\necho done\n');
+  assert.equal(looped.stdout, 'n1\nn2\nn3\ndone\n');
+});
+
+// `exec CMD` ends the shell that runs it. run_noexec_applet_and_exit() clears
+// die_func to say "nothing to come back to", which for a nested shell meant
+// the applet's exit() reached proc_exit and took the instance.
+test('exec inside a nested shell ends that shell, not the instance', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const r = await sh("sh -c 'exec echo hi'; echo \"after=$?\"\n");
+  assert.equal(r.stdout, 'hi\nafter=0\n');
+  const wrapper = await sh('./w.sh a b; echo "s=$?"\n',
+    { files: { '/w.sh': '#!/bin/sh\nexec echo "wrapped $*"\n' } });
+  assert.equal(wrapper.stdout, 'wrapped a b\ns=0\n');
+});
+
+// There is no process to fall over and no fork to fail, so a script that runs
+// itself would recurse until the wasm stack traps — which takes the session,
+// the filesystem and every warm instance with it.
+test('a shell that runs itself is stopped at a depth, not at a wasm trap', async (t) => {
+  if (skipUnlessNested(t)) return;
+  const r = await sh('./r.sh; echo "s=$?"\necho alive\n',
+    { files: { '/r.sh': '#!/bin/sh\n./r.sh\n' } });
+  assert.equal(r.stdout, 's=126\nalive\n');
+  assert.match(r.stderr, /shells nested more than \d+ deep/);
 });
 
 // The guard above this section says a slashed unknown name is 127. These say

@@ -1,0 +1,263 @@
+wasi-sh: let a shell run inside a shell.
+
+Applied AFTER ash-shebang.patch, which is what makes it matter: `#!/bin/sh`
+is the most common shebang there is, and it lands on the `sh` applet, which
+is this shell again.
+
+`sh script`, `sh -c …` and `ash …` have always been reachable by typing
+them, and have always been destructive. Upstream ash is a process-per-shell
+program; run_nofork_applet() calls ash_main() again inside the same
+instance, and two things went wrong there:
+
+  1. exitshell() ends in _exit(), which is proc_exit in a wasm build. It
+     ended the WHOLE INSTANCE, so `echo a; sh -c 'echo n'; echo b` printed
+     a and n and then stopped, with status 0 and no error, and an
+     interactive session just ended at the prompt. It now goes out through
+     die_func when one is installed, which is precisely when this shell is
+     a nested one, so the nested shell becomes a command that returned a
+     status.
+
+  2. ash_main() runs every INIT_G() unconditionally: three globals structs,
+     the command hash table, the alias table. On top of that this file
+     carries mutable statics. The outer shell's whole state is saved around
+     the call and put back — the variable scope it was in, its command and
+     alias tables, its loop and function nesting, the parser's pushback and
+     here-documents, the expander's scratch.
+
+The state is written once as an X-macro so the save and the restore cannot
+drift apart, and build/build.sh re-derives the same list from the patched
+source: a busybox update that adds a mutable static fails the build instead
+of quietly corrupting one more thing.
+
+Nesting is capped at 8. There is no process to fall over and no fork to
+fail, so a script that runs itself would recurse until the wasm stack traps
+— which is unrecoverable and takes the session, the filesystem and every
+warm instance with it.
+
+Not undone: the nested shell's own allocations, a few KB abandoned per
+nested shell. That is the bargain every applet in this build makes.
+
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -6109,6 +6109,20 @@
+  * execve wrappers
+  */
+ #if ENABLE_FEATURE_SH_STANDALONE
++/* wasi-sh: run_nofork_applet(), plus save/restore of this shell's whole
++ * mutable state when the applet IS this shell. Defined at the end of the file,
++ * where every static it has to save has been declared. */
++static int ash_run_applet(int applet_no, char **argv);
++
++/* How many shells are on the stack below this one, and how deep one may go.
++ * There is no process to fall over and no fork to fail, so a script that runs
++ * itself would recurse until the wasm stack traps — which is unrecoverable and
++ * takes the session, the filesystem and every warm instance with it. A refusal
++ * is a message. Nonzero also means "this shell is a nested one", which is what
++ * `exec` has to know (see tryexec_applet). */
++#define ASH_NEST_MAX 8
++static unsigned ash_nest_depth;
++
+ static void
+ tryexec_applet(int applet_no, const char *cmd, char **argv, char **envp)
+ {
+@@ -6159,6 +6173,18 @@
+ // which is not expected by the NOEXEC'ed xargs applet! (It gets EINTR on read).
+ // clear_traps() helps with this:
+ 		clear_traps();
++		/* wasi-sh: `exec CMD` in a NESTED shell must end that shell, not
++		 * the instance. run_noexec_applet_and_exit() sets die_func = NULL
++		 * — right for a process being replaced, fatal here: the applet's
++		 * exit() would go straight to proc_exit and take the outer shell,
++		 * or the whole session, with it. Run it as an ordinary in-process
++		 * applet and finish this shell with its status, which is what
++		 * exec means once there is nothing to replace. */
++		if (ash_nest_depth) {
++			exitstatus = ash_run_applet(applet_no, argv);
++			exitshell();
++			/* NOTREACHED */
++		}
+ 		run_noexec_applet_and_exit(applet_no, cmd, argv);
+ 		/* does not return */
+ 	}
+@@ -9323,6 +9349,9 @@
+  * function is through the `env` builtin below, which is why one level is
+  * enough — see the DEPTH refusal.
+  *
++ * `#!/bin/sh` lands on the `sh` applet, which is this shell again; see the
++ * nested-shell block at the end of this file for what makes that survivable.
++ *
+  * Returns 1 if ARGLIST was rewritten and the caller should resolve again,
+  * 0 if NAME is not a shebang file (the caller's existing 127 stands), or
+  * -1 if it is one that must not run — message already printed. */
+@@ -11682,7 +11711,7 @@
+ 			 * and/or wait for user input ineligible for NOFORK:
+ 			 * for example, "yes" or "rm" (rm -i waits for input).
+ 			 */
+-			exitstatus = run_nofork_applet(applet_no, argv);
++			exitstatus = ash_run_applet(applet_no, argv);
+ 			environ = sv_environ;
+ 			/*
+ 			 * Try enabling NOFORK for "yes" applet.
+@@ -15409,6 +15438,18 @@
+ 	 */
+ 	setjobctl(0);
+ 	flush_stdout_stderr();
++	/* wasi-sh: a NESTED shell (`sh -c …`, `sh script`, a `#!/bin/sh` file) is
++	 * an applet call inside this instance, not a process. _exit() here is
++	 * proc_exit in a wasm build: it would end the instance and take the outer
++	 * shell — or the whole interactive session — with it. die_func is set only
++	 * while run_nofork_applet() is on the stack, which is exactly when this
++	 * shell is a nested one, and xfunc_die() is the longjmp back out to it, so
++	 * `sh -c 'exit 3'` becomes a command that returned 3. */
++	if (die_func) {
++		xfunc_error_retval = exitstatus;
++		xfunc_die();
++		/* NOTREACHED */
++	}
+ 	_exit(exitstatus);
+ 	/* NOTREACHED */
+ }
+@@ -15580,6 +15621,143 @@
+ extern int etext();
+ #endif
+ 
++/* ============ Nested shells
++ *
++ * `sh script`, `sh -c …` and — since build/ash-shebang.patch — any `#!/bin/sh`
++ * file reach ash_main() again inside this same instance, through
++ * run_nofork_applet(). Upstream ash is never asked to do that: it is a
++ * process-per-shell program, and re-entering it used to cost the OUTER shell
++ * everything. `echo a; sh -c 'echo n'; echo b` printed a and n and then
++ * stopped, and an interactive session simply ended.
++ *
++ * Two things had to become true.
++ *
++ * 1. A nested shell's exit has to come back. exitshell() ended in _exit(),
++ *    which is proc_exit here — see the routing there.
++ *
++ * 2. It must not keep the globals it allocates. ash_main() runs every INIT_G()
++ *    unconditionally, replacing the three globals structs, the command hash
++ *    table and the alias table; and this file carries mutable statics besides.
++ *    Everything the outer shell is holding at the moment of the call is saved
++ *    below and put back: localvar_stack and the variable scope it names,
++ *    cmdtable, atab, evalskip and the loop/function nesting the outer shell may
++ *    be inside, the parser's pushback and here-document state, the expander's
++ *    scratch.
++ *
++ * ASH_STATE_LIST IS the shell's whole mutable state, written once so that the
++ * save and the restore cannot drift apart. build/build.sh re-derives the same
++ * list from the patched source and fails the build when a busybox update adds
++ * a mutable static that is not named here — the alternative is a nested shell
++ * that quietly corrupts one more thing than it used to.
++ *
++ * What is NOT undone: the nested shell's own allocations. Its globals, hash
++ * table and string stack are abandoned, a few KB per nested shell. That is the
++ * same bargain every applet in this build makes (see README.md's memory note),
++ * and unpicking it would mean teaching ash how to free itself.
++ */
++#if DEBUG
++# define ASH_STATE_DEBUG(F)     F(tracefile)
++#else
++# define ASH_STATE_DEBUG(F)
++#endif
++#if ENABLE_FEATURE_EDITING
++# define ASH_STATE_EDITING(F)   F(line_input_state) F(cmdedit_prompt)
++#else
++# define ASH_STATE_EDITING(F)
++#endif
++#if ENABLE_ASH_ALIAS
++# define ASH_STATE_ALIAS(F)     F(atab)
++#else
++# define ASH_STATE_ALIAS(F)
++#endif
++#if JOBS
++/* shell_tty_info is deliberately absent: it sits inside an `#if 0` upstream. */
++# define ASH_STATE_JOBS(F) \
++	F(jobctl) F(initialpgrp) F(ttyfd) F(jobtab) F(njobs) F(curjob)
++#else
++# define ASH_STATE_JOBS(F)
++#endif
++#if ENABLE_ASH_MAIL
++# define ASH_STATE_MAIL(F)      F(mailtime_hash)
++#else
++# define ASH_STATE_MAIL(F)
++#endif
++
++/* The three globals pointers are not in the list below: they are declared
++ * BB_GLOBAL_CONST, so a __typeof__ member of one cannot be assigned to. They
++ * go through busybox's own ASSIGN_CONST_PTR, which is what INIT_G() uses. */
++#define ASH_STATE_LIST(F) \
++	F(argptr) F(optptr) F(pathopt) \
++	F(doprompt) F(needprompt) \
++	ASH_STATE_DEBUG(F) \
++	ASH_STATE_EDITING(F) \
++	ASH_STATE_ALIAS(F) \
++	ASH_STATE_JOBS(F) \
++	F(cmdnextc) \
++	F(expdest) F(argbackq) F(ifsfirst) F(ifslastp) F(exparg) \
++	F(cmdtable) F(builtinloc) \
++	F(funcblock) F(funcstring_end) \
++	F(evalskip) F(skipcount) F(loopnest) F(funcline) \
++	F(localvar_stack) \
++	F(checkkwd) \
++	ASH_STATE_MAIL(F) \
++	F(tokpushback) F(heredoclist) F(wordtext) \
++	F(backquotelist) F(redirnode) F(heredoc)
++
++struct ash_state {
++	struct globals_misc     *misc;
++	struct globals_memstack *memstack;
++	struct globals_var      *var;
++#define ASH_STATE_MEMBER(name) __typeof__(name) name;
++	ASH_STATE_LIST(ASH_STATE_MEMBER)
++#undef ASH_STATE_MEMBER
++};
++
++#define ASH_STATE_SAVE(name)    saved->name = name;
++#define ASH_STATE_RESTORE(name) name = saved->name;
++
++int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++
++/* wasi-sh: run one applet in-process. Everything but this shell goes straight
++ * to run_nofork_applet(); this shell gets its state handed back afterwards.
++ * Guarded like its forward declaration, beside tryexec_applet(). */
++#if ENABLE_FEATURE_SH_STANDALONE
++static int
++ash_run_applet(int applet_no, char **argv)
++{
++	struct ash_state *saved;
++	int status;
++
++	if (applet_main[applet_no] != ash_main)
++		return run_nofork_applet(applet_no, argv);
++
++	if (ash_nest_depth >= ASH_NEST_MAX) {
++		ash_msg("%s: shells nested more than %u deep", argv[0], ASH_NEST_MAX);
++		return 126;
++	}
++
++	/* ckmalloc, not a local: the longjmp that brings a dying nested shell
++	 * back out of run_nofork_applet() unwinds this frame's registers, and a
++	 * struct this size has no business on the stack of a recursive call. */
++	saved = ckmalloc(sizeof(*saved));
++	saved->misc     = ash_ptr_to_globals_misc;
++	saved->memstack = ash_ptr_to_globals_memstack;
++	saved->var      = ash_ptr_to_globals_var;
++	ASH_STATE_LIST(ASH_STATE_SAVE)
++	ash_nest_depth++;
++
++	status = run_nofork_applet(applet_no, argv);
++
++	ash_nest_depth--;
++	ASSIGN_CONST_PTR(&ash_ptr_to_globals_misc,     saved->misc);
++	ASSIGN_CONST_PTR(&ash_ptr_to_globals_memstack, saved->memstack);
++	ASSIGN_CONST_PTR(&ash_ptr_to_globals_var,      saved->var);
++	ASH_STATE_LIST(ASH_STATE_RESTORE)
++	free(saved);
++	return status;
++}
++#endif /* ENABLE_FEATURE_SH_STANDALONE */
++
+ /*
+  * Main routine.  We initialize things, parse the arguments, execute
+  * profiles if we're a login shell, and then call cmdloop to execute
