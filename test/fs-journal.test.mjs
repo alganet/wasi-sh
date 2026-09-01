@@ -28,6 +28,7 @@ try {
   if (err?.code !== 'ERR_MODULE_NOT_FOUND') throw err;
 }
 
+const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const GUEST = new URL('./fs-journal.guest.mjs', import.meta.url);
 
@@ -182,6 +183,48 @@ if (!zenfs) {
 
   test('a journal is at least big enough for one ordinary write', () => {
     assert.equal(createJournal(16).byteLength, createJournal(65536).byteLength);
+  });
+
+  // The commonest write a shell makes, and it was silently corrupt: `>` opens
+  // with O_TRUNC, which is a touchSync to zero, and @zenfs/core's touch updates
+  // the index inode without shortening the file. Within the session the cache
+  // agrees with itself; the NEXT hydrate reads the file that is really there
+  // and hands back the old bytes past the new end. So this asserts across a
+  // rehydrate, which is where a reload lives.
+  test('a truncated file is truncated on the backend too, after a rehydrate', async () => {
+    const backing = makeBacking(zenfs);
+    const writer = await journalWriter(await backing.make());
+    const fs = journalFs(writer.sab, writer.snapshot);
+    const NEW_FILE = { mode: 0o644, uid: 0, gid: 0 };
+    fs.createFileSync('/index.php', NEW_FILE);
+    fs.writeSync('/index.php', ENC.encode('the original seed, quite a lot longer'), 0);
+    await writer.idle();
+
+    fs.touchSync('/index.php', { size: 0 });          // what `> file` does
+    fs.writeSync('/index.php', ENC.encode('EDITED'), 0);
+    fs.touchSync('/index.php', { size: 6 });
+    await writer.idle();
+
+    assert.equal(DEC.decode(backing.bytes.get('/index.php')), 'EDITED');
+    const rehydrated = await backing.make();
+    await rehydrated.ready();
+    assert.equal(rehydrated.statSync('/index.php').size, 6);
+    await writer.stop();
+  });
+
+  // And the other direction: a file GROWN by touchSync has a zero hole, not
+  // whatever the bytes past its old end used to be.
+  test('a file grown by touchSync gets a zero hole on the backend', async () => {
+    const backing = makeBacking(zenfs);
+    const writer = await journalWriter(await backing.make());
+    const fs = journalFs(writer.sab, writer.snapshot);
+    fs.createFileSync('/g.bin', { mode: 0o644, uid: 0, gid: 0 });
+    fs.writeSync('/g.bin', ENC.encode('abcde'), 0);
+    fs.touchSync('/g.bin', { size: 2 });
+    fs.touchSync('/g.bin', { size: 5 });
+    await writer.idle();
+    assert.deepEqual([...backing.bytes.get('/g.bin')], [...ENC.encode('ab'), 0, 0, 0]);
+    await writer.stop();
   });
 
   // head and tail are Int32 byte counters, so a session that pushes 2 GiB
