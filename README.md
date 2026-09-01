@@ -204,8 +204,17 @@ postMessage({ sab: writer.sab, snapshot: writer.snapshot });
 import { serve } from 'wasi-sh/worker';
 import { journalFs } from 'wasi-sh/fs';
 
-const { sab, snapshot } = await theWriterHandsThisOver;
-serve({ fs: () => journalFs(sab, snapshot) });
+// serve() is called SYNCHRONOUSLY, at the top of the module — it has to win the
+// startup message, and one placed after a top-level await does not. So the wait
+// for the writer's handover goes INSIDE fs(), which is awaited before the shell
+// is built.
+let handOver;
+const handed = new Promise((resolve) => { handOver = resolve; });
+self.addEventListener('message', (e) => {
+  if (e.data?.type === 'store') handOver(journalFs(e.data.sab, e.data.snapshot));
+});
+
+serve({ fs: () => handed });
 ```
 
 Reads come out of a synchronous cache seeded from `snapshot`; every mutation is
@@ -285,8 +294,10 @@ get it wrong:
   builtins both stop; the *shell's* own loops do not, so `while :; do :; done`
   typed at the prompt still wants `terminate()`, and so does a command parked
   in a blocking read.
-- **No symlinks, permissions, or timestamps** in the sandbox FS (`ln` is
-  deliberately absent; `ls -l` shows placeholders).
+- **No symlinks**, and permission bits are carried but not enforced (`ln` and
+  `chmod` are both absent, and `ls -l` shows placeholders for the mode).
+  Timestamps are real, though: `stat` reports them and `[ a -nt b ]` orders two
+  files by mtime — it is `ls -l` in this build that does not print them.
 - A tool that fails or even calls `exit` only sets `$?` — the shell and
   session survive.
 - **Host builtins are builtins**, so every limit above applies to them

@@ -656,7 +656,15 @@ export async function persistentFs(backing, options = {}) {
           // that refuses a non-empty rmdir can never reach it, and one that
           // allows it would otherwise leave a hollow entry under a directory
           // that is gone.
-          if (NEEDS_A_REAL_FILE.has(method)) materializeUnder(String(args[0]));
+          //
+          // BOTH ends of a rename, because `IndexFS.rename` removes the
+          // destination as well when a name is already there —
+          // `if (this.index.has(to)) await this.remove(to)` — so renaming ONTO
+          // an empty file is the same NotFoundError as removing one.
+          if (NEEDS_A_REAL_FILE.has(method)) {
+            materializeUnder(String(args[0]));
+            if (method === 'renameSync') materializeUnder(String(args[1]));
+          }
           try {
             const result = original.apply(backing, args);
             // Only on the way OUT, so a create the cache refused is not
@@ -891,9 +899,15 @@ function encodeFrame(header, payload) {
  * backend.
  *
  * ```js
- * // in the guest's worker
- * const { sab, snapshot } = await handshakeWithTheWriterWorker();
- * serve({ fs: () => journalFs(sab, snapshot) });
+ * // in the guest's worker. serve() is called SYNCHRONOUSLY — it has to win
+ * // the startup message — so the wait for the writer's handover happens
+ * // inside fs(), which is awaited before the shell is built.
+ * let handOver;
+ * const handed = new Promise((resolve) => { handOver = resolve; });
+ * self.addEventListener('message', (e) => {
+ *   if (e.data?.type === 'store') handOver(journalFs(e.data.sab, e.data.snapshot));
+ * });
+ * serve({ fs: () => handed });
  * ```
  *
  * WORKER-ONLY, and it says so rather than failing later: appending under
@@ -1230,6 +1244,11 @@ export async function journalWriter(backing, options = {}) {
     // below waits, because there is nothing else the snapshot could come from.
     try {
       await preparing;
+      // Inside the try, because reading the tree is part of what this writer
+      // promised to do: a store that hydrated and then threw on the walk would
+      // otherwise leave a buffer advertising a live writer with no drain
+      // behind it, which is the one state journalFs cannot detect.
+      snapshot = snapshotStore(store);
     } catch (err) {
       // J_DRAINING is a claim this writer is now failing to honour. Withdraw it
       // rather than leaving a buffer that says a writer is live while the
@@ -1238,7 +1257,6 @@ export async function journalWriter(backing, options = {}) {
       jWake(ctrl);
       throw err;
     }
-    snapshot = snapshotStore(store);
   } else {
     // The caller read the tree itself and hydration is no longer on the path to
     // a running guest — the drain waits for it instead, at the first frame it
