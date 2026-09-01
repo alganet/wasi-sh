@@ -545,8 +545,9 @@ export async function persistentFs(backing, options = {}) {
     // to fix; passing it on latches a phantom failure that stops the whole
     // session at its next write, which is exactly what it did.
     //
-    // Filed as ZENFS.md finding 9. Drop this the day the guard stops reading
-    // stack traces.
+    // ZENFS.md finding 9 — recorded, not filed; nothing on that list is filed
+    // until the demo that justifies it is public. Drop this the day the guard
+    // stops reading stack traces.
     if (err && typeof err.message === 'string' && err.message.endsWith('(Out of sync!)')) return;
     // The queue is one promise chained with `finally`, so ONE failure rejects
     // every link after it — a second look at the chain sees the same error
@@ -1223,6 +1224,8 @@ export async function journalWriter(backing, options = {}) {
   // safe HERE and nowhere else: this store is the writer's alone, no guest
   // holds a descriptor on it, and no inode of it is ever observed. The same
   // fix inside `persistentFs` would change an ino under a running shell.
+  //
+  // ZENFS.md finding 2. Drop this the day `touch` resizes the data.
   const applyResize = (path, metadata) => {
     const before = store.statSync(path);
     if (before.size === metadata.size) { store.touchSync(path, metadata); return; }
