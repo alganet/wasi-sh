@@ -217,6 +217,17 @@ export interface JournalWriterOptions extends PersistentOptions {
   bufferSize?: number;
   /** An existing journal buffer, when the page allocated it. */
   sab?: SharedArrayBuffer;
+  /**
+   * The tree, when the caller has already read it. Supplying one takes
+   * hydrating the backing store off the guest's critical path: the writer
+   * claims the journal and returns, and only the drain waits for the store.
+   *
+   * It must be what the backing store would have produced — parents before
+   * children — because it is what the guest's cache starts as. The cost is
+   * that an open which FAILS is no longer this call rejecting; it arrives at
+   * `onError` and at the guest's next write, like any other write-back failure.
+   */
+  snapshot?: JournalSnapshotEntry[];
 }
 
 export interface JournalWriter<T> {
@@ -224,8 +235,14 @@ export interface JournalWriter<T> {
   readonly sab: SharedArrayBuffer;
   /** The tree the session starts on. */
   readonly snapshot: JournalSnapshotEntry[];
-  /** The backing store, prepared by {@link persistentFs}. */
+  /**
+   * The backing store, prepared by {@link persistentFs}. Throws while the
+   * store is still opening, which `snapshot` makes reachable — await
+   * {@link JournalWriter.ready} instead of reading this at that point.
+   */
   readonly store: PersistentFileSystem<T>;
+  /** Resolves to the backing store once it is open. */
+  readonly ready: Promise<PersistentFileSystem<T>>;
   /** Stop draining; settles once the loop has left. */
   stop(): Promise<void>;
   /** Resolves when everything appended so far has been applied and flushed. */
@@ -241,6 +258,6 @@ export interface JournalWriter<T> {
  * behind a live session.
  */
 export function journalWriter<T extends FileSystem>(
-  backing: T,
+  backing: T | Promise<T>,
   options?: JournalWriterOptions,
 ): Promise<JournalWriter<T>>;

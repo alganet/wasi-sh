@@ -1069,22 +1069,93 @@ export class JournalFs {
  * putting `persistentFs` behind a live session. A thread that parked in
  * `Atomics.wait` here would reproduce law 1 exactly one thread further along.
  *
- * @param backing the store to persist into, prepared with {@link persistentFs}
+ * **`snapshot` takes hydration off the guest's critical path.** By default this
+ * call hydrates the store and then walks it, because a snapshot has nowhere
+ * else to come from — and the guest waits for all of it. A caller that can read
+ * the tree faster than the backend hydrates hands the result over instead, and
+ * only the drain waits:
+ *
+ * ```js
+ * const root = await navigator.storage.getDirectory();
+ * const writer = await journalWriter(
+ *   WebAccess.create({ handle: root }),        // a promise: not awaited here
+ *   { snapshot: await readTheTree(root), onError: (err) => report(err) },
+ * );
+ * postMessage({ sab: writer.sab, snapshot: writer.snapshot });
+ * ```
+ *
+ * The snapshot must be what the backing store would have produced — the shape
+ * `snapshotStore()` returns, parents before children — because it is what the
+ * guest's cache starts as and what every later write is applied on top of. A
+ * tree read at a different moment than the store was opened is the one way to
+ * get this wrong.
+ *
+ * @param backing the store to persist into, or a promise of one
  * @param options.bufferSize journal capacity in bytes (default 1 MiB)
  * @param options.sab an existing journal buffer, when the page made it
+ * @param options.snapshot the tree, when the caller has already read it
  * @param options.onError called with each failure, as it happens
  */
 export async function journalWriter(backing, options = {}) {
-  // NO `onError` through to persistentFs, deliberately. It reports a failure as
-  // it happens and `flush()` raises the same one straight after, and the drain
-  // below flushes every batch — so passing it on made one failed write arrive
-  // at the embedder twice. The flush is the timely report here.
-  const store = await persistentFs(backing);
   const sab = options.sab ?? createJournal(options.bufferSize);
   const ctrl = new Int32Array(sab, 0, J_WORDS);
   const data = new Uint8Array(sab, J_PREFIX);
   const cap = sab.byteLength - J_PREFIX;
-  const snapshot = snapshotStore(store);
+
+  // The buffer is claimed HERE, before anything is awaited, and that ordering
+  // is the whole of `snapshot` below. `journalFs` refuses a journal that is not
+  // draining — rightly, since a store built against one takes writes nothing
+  // will ever apply — so the claim has to be visible to the other thread from
+  // the first synchronous moment, not after a hydrate that may take seconds.
+  // The guard keeps meaning exactly what it says: THIS buffer has a live
+  // writer. What it no longer implies is that the writer has finished opening.
+  let running = true;
+  Atomics.store(ctrl, J_STATE, J_DRAINING);
+
+  // NO `onError` through to persistentFs, deliberately. It reports a failure as
+  // it happens and `flush()` raises the same one straight after, and the drain
+  // below flushes every batch — so passing it on made one failed write arrive
+  // at the embedder twice. The flush is the timely report here.
+  //
+  // `backing` may be a promise, so that opening it is not on the caller's
+  // critical path either: a backend that reads an index of its own costs about
+  // what hydrating it does, and neither is worth the guest waiting on when the
+  // caller already knows what the tree contains.
+  let store = null;
+  const preparing = Promise.resolve(backing)
+    .then((resolved) => persistentFs(resolved))
+    .then((prepared) => (store = prepared));
+
+  let snapshot;
+  if (options.snapshot === undefined) {
+    // The default, and the only shape before this option existed: read the tree
+    // out of the store that was just hydrated, and hand it over. Everything
+    // below waits, because there is nothing else the snapshot could come from.
+    try {
+      await preparing;
+    } catch (err) {
+      // J_DRAINING is a claim this writer is now failing to honour. Withdraw it
+      // rather than leaving a buffer that says a writer is live while the
+      // rejection travels back to a caller who may not connect the two.
+      Atomics.store(ctrl, J_STATE, J_STOPPED);
+      jWake(ctrl);
+      throw err;
+    }
+    snapshot = snapshotStore(store);
+  } else {
+    // The caller read the tree itself and hydration is no longer on the path to
+    // a running guest — the drain waits for it instead, at the first frame it
+    // has to apply. Worth 1.3 s of a 1.9 s cold boot for phasm's dev page,
+    // where the tree is a Laravel `vendor/` and the backend is OPFS: one
+    // parallel read of the directory produces the same snapshot in 591 ms that
+    // hydrating a `WebAccessFS` to be walked takes 1,899 ms to produce.
+    //
+    // The cost is that a hydrate that FAILS is no longer this call rejecting.
+    // It arrives where every other write-back failure does — `onError`, and the
+    // error region the guest raises from at its next write — which is the same
+    // report, later, rather than a different one.
+    snapshot = options.snapshot;
+  }
 
   // The failure the guest is told about, and the only channel it has: a
   // message in the buffer plus a count, so a store on the other thread can
@@ -1155,11 +1226,13 @@ export async function journalWriter(backing, options = {}) {
     }
   };
 
-  let running = true;
-  Atomics.store(ctrl, J_STATE, J_DRAINING);
-
   const drain = async () => {
     try {
+      // Nothing can be applied before there is a store to apply it to. On the
+      // default path this is already settled; on the deferred one it is what
+      // the guest's first write ends up waiting behind, which is the right
+      // place for the wait to land — it is the first moment the answer matters.
+      await preparing;
       while (running) {
         const seq = Atomics.load(ctrl, J_SEQ);
         const head = Atomics.load(ctrl, J_HEAD);
@@ -1208,7 +1281,28 @@ export async function journalWriter(backing, options = {}) {
   return {
     sab,
     snapshot,
-    store,
+    /**
+     * Resolves to the hydrated backing store. Always await this when a
+     * `snapshot` was supplied — that is the whole point of supplying one.
+     */
+    ready: preparing,
+    /**
+     * The hydrated backing store, for a caller that already knows it is open.
+     * A getter rather than a field because `snapshot` makes it legal for this
+     * call to return before there is one, and a property that is silently
+     * `null` for the first second of a session is a defect waiting to be
+     * blamed on the store.
+     */
+    get store() {
+      if (!store) {
+        throw new Error(
+          'journalWriter: the backing store is not open yet. That is what passing `snapshot` buys — '
+          + 'the guest starts on the tree you already read while this hydrates behind it. Await '
+          + '`ready` for the store itself.'
+        );
+      }
+      return store;
+    },
     /** Stop draining and settle once the loop has left. */
     async stop() { running = false; jWake(ctrl); await done; },
     /** Resolves when everything appended so far has been applied and flushed. */
