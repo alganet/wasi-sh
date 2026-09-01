@@ -40,6 +40,7 @@
   <button data-cmd='echo hi | read foo; echo "foo=[$foo]  (pipe stage is a subshell)"'>pipe subshell</button>
   <button data-cmd='w=$(printf "a b c" | while read p q r; do echo "$r$q$p"; done); echo "[$w]"'>nested pipe in $()</button>
   <button data-cmd='r=$(exit 7); echo "rc=$?  (exit status propagates)"; echo still-alive'>exit status</button>
+  <button data-cmd='echo "spinning — press Ctrl-C"; awk "BEGIN{for(;;)i++}"; echo "stopped, rc=$? — and the shell is still here"'>runaway awk (^C)</button>
   <br>Browser bridges:
   <button data-cmd='printf "\033]0;busybox @ wasi-sh\007"; echo "title set — look at the browser tab"'>set tab title</button>
   <button data-cmd='printf "\033]52;c;aGVsbG8gZnJvbSB3YXNpLXNoIPCfk4s=\007"; echo "copied \"hello from wasi-sh\" — paste it anywhere"'>copy to clipboard</button>
@@ -165,7 +166,20 @@ session.exited.then((code) => say("\r\n[shell exited: " + code + "]\r\n"));
 session.onError((e) => say("\r\n[error: " + e.message + "]\r\n"));
 
 term.onData(d => {
-  if (running){ session.write(d); return; }                    // keyboard → shell
+  if (running){                                                // keyboard → shell
+    // …except ^C, which is the one key that must NOT go to stdin. There are no
+    // signals here, so the 0x03 byte is simply read as input by whatever is
+    // running; session.interrupt() is the ^C. It stops an applet at its next
+    // safe point and a host builtin that polls ctx.interrupted(); a loop
+    // written in shell, and a command parked in a blocking read, it cannot
+    // reach. Anything typed BEFORE the ^C still belongs to the command; what
+    // follows it belongs to a command that is being cancelled.
+    const i = d.indexOf("\x03");
+    if (i < 0){ session.write(d); return; }
+    if (i > 0) session.write(d.slice(0, i));
+    term.write("^C"); session.interrupt();
+    return;
+  }
   for (const ch of d){
     if (ch === "\r"){ term.write("\r\n"); const l = line; line = ""; runLine(l); }
     else if (ch === "\x7f" || ch === "\b"){ if (line){ line = line.slice(0,-1); term.write("\b \b"); } }
@@ -188,6 +202,7 @@ for (const btn of document.querySelectorAll("#bar button")){
 say("\x1b[38;5;250mbusybox ash — fork-free command substitution, pipes & subshell isolation.\x1b[0m\r\n");
 say("\x1b[38;5;244mType a command, or click an example above. (builtins only — no exec)\x1b[0m\r\n");
 say("\x1b[38;5;244mThe 'Browser bridges' row talks to the tab title and the system clipboard, both ways.\x1b[0m\r\n");
+say("\x1b[38;5;244mCtrl-C while a command runs is a cooperative interrupt — try 'runaway awk'.\x1b[0m\r\n");
 prompt();
 term.focus();
 </script>
