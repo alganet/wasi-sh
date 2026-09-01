@@ -185,6 +185,116 @@ if (!zenfs) {
     assert.equal(createJournal(16).byteLength, createJournal(65536).byteLength);
   });
 
+  // `snapshot`: hydrating the backing store is no longer what a guest waits
+  // for. The measurement that bought this is in MOAR §4.3c — an OPFS tree the
+  // caller reads itself in 591 ms against 1,899 ms to hydrate a WebAccessFS and
+  // walk it — but the property under test is not the speed. It is that the
+  // session starts on a tree the backing store has not been opened for, and
+  // that nothing written in the meantime is lost.
+  //
+  // A promise nobody has resolved stands in for the slow open, because it is
+  // the only stand-in that cannot accidentally be fast.
+  const gated = () => { let open; return { promise: new Promise((r) => { open = r; }), open }; };
+
+  test('a snapshot the caller supplies starts the session before the store opens', async () => {
+    const backing = makeBacking(zenfs, { '/srv/index.php': '<?php echo "seeded";' });
+    // Read the tree the way the default path would, so what is handed over is
+    // exactly what the store would have produced — the contract the option
+    // documents, held here rather than described.
+    const probe = await journalWriter(await backing.make());
+    const snapshot = probe.snapshot;
+    await probe.stop();
+
+    const gate = gated();
+    const writer = await journalWriter(gate.promise, { snapshot });
+    assert.deepEqual(writer.snapshot, snapshot, 'handed straight back, not re-read');
+
+    // The whole claim: a guest builds its filesystem and reads the project
+    // while the backing store is still a promise nobody has resolved.
+    const guest = startGuest('read-snapshot', writer.sab, writer.snapshot);
+    assert.deepEqual(await guest.next(), { index: '<?php echo "seeded";', listing: ['index.php'] });
+    await guest.done();
+
+    gate.open(await backing.make());
+    await writer.ready;
+    await writer.stop();
+  });
+
+  // The half that would make the option a data-loss bug if it were wrong.
+  test('a write journaled before the store opens is applied once it does', async () => {
+    const backing = makeBacking(zenfs);
+    const probe = await journalWriter(await backing.make());
+    const snapshot = probe.snapshot;
+    await probe.stop();
+
+    const gate = gated();
+    const writer = await journalWriter(gate.promise, { snapshot });
+    const guest = startGuest('write-then-park', writer.sab, writer.snapshot);
+    assert.equal(await guest.next(), 'written');
+    assert.equal(backing.bytes.has('/srv/live.txt'), false,
+      'the drain is waiting on the store, so nothing can have been applied yet');
+
+    gate.open(await backing.make());
+    await writer.idle();
+    assert.equal(
+      DEC.decode(backing.bytes.get('/srv/live.txt')),
+      'written from inside a running guest',
+      'and the write made during the wait is not lost',
+    );
+    assert.equal(await guest.next(), 'woke');
+    await guest.done();
+    await writer.stop();
+  });
+
+  test('the backing store refuses to be read before it is open, by name', async () => {
+    const backing = makeBacking(zenfs);
+    const probe = await journalWriter(await backing.make());
+    await probe.stop();
+
+    const gate = gated();
+    const writer = await journalWriter(gate.promise, { snapshot: probe.snapshot });
+    // Silently null here is the defect this getter exists to refuse: it would
+    // be read as "the store has nothing in it" by the one caller most likely
+    // to look, and only for the first second of a session.
+    assert.throws(() => writer.store, /the backing store is not open yet/);
+    gate.open(await backing.make());
+    assert.equal(await writer.ready, await writer.ready, 'ready settles to the store itself');
+    assert.equal(typeof writer.store.statSync, 'function');
+    await writer.stop();
+  });
+
+  // What the deferral costs, stated as a test rather than as a footnote: an
+  // open that fails is no longer this call rejecting, so it has to arrive on
+  // the channel every other write-back failure uses.
+  test('an open that fails after the snapshot is reported, and stops the writer', async () => {
+    const seen = [];
+    const writer = await journalWriter(
+      Promise.reject(new Error('the directory went away')),
+      { snapshot: [], onError: (err) => seen.push(err) },
+    );
+    await writer.stop();
+    assert.equal(seen.length, 1);
+    assert.match(seen[0].message, /the directory went away/);
+    assert.throws(() => journalFs(writer.sab, []),
+      /the journal writer is stopped/,
+      'and a guest that arrives late is refused rather than writing into nothing');
+  });
+
+  // The default path keeps rejecting, and must also withdraw the claim it made
+  // on the buffer before it knew it could not keep it. Without this, a caller
+  // that catches the rejection and hands the buffer on anyway gets a store
+  // built against a writer that does not exist.
+  test('a hydrate that fails on the default path leaves no buffer claiming a writer', async () => {
+    const sab = createJournal();
+    const stub = Object.fromEntries(
+      ['statSync', 'readdirSync', 'createFileSync', 'mkdirSync', 'rmdirSync',
+        'unlinkSync', 'renameSync', 'readSync', 'writeSync', 'touchSync'].map((n) => [n, () => {}]),
+    );
+    stub.ready = async () => { throw new Error('permission was revoked'); };
+    await assert.rejects(() => journalWriter(stub, { sab }), /could not be hydrated: permission was revoked/);
+    assert.throws(() => journalFs(sab, []), /the journal writer is stopped/);
+  });
+
   // The commonest write a shell makes, and it was silently corrupt: `>` opens
   // with O_TRUNC, which is a touchSync to zero, and @zenfs/core's touch updates
   // the index inode without shortening the file. Within the session the cache

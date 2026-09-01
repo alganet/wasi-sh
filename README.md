@@ -236,6 +236,35 @@ next call, once per failure. A writer that has stopped fails the next write
 *before* the cache moves, because a write that succeeds into a cache nothing
 drains looks exactly like one that saved.
 
+**`snapshot`, when opening the backend is slower than reading the tree.** By
+default the call above hydrates the backing store and then walks it, because a
+snapshot has nowhere else to come from — and the guest waits for all of it. A
+caller that can read the tree faster hands the result over instead; the writer
+claims the journal and returns, and only the drain waits for the store:
+
+```js
+const root = await navigator.storage.getDirectory();
+const writer = await journalWriter(
+  WebAccess.create({ handle: root }),          // a promise — not awaited here
+  { snapshot: await readTheTree(root) },       // what the store would produce
+);
+postMessage({ sab: writer.sab, snapshot: writer.snapshot });
+```
+
+Worth 1.3 s of a 1.9 s cold boot on a 6,504-file tree in OPFS, where reading it
+in parallel costs 591 ms against 1,899 ms to hydrate a `WebAccessFS` and walk
+it. Three things it changes, all of them stated because they are the ways to
+get it wrong:
+
+- **The snapshot must be what the backing store would have produced** — the
+  shape a default `journalWriter()` hands back, parents before children. It is
+  what the guest's cache starts as and what every later write lands on top of.
+- **An open that fails is no longer this call rejecting.** It arrives at
+  `onError`, and at the guest's next write, like any other write-back failure.
+- **`writer.store` throws until the store is open.** Await `writer.ready` for
+  it; a property that is silently empty for the first second of a session is
+  read as a store with nothing in it.
+
 ## Scope and drawbacks — read before depending on it
 
 - **No processes, ever.** There is no fork/exec: no external programs, no
