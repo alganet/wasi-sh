@@ -131,6 +131,44 @@ patch -p1 -d "$BB" < "$here/ash-hostbuiltin.patch"
 # in execve(), which is ENOSYS here.
 patch -p1 -d "$BB" < "$here/ash-shebang.patch"
 
+# A shell that survives being run inside a shell. Depends on ash-shebang.patch
+# only in the sense that it is what makes `#!/bin/sh` worth resolving; the bug
+# it fixes (a nested `sh` ends the whole instance) is reachable by typing.
+patch -p1 -d "$BB" < "$here/ash-nested-shell.patch"
+
+# Drift guard for the patch above. ASH_STATE_LIST() must name every mutable
+# file-scope static in ash.c: one it misses is state a nested shell silently
+# takes from its caller, which is invisible until a script does something odd
+# in a way nobody connects back to here. Re-derive the list from the patched
+# source and compare. `static const` is skipped (read-only), and so are the few
+# the config compiles out — those sit behind the same #if in both places, so
+# this compares NAMES and lets the compiler enforce the guards.
+ash_statics() {
+	sed -n 's/^static \([A-Za-z_][A-Za-z0-9_ *]*[ *]\)\([A-Za-z_][A-Za-z0-9_]*\)\(\[[^]]*\]\)\?\( *=[^;]*\)\?;$/\2/p' \
+	  "$BB/shell/ash.c" | sort -u
+}
+ash_state_list() {
+	# The whole nested-shell block, so the #if'd sub-lists count too.
+	sed -n '/^\/\* ============ Nested shells/,/^struct ash_state {/p' "$BB/shell/ash.c" \
+	  | grep -o 'F(\([A-Za-z_][A-Za-z0-9_]*\))' | sed 's/F(\(.*\))/\1/' | sort -u
+}
+ash_statics > "$work/ash-statics"
+ash_state_list > "$work/ash-state"
+# profile_buf is a profiler's output buffer, not shell state; ash_nest_depth is
+# the nesting counter itself, which MUST survive the restore; shell_tty_info
+# sits inside an `#if 0` upstream (a bash tty-restore feature ash never turned
+# on) and is not compiled at all.
+missing=$(comm -23 "$work/ash-statics" "$work/ash-state" \
+	  | grep -vxE 'profile_buf|ash_nest_depth|shell_tty_info' || true)
+if [ -n "$missing" ]; then
+	echo "ash.c has mutable statics missing from ASH_STATE_LIST():" >&2
+	echo "$missing" >&2
+	echo "A nested shell would take these from its caller. Add them to" >&2
+	echo "build/ash-nested-shell.patch, or add an exemption in build/build.sh." >&2
+	exit 1
+fi
+echo "ash state guard: $(wc -l < "$work/ash-state") names, no drift"
+
 # Cooperative interrupt, applet side: run_nofork_applet arms a baseline, and
 # the safe points (wrapped read/write/readv/writev below, plus awk's and sed's
 # own loops) bail through die_func with 130 when the host's count has moved.

@@ -548,12 +548,41 @@ redirections and pipeline dup2s are the ones already installed.
 - **`env` is also the only way back into the reader**, and only for a file named
   `env` whose own `#!` line names `env`. That one is refused with 126 and a
   message naming the file, rather than recursed.
-- **A `#!` line naming `sh` or `ash` is refused**, with 126. busybox ash is not
-  reentrant: `ash_main()` re-runs all three `INIT_G()`s and never restores them,
-  so a nested shell leaves with the outer one's variables, functions and script
-  position — an interactive session simply ends. That is already true of
-  `sh script.sh` typed by hand; making `./deploy.sh` the ordinary way to reach
-  it would be worse than saying no.
+- **`#!/bin/sh` lands on the `sh` applet, which is this shell again**, and that
+  is survivable — see below.
+
+**A shell inside a shell** (`build/ash-nested-shell.patch`). `sh script`,
+`sh -c …` and `ash …` were always reachable by typing them, and were always
+destructive: `echo a; sh -c 'echo n'; echo b` printed `a` and `n` and then
+stopped, with status 0 and no error, and an interactive session ended at the
+prompt. Upstream ash is a process-per-shell program and `run_nofork_applet()`
+calls `ash_main()` again inside the same instance. Two things were wrong:
+
+- **`exitshell()` ends in `_exit()`**, which is `proc_exit` in a wasm build — it
+  ended the *instance*. It now leaves through `die_func` when one is installed,
+  which is exactly when this shell is a nested one, so the nested shell becomes
+  an ordinary command that returned a status. `exec CMD` needed the same care
+  one layer down: `run_noexec_applet_and_exit()` clears `die_func` to say "there
+  is nothing to come back to", which is right for a process being replaced and
+  fatal here, so a nested `exec` runs the applet in-process and then ends its
+  own shell.
+- **`ash_main()` runs every `INIT_G()` unconditionally** — three globals
+  structs, the command hash table, the alias table — and this file has mutable
+  statics besides. The outer shell's whole state is saved around the call and
+  put back: the variable scope it was in, its command and alias tables, its loop
+  and function nesting, the parser's pushback and here-documents, the expander's
+  scratch.
+
+That state is written once as an X-macro (`ASH_STATE_LIST`) so the save and the
+restore cannot drift apart, and `build/build.sh` **re-derives the same list from
+the patched source and fails the build** if a busybox update adds a mutable
+static that is not named — the alternative is a nested shell that quietly
+corrupts one more thing than it used to. Nesting is capped at 8: there is no
+process to fall over and no fork to fail, so a script that runs itself would
+recurse until the wasm stack traps, which is unrecoverable and takes the
+session, the filesystem and every warm instance with it. What is *not* undone is
+the nested shell's own allocations — a few KB abandoned per nested shell, the
+same bargain every applet in this build makes.
 
 **This supersedes an earlier design statement.** Host builtins used to be
 deliberately unreachable by path, on the grounds that a virtual `/bin` would
