@@ -1,6 +1,6 @@
 {
   "name": "wasi-sh",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Run shell scripts in the browser — busybox ash + coreutils compiled to wasm32-wasi, fork-free",
   "license": "ISC",
   "author": "Alexandre Gomes Gaigalas <alganet@gmail.com>",
