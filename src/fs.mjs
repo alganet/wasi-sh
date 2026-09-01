@@ -528,6 +528,26 @@ export async function persistentFs(backing, options = {}) {
   const { onError } = options;
   const reported = new WeakSet();
   const record = (err) => {
+    // NOT a write failure, and on one engine it is every write. `@zenfs/core`'s
+    // Async mixin re-applies each completed async op to its sync cache unless
+    // it recognises the call as its own — and it recognises it by STRING
+    // MATCHING A V8 STACK TRACE (`at <computed> [as write]`). SpiderMonkey
+    // formats frames as `name@url`, so on Firefox the guard never fires: every
+    // queued op is applied to the cache a second time, and `createFile` and
+    // `mkdir` then throw EEXIST against what they just made, decorated with
+    // ' (Out of sync!)'.
+    //
+    // Tolerated rather than reported, and the reason is structural rather than
+    // hopeful: the wrapper does `await originalMethod(...)` FIRST and only then
+    // touches the cache, so by the time this can throw **the bytes are already
+    // on the backing store**. The cache is right too — this side applied it
+    // synchronously before queueing. So there is nothing to report and nothing
+    // to fix; passing it on latches a phantom failure that stops the whole
+    // session at its next write, which is exactly what it did.
+    //
+    // Filed as ZENFS.md finding 9. Drop this the day the guard stops reading
+    // stack traces.
+    if (err && typeof err.message === 'string' && err.message.endsWith('(Out of sync!)')) return;
     // The queue is one promise chained with `finally`, so ONE failure rejects
     // every link after it — a second look at the chain sees the same error
     // again, for ever. Report each object once and the count means something.
