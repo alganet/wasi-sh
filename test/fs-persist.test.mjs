@@ -108,6 +108,38 @@ if (!zenfs) {
     assert.equal(seen[0].code, 'ENOSPC');
   });
 
+  // Firefox, and it was every write. `@zenfs/core`'s Async mixin re-applies a
+  // completed async op to its sync cache unless it recognises the call as its
+  // own, and it recognises it by string-matching a V8 stack trace
+  // (`at <computed> [as write]`). SpiderMonkey writes frames as `name@url`, so
+  // the guard never fires there: the op is applied twice and `createFile`
+  // throws EEXIST against what it just made, decorated with ' (Out of sync!)'.
+  //
+  // It is not a write failure — the wrapper awaits the real write BEFORE it
+  // touches the cache — so passing it on latches a phantom that stops the
+  // session at its next write. Simulated here rather than waiting for a
+  // browser, because node is V8 and would never produce it.
+  test('a cache re-apply upstream cannot guard against is not a write failure', async () => {
+    const { make, bytes } = makeBacking(zenfs);
+    const raw = await make();
+    const seen = [];
+    const store = await persistentFs(raw, { onError: (err) => seen.push(err) });
+    store.mkdirSync('/srv', NEW_DIR);
+    store.createFileSync('/srv/a.php', NEW_FILE);
+    store.writeSync('/srv/a.php', ENC.encode('written'), 0);
+    await store.flush();
+    assert.equal(DEC.decode(bytes.get('/srv/a.php')), 'written', 'the real write lands first — that is the point');
+
+    // And THEN what the mixin does on SpiderMonkey, after the bytes are down.
+    const outOfSync = Object.assign(new Error('file already exists (Out of sync!)'), { code: 'EEXIST', errno: 17 });
+    raw._promise = Promise.reject(outOfSync);
+    store.writeSync('/srv/a.php', ENC.encode('written'), 0);   // makes the watcher pick the new queue up
+    await store.flush().catch(() => {});
+
+    assert.deepEqual(seen, [], 'nothing to report: the bytes are on the store and the cache is right');
+    assert.doesNotThrow(() => store.syncSync(), 'and nothing latched to stop the next write');
+  });
+
   // The shim calls syncSync() at every proc_exit and reports a throw as data
   // loss on stderr. It cannot wait for the backing store, so what it reports is
   // what has already failed — and reporting it CLEARS it, or the next real
