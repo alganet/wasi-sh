@@ -36,6 +36,12 @@ export function makeBacking(core, seed = {}) {
       const next = new Uint8Array(Math.max(old.length, offset + buffer.length));
       next.set(old); next.set(buffer, offset);
       bytes.set(path, next);
+      // The index is updated too, as `WebAccessFS.write` does it. Without this
+      // the backend's own inode keeps the size `createFile` gave it — zero —
+      // and `IndexFS.rename` then copies `inode.size` bytes, which is a rename
+      // that silently empties the file it moved.
+      const inode = this.index.get(path);
+      if (inode) { inode.update({ size: next.length, mtimeMs: Date.now() }); this.index.set(path, inode); }
     }
     // Faithful to OPFS on purpose: `removeEntry()` on a name the directory
     // does not have throws NotFoundError, and a backend whose `remove` is a

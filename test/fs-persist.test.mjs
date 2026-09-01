@@ -122,6 +122,21 @@ if (!zenfs) {
     assert.ok(bytes.has('/to.txt') && !bytes.has('/from.txt'));
   });
 
+  // `IndexFS.rename` removes the DESTINATION too when one is already there
+  // (`if (this.index.has(to)) await this.remove(to)`), so a rename ONTO an
+  // empty file is the same NotFoundError as removing one.
+  test('an empty file can be renamed over, which the backend also removes', async () => {
+    const { bytes, make } = makeBacking(zenfs);
+    const store = await persistentFs(await make());
+    store.createFileSync('/target.txt', NEW_FILE);          // never written
+    store.createFileSync('/source.txt', NEW_FILE);
+    store.writeSync('/source.txt', ENC.encode('winner'), 0);
+    store.renameSync('/source.txt', '/target.txt');
+    await store.flush();
+    assert.equal(DEC.decode(bytes.get('/target.txt')), 'winner');
+    assert.ok(!bytes.has('/source.txt'));
+  });
+
   test('a store outlives the session that filled it', async () => {
     const backing = makeBacking(zenfs);
     const first = await persistentFs(await backing.make());
