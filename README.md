@@ -137,16 +137,19 @@ live object, so in a browser it is registered inside the worker with
 Every backend that outlives a tab is asynchronous, and the contract is
 synchronous, so the two meet through **hydrate-and-flush**: read the tree into
 a cache before the guest starts, serve every call from it, pipeline the writes
-back out. That is `@zenfs/dom`'s `WebAccessFS` over any
-`FileSystemDirectoryHandle` — so OPFS and a folder the user picked are one
-backend, and neither is ours. `persistentFs()` is the seam:
+back out. `@zenfs/dom` has both halves of that and neither is ours:
+`IndexedDB` for a project that lives in the browser, `WebAccessFS` over any
+`FileSystemDirectoryHandle` for one that lives in a folder the user picked.
+**Reach for `IndexedDB` unless you specifically want that folder** — the
+measurements below are lopsided enough to be a default rather than a
+preference. `persistentFs()` is the seam either way:
 
 ```js
-import { WebAccess } from '@zenfs/dom';
+import { IndexedDB } from '@zenfs/dom';
 import { persistentFs } from 'wasi-sh/fs';
 
 const store = await persistentFs(
-  await WebAccess.create({ handle: await navigator.storage.getDirectory() }),
+  await IndexedDB.create({ storeName: 'my-project' }),
   { onError: (err) => console.error('it did not save:', err) },
 );
 
@@ -164,7 +167,7 @@ persists and a long-lived `spawn()` does not. **`journalFs()` below is the one
 that does.**
 
 It does three things, each of which is silent when it is got wrong.
-**Hydration is not automatic** — `WebAccess.create()` loads the index and not
+**Hydration is not automatic** — `create()` loads the index and not
 the cache, and a store handed over between the two answers ENOENT for every
 file that is really there, so the shell sees an empty project and the first
 thing it writes shadows the real one. **A failed write-back is dropped** — the
@@ -180,6 +183,44 @@ The cache costs roughly 6× the project's size in heap. Sync access handles
 (`createSyncAccessHandle`) are not used and are worker-only; they are the door
 left open for a live SQLite file, not this.
 
+#### Why the default is IndexedDB and not OPFS
+
+**OPFS charges per file, and a project is thousands of them.** This is the
+browser's price and not ZenFS's: in Firefox 153, creating one file in OPFS
+costs ~2.5 ms and opening a sync access handle on it ~5.4 ms, against ~0.07 ms
+to write three kilobytes into a handle that is already open — and 20 ms to
+write six megabytes into one. Bytes are nearly free; handles are not, and a
+file-per-file backend needs one of each per file.
+
+The same 2,041-file, 6.9 MB project seeded through `persistentFs()`, written
+with the operations a journal drain actually replays:
+
+| backend | Firefox 153 | Chromium |
+| --- | --- | --- |
+| `WebAccess` (OPFS) | **34,799 ms** | 3,121 ms |
+| `IndexedDB` | **194 ms** | 183 ms |
+
+179× in Firefox and 17× in Chromium, and — the part that matters if you ship
+to both — the 11× gap *between the browsers* becomes none at all. One
+transaction carries the whole batch, so what the drain flushes in bulk is
+committed in bulk. Verified byte-for-byte on both engines across a reopen,
+including rewrite, truncate, rename and unlink, with no write-back reported
+lost.
+
+What OPFS buys for that price is the other handle: `WebAccessFS` takes any
+`FileSystemDirectoryHandle`, so the same backend that reaches OPFS reaches a
+**real directory on the user's disk** through `showDirectoryPicker()`. That is
+worth every millisecond when it is what you want, and nothing when it is not.
+Reading is not the deciding factor either way — the same tree walks back out of
+OPFS in ~292 ms and out of a hydrated `IndexedDB` in ~838 ms, both of them
+noise beside 34 seconds. Most of that 838 ms is one avoidable thing, noted here
+because it is the shape of ZENFS.md's finding 5 in a second backend:
+`IndexedDB.create()` warms its cache with `for (const id of await tx.keys())
+await tx.get(id)` — one awaited round trip per record. Filling the same cache
+from a single `getAll()` produces a byte-identical tree in ~403 ms in Firefox
+and ~645 ms in Chromium. That is upstream's to fix; reaching into `store.cache`
+to do it yourself buys half a second at the price of a private field.
+
 ### Persisting a session that never ends
 
 A dev environment's shell sits on `/dev/hostreq` for the life of the tab, so
@@ -190,15 +231,22 @@ synchronously, and a second thread whose event loop is free lands them.
 
 ```js
 // writer.worker.mjs — a worker of its own, NOT the one the shell runs in
-import { WebAccess } from '@zenfs/dom';
+import { IndexedDB } from '@zenfs/dom';
 import { journalWriter } from 'wasi-sh/fs';
 
 const writer = await journalWriter(
-  await WebAccess.create({ handle: await navigator.storage.getDirectory() }),
+  await IndexedDB.create({ storeName: 'my-project' }),
   { onError: (err) => console.error('it did not save:', err) },
 );
 postMessage({ sab: writer.sab, snapshot: writer.snapshot });
 ```
+
+The backend is the one from the section above, and the reason to care is
+sharper here than it is there: a drain replays *every* write a long session
+makes, so the per-file price is charged for the whole life of the tab and not
+only at hydrate. A cold seed of 2,041 files is 194 ms of IndexedDB against 35
+seconds of OPFS in Firefox — and a drain that takes 35 seconds is one a reload
+can land in the middle of.
 
 ```js
 // the shell's worker
@@ -263,8 +311,18 @@ postMessage({ sab: writer.sab, snapshot: writer.snapshot });
 
 Worth 1.3 s of a 1.9 s cold boot on a 6,504-file tree in OPFS, where reading it
 in parallel costs 591 ms against 1,899 ms to hydrate a `WebAccessFS` and walk
-it. Three things it changes, all of them stated because they are the ways to
-get it wrong:
+it.
+
+**This is an option and not an upgrade**, and it pays only when you can read the
+tree faster than the backend hydrates. OPFS is such a backend: it holds real
+files, so a parallel walk of the directory beats the index-then-data passes
+`WebAccessFS` makes. `IndexedDB` is not — its records are ZenFS's own inodes
+keyed by id, and there is nothing to read faster without decoding a format that
+is not yours. Leave `snapshot` off there and let the default path hydrate and
+walk (~838 ms on the 2,041-file tree above).
+
+Three things it changes, all of them stated because they are the ways to get it
+wrong:
 
 - **The snapshot must be what the backing store would have produced** — the
   shape a default `journalWriter()` hands back, parents before children. It is
