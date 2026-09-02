@@ -230,10 +230,37 @@ export class RingWriter {
   }
 }
 
+/**
+ * Whether this platform needs the async wait to poll, and how fast.
+ *
+ * Non-zero on node and zero everywhere else, because node is the only engine
+ * measured that does not wake a parked agent on `Atomics.notify` — see
+ * `_waitForAsync`. A browser therefore pays nothing at all for this, which
+ * matters: a shell idling at its prompt is the common case, and a timer that
+ * fires a hundred times a second under it would be the same busy-wait the
+ * suspension was for.
+ *
+ * Ten milliseconds bounds the wake latency of every suspended read on node: a
+ * keystroke waits at most that long, which is under what a terminal notices
+ * and far cheaper than the alternative, which is not working there at all.
+ *
+ * Overridable per reader, so an embedder who has measured their own engine can
+ * say so either way.
+ */
+function defaultWakeTick() {
+  const node = globalThis.process && globalThis.process.versions
+    && typeof globalThis.process.versions.node === 'string';
+  return node ? 10 : 0;
+}
+
 // Consumer side. Lives on a worker thread where Atomics.wait is allowed.
 // toInput() adapts it to the WasiShim `input` contract.
 export class RingReader {
-  constructor(sab) {
+  constructor(sab, { wakeTick = defaultWakeTick() } = {}) {
+    // How often an async wait re-checks on a platform that will not wake it.
+    // Zero — the correct value, and the browser's — means the wait is purely
+    // event-driven and an idle guest costs nothing. See `_waitForAsync`.
+    this.wakeTick = Number(wakeTick) > 0 ? Number(wakeTick) : 0;
     this.ctrl = new Int32Array(sab, 0, CTRL_WORDS);
     // A ONE-BYTE view over IDX_SIGNAL. A byte rather than the whole word
     // because that is the shape a guest polls — CPython's interrupt buffer is
@@ -327,12 +354,69 @@ export class RingReader {
     return Atomics.exchange(this.ctrl, IDX_WINCH, 0) !== 0;
   }
 
+  // The same park as `_waitFor`, without owning the thread while it waits.
+  // `Atomics.waitAsync` hands back a promise on the same seq word the producer
+  // already notifies, so nothing about the protocol changes — only who is
+  // blocked. This is the half a suspending guest needs.
+  //
+  // `wakeTick` is a workaround for one platform and is measured, not assumed.
+  // In a browser worker the notify wakes the thread and the promise settles:
+  // a shell with no timer anywhere, whose page never posts to it after boot,
+  // reaches its prompt and echoes keystrokes on the ring alone. Node does not
+  // wake — the promise stays pending through a notify AND through waitAsync's
+  // own timeout, so nothing self-corrects — and a single `setInterval` in the
+  // same worker makes both work. That is the known V8/Node gap in
+  // `PostNonNestableDelayedTask()` for the foreground task runner
+  // (v8:13238), still open on node 24.18.
+  //
+  // So where the platform will not wake us, we wake ourselves: a plain timer
+  // rather than a raced `waitAsync`, because a race the timer wins leaves the
+  // waiter registered — at one abandoned waiter per tick, a parked shell would
+  // accumulate thousands before the first of them expired.
+  async _waitForAsync(cond, ms) {
+    const deadline = ms == null ? null : Date.now() + ms;
+    for (;;) {
+      const seq = Atomics.load(this.ctrl, IDX_SEQ);
+      if (cond()) return true;
+      const left = deadline == null ? 30000 : deadline - Date.now();
+      if (left <= 0) return cond();
+      if (this.wakeTick > 0) {
+        await new Promise((res) => setTimeout(res, Math.min(left, this.wakeTick)));
+      } else {
+        const r = Atomics.waitAsync(this.ctrl, IDX_SEQ, seq, Math.min(left, 30000));
+        if (r.async) await r.value;
+      }
+      if (deadline == null && cond()) return true;
+      if (deadline != null && Date.now() >= deadline) return cond();
+    }
+  }
+
+  // pollReadable's twin, with the same break conditions — a pending winch
+  // included, so an untimed park still ends on a resize and the guest's poll
+  // wrapper gets its chance to synthesize the SIGWINCH.
+  async pollReadableAsync(ms) {
+    if (this.readable) return true;
+    if (this.closed) return false;
+    if (ms == null || ms > 0) {
+      await this._waitForAsync(() => this.readable || this.closed || this.winchPending(), ms);
+    }
+    return this.readable;
+  }
+
+  // readBlocking's twin: park until bytes arrive (or EOF), then take them.
+  async readBlockingAsync(max) {
+    await this._waitForAsync(() => this.readable || this.ended, null);
+    return this.read(max);
+  }
+
   // The WasiShim `input` contract, bound to this reader.
   toInput() {
     return {
       pollReadable: (ms) => this.pollReadable(ms),
       read: (max) => this.read(max),
       readBlocking: (max) => this.readBlocking(max),
+      readBlockingAsync: (max) => this.readBlockingAsync(max),
+      pollReadableAsync: (ms) => this.pollReadableAsync(ms),
       wait: (ms) => this.wait(ms),
       closed: () => this.closed,
       winsize: () => this.winsize(),

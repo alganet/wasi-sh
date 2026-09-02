@@ -346,3 +346,88 @@ test('a wrapped ring reports EOF rather than throwing into the guest', () => {
   assert.equal(r.closed, true, 'drained and ended is EOF');
   assert.deepEqual(r.read(1024), new Uint8Array(0), 'and a read past it is empty, not an exception');
 });
+
+// ── The async park ──────────────────────────────────────────────────────────
+//
+// `pollReadableAsync` / `readBlockingAsync` are `pollReadable` / `readBlocking`
+// with the thread given back while they wait, which is what lets a suspending
+// guest park without stopping the worker under it (see shim.mjs's
+// `suspendInput`). They are also usable from the main thread, where
+// `Atomics.wait` is forbidden and these are not.
+//
+// On node they run on `wakeTick`'s timer rather than on `Atomics.waitAsync`,
+// because node does not wake a parked agent on `Atomics.notify` — that is what
+// `wakeTick` is for and why it defaults on here. So these cases pin the
+// CONTRACT on every platform and the mechanism only on this one; the
+// event-driven path is exercised in a browser, where it is the only path.
+
+test('wakeTick defaults on under node, and is overridable', () => {
+  const sab = createStdinRing(64);
+  assert.ok(new RingReader(sab).wakeTick > 0, 'node needs the timer; see _waitForAsync');
+  assert.equal(new RingReader(sab, { wakeTick: 0 }).wakeTick, 0);
+  // A tick that is not a positive number would silently pick the branch that
+  // never wakes here, so it is coerced rather than trusted.
+  assert.equal(new RingReader(sab, { wakeTick: -5 }).wakeTick, 0);
+  assert.equal(new RingReader(sab, { wakeTick: 'x' }).wakeTick, 0);
+});
+
+test('pollReadableAsync wakes on a write that lands while it waits', async () => {
+  const { w, r } = pair();
+  const t0 = Date.now();
+  const waiting = r.pollReadableAsync(null);
+  setTimeout(() => w.write(enc.encode('hi')), 60);
+  assert.equal(await waiting, true);
+  assert.ok(Date.now() - t0 >= 50, 'it really waited rather than answering at once');
+  assert.equal(dec.decode(r.read(64)), 'hi');
+});
+
+test('pollReadableAsync answers at once when bytes are already there', async () => {
+  const { w, r } = pair();
+  w.write(enc.encode('hi'));
+  const t0 = Date.now();
+  assert.equal(await r.pollReadableAsync(null), true);
+  assert.ok(Date.now() - t0 < 50, 'no park for a ring that is already readable');
+});
+
+test('pollReadableAsync gives up when its timeout elapses', async () => {
+  const { r } = pair();
+  const t0 = Date.now();
+  assert.equal(await r.pollReadableAsync(120), false);
+  const waited = Date.now() - t0;
+  assert.ok(waited >= 100, `waited the timeout (${waited}ms)`);
+  assert.ok(waited < 400, `and only once — a double wait is the read -t bug (${waited}ms)`);
+});
+
+test('pollReadableAsync ends on a pending winch, so a resize is not sat out', async () => {
+  const { w, r } = pair();
+  const t0 = Date.now();
+  const waiting = r.pollReadableAsync(null);
+  setTimeout(() => w.resize(100, 30), 60);
+  // False, because a resize is not bytes — but it RETURNS, which is the whole
+  // point: the guest's poll wrapper then runs and synthesizes the SIGWINCH.
+  assert.equal(await waiting, false);
+  assert.ok(Date.now() - t0 < 2000, 'the resize ended the park');
+  assert.equal(r.winchPending(), true);
+});
+
+test('readBlockingAsync parks, then hands over what arrived', async () => {
+  const { w, r } = pair();
+  const waiting = r.readBlockingAsync(64);
+  setTimeout(() => w.write(enc.encode('later')), 60);
+  assert.equal(dec.decode(await waiting), 'later');
+});
+
+test('readBlockingAsync returns empty at EOF rather than parking forever', async () => {
+  const { w, r } = pair();
+  const waiting = r.readBlockingAsync(64);
+  setTimeout(() => w.end(), 60);
+  assert.equal((await waiting).length, 0);
+  assert.equal(r.closed, true);
+});
+
+test('toInput() carries both async methods, which is what the shim gates on', () => {
+  const { r } = pair();
+  const input = r.toInput();
+  assert.equal(typeof input.pollReadableAsync, 'function');
+  assert.equal(typeof input.readBlockingAsync, 'function');
+});
