@@ -364,6 +364,93 @@ test('the Up arrow recalls the previous line', async () => {
   writer.end();
 });
 
+// --- prompt expansion (CONFIG_ASH_EXPAND_PRMT) --------------------------------
+//
+// Without it ash hands PS1 to the editor verbatim, so a prompt can report
+// nothing about the shell it belongs to: `$?` prints as the two characters
+// `$?`. That is what these assert against.
+
+test('PS1 is expanded, so the prompt can report the last exit status', async () => {
+  const { writer, live } = spawnTwin(null, { tty: true, env: { PS1: '[$?]$ ' } });
+  await settle();
+  assert.match(screen(live()), /^\[0\]\$ $/, 'a fresh shell has status 0');
+  writer.write(enc.encode('false\r'));
+  await settle();
+  assert.match(screen(live()), /^\[1\]\$ $/, 'and the NEXT prompt carries what false returned');
+  writer.write(enc.encode('true\r'));
+  await settle();
+  assert.match(screen(live()), /^\[0\]\$ $/, 'and goes back down again');
+  writer.end();
+});
+
+test('an OSC marker in PS1 carries the status out to the page', async () => {
+  // What a page wraps a terminal in: one escape per prompt saying "a command
+  // finished, and here is its status". The bare marker fires either way; the
+  // status is the half that needs the expansion. The newline is not decoration
+  // — see the width test below.
+  const { writer, live } = spawnTwin(null, {
+    tty: true, env: { PS1: '\x1b]777;done;$?\x07\n$ ' },
+  });
+  await settle();
+  writer.write(enc.encode('false\r'));
+  await settle();
+  assert.match(live(), /\x1b\]777;done;1\x07\n\$ $/, 'the marker ends with the real status');
+  assert.doesNotMatch(live(), /done;\$\?/, 'and never with the literal $?');
+  writer.end();
+});
+
+test('an escape on the prompt LAST LINE is measured as visible width', async () => {
+  // FEATURE_EDITING_FANCY_PROMPT is off, so there are no \\[ \\] non-printing
+  // markers and the editor measures the last prompt line with
+  // unicode_strwidth() — escape bytes included. A 14-byte OSC left beside "$ "
+  // reports 16 columns for 2, and the editor wraps that much early. Parking it
+  // above the last line costs nothing, which is why the README puts it there.
+  const OSC = '\x1b]777;done;$?\x07';
+  const type = 'x'.repeat(30);                 // 30 chars after a 2-column prompt
+  const run = async (PS1) => {
+    const { writer, live } = spawnTwin(null, {
+      tty: true, env: { PS1, COLUMNS: '40', LINES: '24' },
+    });
+    await settle();
+    const banner = live().length;
+    writer.write(enc.encode(type));
+    await settle();
+    const echoed = live().slice(banner);
+    writer.end();                              // EOF, so the typed line never runs
+    return echoed;
+  };
+  assert.doesNotMatch(await run('$ '), /\r\n/, 'a 2-column prompt fits 30 characters on 40 columns');
+  assert.doesNotMatch(await run(OSC + '\n$ '), /\r\n/, 'and so does one with the escape a line above');
+  assert.match(await run(OSC + '$ '), /\r\n/, 'but on the same line the editor wraps mid-word');
+});
+
+test('a nested shell does not take the outer shell prompt with it', async () => {
+  // Prompt expansion makes cmdedit_prompt an OWNED pointer — putprompt() frees
+  // the previous copy before strdup'ing the next. ash_run_applet() saves and
+  // restores that pointer across a nested shell whose allocations are
+  // abandoned, so the nested shell's first prompt would free the outer's copy
+  // and the restore would hand it back freed. See ash-nested-shell.patch.
+  const { writer, live } = spawnTwin(null, { tty: true, env: { PS1: 'outer:$? ' } });
+  await settle();
+  // Single-quoted: the OUTER shell must not expand $? here, or the nested
+  // shell inherits a prompt with the status already baked in.
+  writer.write(enc.encode("PS1='inner:$? ' sh\r"));
+  await settle();
+  assert.match(screen(live()), /^inner:0 $/, 'the nested shell draws its own prompt');
+  writer.write(enc.encode('false\r'));
+  await settle();
+  assert.match(screen(live()), /^inner:1 $/, 'and expands its own PS1, not the outer one');
+  writer.write(enc.encode('true\r'));
+  await settle();
+  writer.write(enc.encode('exit\r'));
+  await settle();
+  assert.match(screen(live()), /^outer:0 $/, 'and the outer prompt comes back intact');
+  writer.write(enc.encode('echo still-here\r'));
+  await settle();
+  assert.match(live(), /^still-here$/m, 'with a shell that still runs commands');
+  writer.end();
+});
+
 test('without a tty none of that happens, and that is the default', async () => {
   // The compatibility guarantee: an embedder that edits lines in the page (both
   // of ours do) must not suddenly get a second echo of every line from the

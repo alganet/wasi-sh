@@ -521,10 +521,34 @@ yourself to change it.
 
 [v8-13238]: https://groups.google.com/g/v8-reviews/c/J2DrwAc0IwI
 
-One caveat if you set `PS1`: this build has `FEATURE_EDITING_FANCY_PROMPT`
-off, so the editor measures the prompt with `strlen()`. A colour escape in
-`PS1` counts as visible width and puts the cursor in the wrong column — keep it
-plain text.
+### What a prompt can say
+
+`PS1` is **expanded every time it is drawn**, so a prompt can report on the
+shell it belongs to: `$?`, `$PWD`, `$(date)`. That is what a page hangs its
+own markers on — one escape per prompt saying a command finished and how it
+went:
+
+```js
+const session = await spawn({
+  tty: true,
+  env: { PS1: '\x1b]777;done;$?\x07\n$ ' },  // the page reads the OSC, the user sees "$ "
+});
+```
+
+Without expansion that marker reports the two characters `$?` forever, which
+is why `CONFIG_ASH_EXPAND_PRMT` is on in this build.
+
+**Note where the newline is.** `FEATURE_EDITING_FANCY_PROMPT` is off, so the
+editor has no `\[`/`\]` non-printing markers and measures the prompt with
+`unicode_strwidth()` — every escape byte counts as a visible column. What it
+measures is the prompt's LAST LINE (`libbb/lineedit.c`, `parse_and_put_prompt`),
+so an escape parked before a `\n` costs nothing and one left on the visible
+line costs its whole length. Measured on a 40-column terminal, that 14-byte OSC
+sharing a line with `$ ` makes the editor wrap after 25 characters instead of
+38 — a hard `\r\n` through the middle of what you typed.
+
+So: escapes above the last line, plain text on it. The same arithmetic rules
+out a colour escape around the visible prompt — there is nowhere to put it.
 
 ### Completion for a terminal that edits its own lines
 
