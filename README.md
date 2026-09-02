@@ -983,6 +983,15 @@ wraps it in a `FILE*` and never calls `send`/`recv` — so a socket is an
 ordinary fd in the shim's table, and redirection, `poll` and `close` all work
 on it without knowing what it is.
 
+In a browser the net goes in the **worker module**, beside the other live
+objects, because that is the only place one can be given at all — a port is
+methods, and `postMessage` structured-clones them away:
+
+```js
+// my-worker.mjs
+serve({ net: async () => makeNet() });   // a factory: the backend may have setup of its own
+```
+
 Omit `net` and `socket()` fails with `EAFNOSUPPORT`. Nothing else changes, and
 nothing else ever asks.
 
@@ -1027,10 +1036,11 @@ argv — busybox is a multicall binary, argv[0] is `busybox`), `command`
 (`{ '/path': string | Uint8Array }`), `env` (merged over
 `PATH=/ HOME=/ TERM=xterm-256color LANG=C.UTF-8`).
 
-`run` also takes `fs` (a store) and `host` (a capability port). Both need
-`inline: true`, since a live object cannot be structured-cloned into a Worker —
-off-thread runs and `spawn` use `serve({ fs, host })` in a worker module
-instead, and passing either to a stock worker throws and says so. `run` takes
+`run` also takes `fs` (a store), `host` (a capability port) and `net` (a
+socket port). All three need `inline: true`, since a live object cannot be
+structured-cloned into a Worker — off-thread runs and `spawn` use
+`serve({ fs, host, net })` in a worker module instead, and passing `fs` or
+`host` to a stock worker throws and says so. `run` takes
 `requests` (the inbound channel, staged up front); `spawn` takes
 `requestBufferSize` and feeds the same channel live with `session.post()`.
 

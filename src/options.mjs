@@ -267,6 +267,19 @@ export async function resolveHost(spec) {
   return hostPort(typeof spec === 'function' ? await spec() : spec);
 }
 
+// The public `net` option: a port, or a factory returning one. There is no
+// normalization to do — a net is a fixed set of six methods and not a map that
+// could also be a provider — so this is only about the factory, and the factory
+// is the whole point: a backend may have to spawn a thread of its own before it
+// can answer anything, and `serve()` is called synchronously with no chance to
+// await. Resolved before the shell starts, like every other seam; from then on
+// each call into it is synchronous, because a guest inside `connect()` has no
+// event loop turn left to give.
+export async function resolveNet(spec) {
+  if (!spec) return undefined;
+  return typeof spec === 'function' ? await spec() : spec;
+}
+
 // The WasiShim input contract over a fixed byte buffer: drain, then EOF.
 // This is the whole of run()'s stdin story — nothing ever blocks on a user.
 export function fixedInput(data) {
