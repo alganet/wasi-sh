@@ -280,6 +280,44 @@ test('fd_readdir walks children with cookies and d_type', () => {
   assert.equal(dec.decode(t.bytes().slice(0x800 + 24, 0x800 + 24 + nlen2)), 'b.txt');
 });
 
+test('fd_readdir fills the buffer, because short means end-of-directory', () => {
+  // Thirty entries into a buffer that holds about three. wasi-libc reads a
+  // SHORT answer as "the directory ended" and never asks again, so a shim that
+  // stops at the last entry that fits whole hides every entry after it. The
+  // real one hid 699 of the 824 files in Laravel's carbon/src/Carbon/Lang.
+  const files = {};
+  for (let i = 0; i < 30; i++) files[`/many/file-${String(i).padStart(2, '0')}.txt`] = 'x';
+  const t = makeShim({ files });
+  const fd = openPath(t, '/many');
+  const LEN = 128;
+
+  t.p1.fd_readdir(fd, 0x800, LEN, 0n, 0x900);
+  assert.equal(t.view().getUint32(0x900, true), LEN,
+    'a buffer with entries left over must come back full, or the caller stops asking');
+
+  // And the whole directory is reachable by walking the cookies, taking the
+  // last COMPLETE entry's `d_next` each time — which is what a caller does.
+  const seen = [];
+  for (let cookie = 0n, guard = 0; guard < 100; guard++) {
+    const errno = t.p1.fd_readdir(fd, 0x800, LEN, cookie, 0x900);
+    assert.equal(errno, 0);
+    const used = t.view().getUint32(0x900, true);
+    if (!used) break;
+    let at = 0;
+    while (at + 24 <= used) {
+      const next = t.view().getBigUint64(0x800 + at, true);
+      const nlen = t.view().getUint32(0x800 + at + 16, true);
+      if (at + 24 + nlen > used) break;      // a truncated tail entry: re-read it
+      seen.push(dec.decode(t.bytes().slice(0x800 + at + 24, 0x800 + at + 24 + nlen)));
+      cookie = next;
+      at += 24 + nlen;
+    }
+    if (used < LEN) break;
+  }
+  assert.equal(seen.length, 30, 'every entry is reachable');
+  assert.equal(new Set(seen).size, 30, 'and none of them twice');
+});
+
 test('fd_filestat_get reports size for regular files', () => {
   const t = makeShim({ files: { '/f.txt': '12345' } });
   const fd = openPath(t, '/f.txt');

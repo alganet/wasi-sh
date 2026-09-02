@@ -370,12 +370,28 @@ export class WasiShim {
         const next=whence===0?off:whence===1?p.v+off:sz+off;
         if(!Number.isFinite(next)||next<0) return E.INVAL;
         p.v=next; w.dv().setBigUint64(out,BigInt(p.v),true); return 0; },
+      // A SHORT answer means "the directory ended", so a buffer that cannot
+      // hold the next entry must be filled to its last byte rather than left
+      // short of it. wasi-libc reads `used < len` as end-of-directory and
+      // stops asking — it does not re-read with the cookie — so breaking on
+      // the first entry that does not fit silently truncates every directory
+      // bigger than one buffer. Measured on Laravel's vendor tree: 824 entries
+      // in carbon/src/Carbon/Lang, 125 of them visible to `find`.
+      //
+      // So the last entry is written PARTIALLY, header and name both cut at
+      // the end of the buffer, and `used == len` is what tells the caller to
+      // come back with the cookie of the last entry it managed to parse whole.
       fd_readdir:(fd,buf,len,cookie,out)=>{ const f=w.fds.get(fd); if(!f||f.type!=='dir') return E.BADF;
         let ents; try { ents=w.readdirAt(f.path); } catch(e) { return wasiErrno(e); }
-        let p=buf; let idx=Number(cookie); let written=0;
-        for(;idx<ents.length;idx++){ const name=ents[idx]; const nb=strBytes(name); const child=w.statAt(joinPath(f.path,name)); const need=24+nb.length; if(p+need>buf+len)break;
-          w.dv().setBigUint64(p,BigInt(idx+1),true); w.dv().setBigUint64(p+8,BigInt(child?child.ino:0),true); w.dv().setUint32(p+16,nb.length,true); w.dv().setUint8(p+20,child&&isDir(child.mode)?FT.DIR:FT.REG); w.bytes().set(nb,p+24); p+=need; written+=need; }
-        w.dv().setUint32(out,written,true); return 0; },
+        const end=buf+len; let p=buf; let idx=Number(cookie);
+        // One scratch dirent, refilled per entry: bytes 21-23 are the padding
+        // after d_type and stay zero for the life of the buffer.
+        const dirent=new DataView(new ArrayBuffer(24)); const db=new Uint8Array(dirent.buffer);
+        for(;idx<ents.length&&p<end;idx++){ const name=ents[idx]; const nb=strBytes(name); const child=w.statAt(joinPath(f.path,name));
+          dirent.setBigUint64(0,BigInt(idx+1),true); dirent.setBigUint64(8,BigInt(child?child.ino:0),true); dirent.setUint32(16,nb.length,true); dirent.setUint8(20,child&&isDir(child.mode)?FT.DIR:FT.REG);
+          const hn=Math.min(24,end-p); w.bytes().set(db.subarray(0,hn),p); p+=hn;
+          if(p<end){ const nn=Math.min(nb.length,end-p); w.bytes().set(nb.subarray(0,nn),p); p+=nn; } }
+        w.dv().setUint32(out,p-buf,true); return 0; },
       // ---- writable-FS ops (rm/mkdir/rmdir/mv and friends) ----
       path_unlink_file:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),false),
       path_remove_directory:(fd,pathp,plen)=>w.removeNode(w.resolve(fd,w.str(pathp,plen)),true),
