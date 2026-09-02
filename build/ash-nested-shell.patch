@@ -155,7 +155,7 @@ nested shell. That is the bargain every applet in this build makes.
  	_exit(exitstatus);
  	/* NOTREACHED */
  }
-@@ -15580,6 +15628,182 @@
+@@ -15580,6 +15628,194 @@
  extern int etext();
  #endif
  
@@ -321,6 +321,18 @@ nested shell. That is the bargain every applet in this build makes.
 +	saved->memstack = ash_ptr_to_globals_memstack;
 +	saved->var      = ash_ptr_to_globals_var;
 +	ASH_STATE_LIST(ASH_STATE_SAVE)
++#if ENABLE_FEATURE_EDITING && ENABLE_ASH_EXPAND_PRMT
++	/* The one entry above this shell OWNS. With prompt expansion on,
++	 * putprompt() frees cmdedit_prompt before strdup'ing the next one, so a
++	 * nested shell that draws a prompt frees the OUTER shell's copy — and the
++	 * restore below then hands that freed pointer back, to be freed a second
++	 * time at the outer shell's next prompt. Give the nested shell its own
++	 * copy to spend; it is abandoned with the rest of its allocations. A copy
++	 * rather than NULL because setprompt_if() is a no-op when do_set is 0,
++	 * and read_line_input() would then be handed a NULL prompt. */
++	if (cmdedit_prompt)
++		cmdedit_prompt = ckstrdup(cmdedit_prompt);
++#endif
 +	ash_nest_depth++;
 +
 +	status = run_nofork_applet(applet_no, argv);
