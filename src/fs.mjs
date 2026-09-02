@@ -823,6 +823,9 @@ function jWake(ctrl) {
   Atomics.notify(ctrl, J_SEQ);
 }
 
+/** The one refusal a stopped writer earns, from either side of the wait. */
+const jStopped = () => jError('EIO', 'journalFs: the journal writer has stopped, so nothing more can be persisted');
+
 function jError(code, message) {
   const err = new Error(message);
   err.code = code;
@@ -1047,15 +1050,26 @@ export class JournalFs {
       // with a name of its own.
       throw jError('ENAMETOOLONG', `journalFs: this operation does not fit in a ${this.#cap}-byte journal; raise bufferSize`);
     }
-    if (this.#state() === J_STOPPED) {
-      throw jError('EIO', 'journalFs: the journal writer has stopped, so nothing more can be persisted');
-    }
-    if (this.#free() < length && !this.#waitFor(() => this.#free() >= length)) {
+    if (this.#state() === J_STOPPED) throw jStopped();
+    // The wait ends on EITHER answer, and the second one is the whole point:
+    // room arriving means go, and the writer stopping means it never will. The
+    // check above only covers a writer that was already gone when this was
+    // called — a writer that dies while this is parked is invisible to a
+    // condition that asks about space, so every write after it sat out the full
+    // timeout for a drain that was over. Ten seconds each, from a shell.
+    // syncSync() has always short-circuited on the same state; these two agree
+    // now.
+    if (this.#free() < length
+      && !this.#waitFor(() => this.#free() >= length || this.#state() === J_STOPPED)) {
       throw jError('EIO',
         `journalFs: the journal writer did not drain within ${this.#timeout}ms — `
-        + `${length} bytes to append, ${this.#free()} free. It is stopped, wedged, or on a thread `
+        + `${length} bytes to append, ${this.#free()} free. It is wedged, or on a thread `
         + 'whose event loop is blocked, which is the one thing it may not be.');
     }
+    // Asked again rather than inferred from the wait: it may have ended on
+    // either condition, and a writer that has stopped cannot persist this frame
+    // whether or not there is now room for it.
+    if (this.#state() === J_STOPPED) throw jStopped();
   }
 
   #commit(frame) {
