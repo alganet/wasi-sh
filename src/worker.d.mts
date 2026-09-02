@@ -10,6 +10,7 @@
  *           { type:'ready' } | { type:'exit', code } | { type:'error', msg }
  */
 import type { HostBuiltins, BuiltinMap, HostPort, HostVerbMap } from './shim.mjs';
+import type { RingInput } from './ring.mjs';
 import type { FileSystem } from './fs.mjs';
 
 export interface ServeOptions {
@@ -19,7 +20,8 @@ export interface ServeOptions {
    * where any heavy async setup belongs (booting a wasm interpreter, opening
    * OPFS). Handlers themselves must be synchronous.
    */
-  builtins?: BuiltinMap | HostBuiltins | (() => BuiltinMap | HostBuiltins | Promise<BuiltinMap | HostBuiltins>);
+  builtins?: BuiltinMap | HostBuiltins
+    | ((session: ServeSession) => BuiltinMap | HostBuiltins | Promise<BuiltinMap | HostBuiltins>);
   /**
    * The filesystem this worker's shell runs on; omitted, it gets the default
    * in-memory store seeded with `files`. Like builtins, a store is a live
