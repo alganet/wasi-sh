@@ -123,9 +123,9 @@ export function hostBuiltins(spec) {
 // either. The factory is the only reason this is async — it exists so a worker
 // can `await` a heavy dependency (a wasm interpreter, an OPFS handle) ONCE,
 // before _start(), and keep every handler synchronous afterwards.
-export async function resolveBuiltins(spec) {
+export async function resolveBuiltins(spec, session) {
   if (!spec) return undefined;
-  return hostBuiltins(typeof spec === 'function' ? await spec() : spec);
+  return hostBuiltins(typeof spec === 'function' ? await spec(session) : spec);
 }
 
 // Normalize `host` into the shim's port contract:

@@ -94,7 +94,11 @@ self.addEventListener('message', async (e) => {
     // Builtin setup and wasm compilation are independent; overlapping them
     // hides an interpreter-sized init behind the compile.
     const [builtins, host, compiled] = await Promise.all([
-      resolveBuiltins(config.builtins).catch((ex) => {
+      // `builtins()` is handed the session's own input, which is the only way
+      // to reach the things that exist HERE and nowhere else — the signal cell
+      // a hosted runtime polls, the terminal geometry it may want at startup.
+      // A setup function that takes no argument is unaffected.
+      resolveBuiltins(config.builtins, { input }).catch((ex) => {
         throw new Error(`serve({ builtins }): setup failed: ${(ex && ex.message) || ex}`);
       }),
       resolveHost(config.host).catch((ex) => {
