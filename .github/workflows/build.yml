@@ -95,9 +95,16 @@ jobs:
       # No install step, and that is the point: this job builds the binary that
       # release.yml publishes, so nothing third-party is fetched or executed
       # anywhere near it. The package still has zero `dependencies`; the one
-      # devDependency is exercised in the separate `conformance` job below,
-      # which never touches dist/. test/fs-zenfs.test.mjs skips itself when the
-      # package is absent, so the suite here is complete on its own terms.
+      # devDependency is exercised in the separate job below, which never
+      # touches dist/.
+      #
+      # THREE suites skip themselves here for want of it — fs-zenfs, fs-journal
+      # and fs-persist — so this run is complete only about the code that needs
+      # no backend. What covers the rest is the other job, and what keeps that
+      # claim true is test/workflow.test.mjs, which runs HERE: it fails when a
+      # suite needing the dev dependency is missing from the line that names
+      # them. The comment this replaces said the suite was complete on its own
+      # terms and was wrong by 815 lines.
       - name: Test
         run: npm test
 
@@ -143,8 +150,20 @@ jobs:
       - name: Install dev dependencies
         run: npm install --no-audit --no-fund --ignore-scripts
 
-      # Not `npm test`: that wants dist/busybox.wasm, and these files are pure
-      # JS bar one case that runs a shell and skips without it. A skipped
+      # Not `npm test`: its pretest guard wants dist/busybox.wasm, and this job
+      # deliberately has no build. So the files are named, and they are pure JS
+      # bar a handful of cases that want a shell and skip without one. A skipped
       # @zenfs/core suite here would mean the install failed.
-      - name: Run the fs conformance suite
-        run: node --test test/fs.test.mjs test/fs-conformance.test.mjs test/fs-zenfs.test.mjs
+      #
+      # The list is by hand because it has to be — which file needs a wasm build
+      # is not something a glob can answer — and by hand is how fs-journal and
+      # fs-persist came to run in neither job. test/workflow.test.mjs reads this
+      # line and fails when it misses one.
+      - name: Run the suites that need @zenfs/core
+        run: >
+          node --test
+          test/fs.test.mjs
+          test/fs-conformance.test.mjs
+          test/fs-zenfs.test.mjs
+          test/fs-journal.test.mjs
+          test/fs-persist.test.mjs
