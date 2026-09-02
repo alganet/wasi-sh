@@ -164,18 +164,23 @@ patch -p1 -d "$BB" < "$here/wget-https.patch"
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null
 
-# libbb's socket helpers don't compile against wasi-libc (no getsockname, no
-# sockaddr_un.sun_path) and the ash-only config never links them — drop them
-# from the object list instead of letting them abort the libbb build.
-# (Kbuild.src, not Kbuild: make regenerates the latter from the former.)
-# EXPERIMENT: keep xconnect.o and see what breaks
+# libbb/xconnect.o is KEPT, and used to be dropped here — it is the socket code
+# wget needs, and what stopped it compiling against wasi-libc was three small
+# things rather than one large one. All three are answered in shim/wasi_compat.h:
+# WASI's poll has no POLLPRI at all, its sockaddr_un has no sun_path for dead
+# code to mention, and getsockname/getpeername go undeclared — the only hard
+# error, because busybox takes their ADDRESS and an implicitly-declared
+# function has none.
+#
+# The sed that dropped it (from Kbuild.src, not Kbuild — make regenerates the
+# latter) is gone rather than commented out: what it removed is now wanted.
 
 # --- compiler wrappers ----------------------------------------------------------
 SHIM="$here/shim"
 CFLAGS_WASM="-mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
   -fno-sanitize=all \
   -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID \
-  -D_WASI_EMULATED_PROCESS_CLOCKS -D_GNU_SOURCE -DSOCK_RDM=4 -D__wasilibc_use_wasip2 \
+  -D_WASI_EMULATED_PROCESS_CLOCKS -D_GNU_SOURCE -DSOCK_RDM=4 \
   -include $SHIM/wasi_compat.h -I$SHIM \
   -Wno-implicit-function-declaration -Wno-int-conversion -Wno-error"
 
