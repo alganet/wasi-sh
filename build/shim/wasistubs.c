@@ -485,3 +485,150 @@ int host_builtin_run(char **argv, char **envp)
 	r = __host_builtin_run(cwd, argc, argv, envp);
 	return r < 0 ? -1 : (r & 0xFF);   /* WEXITSTATUS-style clamp */
 }
+
+/* ---- sockets, over whatever the embedder puts on the other end -------------
+ *
+ * WASI preview1 has `sock_recv`, `sock_send` and `sock_shutdown` for
+ * descriptors it was ALREADY given, and no way whatsoever to originate a
+ * connection: there is no socket() and no connect(). So the four calls busybox
+ * needs to reach a host are supplied here, by the usual mechanism — an
+ * unresolved __host_* symbol becomes an env.* import that the JS shim answers
+ * (see the `net` seam in src/shim.mjs).
+ *
+ * Only four cross the boundary. read(2) and write(2) do the I/O, because that
+ * is what busybox's wget uses — it wraps the descriptor in a FILE* — so the
+ * socket is an ordinary fd in the shim's own table and needs no send/recv of
+ * its own. The rest of what xconnect.c reaches for is formatting, and is
+ * answered here rather than in JS: crossing a boundary to sprintf an address
+ * would be a strange thing to do.
+ *
+ * Addresses travel as an i32 in NETWORK byte order, which is what
+ * `struct in_addr` already holds, so neither side converts and neither side
+ * can convert wrongly.
+ */
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+extern int __host_sock_open(void);
+extern int __host_sock_connect(int fd, unsigned addr, int port);
+extern int __host_sock_resolve(const char *name, unsigned *addr);
+
+int socket(int domain, int type, int protocol)
+{
+	(void) protocol;
+	/* AF_INET/SOCK_STREAM only, and saying so here means the shim never has
+	 * to. A guest asking for a datagram or a unix socket is asking for
+	 * something this stack cannot become. */
+	if (domain != AF_INET || type != SOCK_STREAM) { errno = EAFNOSUPPORT; return -1; }
+	{
+		int fd = __host_sock_open();
+		if (fd < 0) { errno = EMFILE; return -1; }
+		return fd;
+	}
+}
+
+int connect(int fd, const struct sockaddr *sa, socklen_t len)
+{
+	const struct sockaddr_in *in = (const struct sockaddr_in *) sa;
+
+	if (sa == NULL || len < (socklen_t) sizeof(*in) || sa->sa_family != AF_INET) {
+		errno = EAFNOSUPPORT;
+		return -1;
+	}
+	if (__host_sock_connect(fd, (unsigned) in->sin_addr.s_addr, ntohs(in->sin_port)) != 0) {
+		errno = ECONNREFUSED;
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * `service` is always NULL here and `node` is never a numeric address:
+ * xconnect.c's str2sockaddr() takes the port off the string itself and tries
+ * inet_aton() before it gets this far, so what arrives is a hostname and
+ * nothing else. One AF_INET answer with a zero port is therefore the whole
+ * contract — the caller fills the port in afterwards.
+ */
+int getaddrinfo(const char *node, const char *service,
+		const struct addrinfo *hints, struct addrinfo **res)
+{
+	struct addrinfo *ai;
+	struct sockaddr_in *sin;
+	unsigned addr = 0;
+
+	(void) service;
+	(void) hints;
+	if (node == NULL || res == NULL) return EAI_NONAME;
+	if (__host_sock_resolve(node, &addr) != 0) return EAI_NONAME;
+
+	ai = calloc(1, sizeof *ai);
+	sin = calloc(1, sizeof *sin);
+	if (!ai || !sin) { free(ai); free(sin); return EAI_MEMORY; }
+
+	sin->sin_family = AF_INET;
+	sin->sin_port = 0;
+	sin->sin_addr.s_addr = addr;
+
+	ai->ai_family = AF_INET;
+	ai->ai_socktype = SOCK_STREAM;
+	ai->ai_protocol = 0;
+	ai->ai_addrlen = sizeof *sin;
+	ai->ai_addr = (struct sockaddr *) sin;
+	ai->ai_next = NULL;
+	*res = ai;
+	return 0;
+}
+
+void freeaddrinfo(struct addrinfo *ai)
+{
+	while (ai) {
+		struct addrinfo *next = ai->ai_next;
+		free(ai->ai_addr);
+		free(ai);
+		ai = next;
+	}
+}
+
+char *inet_ntoa(struct in_addr in)
+{
+	static char buf[16];
+	unsigned char *b = (unsigned char *) &in.s_addr;
+
+	sprintf(buf, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+	return buf;
+}
+
+/*
+ * Numeric always. There is no reverse resolver behind any of this, and a
+ * getnameinfo() that invented a name would be inventing the one thing the
+ * caller asked it to look up.
+ */
+int getnameinfo(const struct sockaddr *sa, socklen_t salen,
+		char *host, socklen_t hostlen,
+		char *serv, socklen_t servlen, int flags)
+{
+	const struct sockaddr_in *in = (const struct sockaddr_in *) sa;
+
+	(void) flags;
+	if (!sa || salen < (socklen_t) sizeof(*in) || sa->sa_family != AF_INET) return EAI_FAMILY;
+	if (host && hostlen) snprintf(host, hostlen, "%s", inet_ntoa(in->sin_addr));
+	if (serv && servlen) snprintf(serv, servlen, "%u", (unsigned) ntohs(in->sin_port));
+	return 0;
+}
+
+/*
+ * No alarm, and nothing to deliver one with: there are no signals here, so a
+ * clock that promised to interrupt something could only lie. wget's status bar
+ * asks for one per second and redraws on incoming data regardless, which is
+ * the behaviour that survives.
+ */
+unsigned alarm(unsigned seconds)
+{
+	(void) seconds;
+	return 0;
+}

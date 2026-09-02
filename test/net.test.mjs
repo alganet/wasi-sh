@@ -180,3 +180,105 @@ test('without a net, a socket cannot be made at all', () => {
   assert.equal(t.env.__host_sock_open(), -1);
   assert.equal(t.env.__host_sock_resolve(0x100, 0x300), -1);
 });
+
+// ─── end to end: the real applet, over a net that answers from memory ────────
+
+import { run } from '../src/run.mjs';
+import { existsSync } from 'node:fs';
+
+const HAVE_WASM = existsSync(new URL('../dist/busybox.wasm', import.meta.url));
+const e2e = { skip: HAVE_WASM ? false : 'dist/busybox.wasm is missing — run npm run build:wasm' };
+
+/**
+ * A net that speaks HTTP without a network.
+ *
+ * Enough to prove the whole path: wget resolves a name, opens a descriptor,
+ * connects, writes a request through fd_write and reads the answer through
+ * fd_read. What carries the bytes is not wasi-sh's business — sockfetch is what
+ * this project puts here, and it is tested where it lives.
+ */
+function cannedNet(respond) {
+  const conns = new Map();
+  const names = new Map();
+  let next = 1;
+  let id = 0;
+  return {
+    seen: [],
+    resolve(name) {
+      if (!names.has(name)) names.set(name, `172.29.0.${++id}`);
+      return names.get(name);
+    },
+    connect(addr, port) {
+      const h = next++;
+      conns.set(h, { addr, port, req: '', out: null, off: 0 });
+      this.seen.push({ addr, port });
+      return h;
+    },
+    send(h, bytes) {
+      const c = conns.get(h);
+      c.req += dec.decode(bytes);
+      if (c.req.includes('\r\n\r\n')) c.out = enc.encode(respond(c.req, c.port));
+      return bytes.length;
+    },
+    recv(h, max) {
+      const c = conns.get(h);
+      if (!c.out) return null;
+      const slice = c.out.subarray(c.off, c.off + max);
+      c.off += slice.length;
+      return slice;
+    },
+    poll(h) {
+      const c = conns.get(h);
+      return { readable: !!c.out, writable: true, hup: !!c.out && c.off >= c.out.length };
+    },
+    close(h) { conns.delete(h); },
+  };
+}
+
+const httpOk = (body) => [
+  'HTTP/1.1 200 OK', 'Content-Type: text/plain',
+  `Content-Length: ${body.length}`, 'Connection: close', '', body,
+].join('\r\n');
+
+test('wget fetches, for real', e2e, async () => {
+  const net = cannedNet(() => httpOk('hello from a net'));
+  const r = await run({ inline: true, net, args: ['wget', '-q', '-O', '-', 'http://example.test/thing'] });
+
+  assert.equal(r.exitCode, 0, r.stderr);
+  assert.equal(r.stdout, 'hello from a net');
+  // The name was resolved and the alias connected to, on the default port.
+  assert.deepEqual(net.seen, [{ addr: '172.29.0.1', port: 80 }]);
+});
+
+test('wget writes a request the other end can read', e2e, async () => {
+  let seenRequest = '';
+  const net = cannedNet((req) => { seenRequest = req; return httpOk('x'); });
+  await run({ inline: true, net, args: ['wget', '-q', '-O', '-', 'http://example.test/a/b?c=d'] });
+
+  assert.match(seenRequest, /^GET \/a\/b\?c=d HTTP\/1\.1\r\n/);
+  assert.match(seenRequest, /Host: example\.test\r\n/);
+});
+
+test('https is spoken as plaintext on 443', e2e, async () => {
+  // build/wget-https.patch. Without it wget refuses the scheme outright, and a
+  // script does not choose its scheme — a redirect hands it one.
+  const net = cannedNet(() => httpOk('secure enough'));
+  const r = await run({ inline: true, net, args: ['wget', '-q', '-O', '-', 'https://example.test/thing'] });
+
+  assert.equal(r.exitCode, 0, r.stderr);
+  assert.equal(r.stdout, 'secure enough');
+  assert.equal(net.seen[0].port, 443, 'the port is the only thing left saying https');
+});
+
+test("wget reports the server's error as its own", e2e, async () => {
+  const net = cannedNet(() => 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+  const r = await run({ inline: true, net, args: ['wget', '-O', '-', 'http://example.test/missing'] });
+
+  assert.notEqual(r.exitCode, 0);
+  assert.match(r.stderr, /404 Not Found/);
+});
+
+test('without a net, wget fails rather than hanging', e2e, async () => {
+  const r = await run({ inline: true, args: ['wget', '-q', '-O', '-', 'http://example.test/thing'] });
+  assert.notEqual(r.exitCode, 0);
+});

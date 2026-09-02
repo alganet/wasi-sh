@@ -12,6 +12,31 @@
 #define SOCK_RDM 4
 #endif
 
+/* WASI's poll has no urgent-data bit: __header_poll.h defines POLLRDNORM,
+ * POLLWRNORM, POLLIN, POLLOUT, POLLERR, POLLHUP and POLLNVAL and stops there.
+ * wget asks for `POLLIN | POLLPRI` and so will not compile without one.
+ *
+ * NOT Linux's 0x002, which is POLLWRNORM here — a value that would quietly ask
+ * for writability. An unused bit instead: nothing ever reports it, which is
+ * the truth, since there is no out-of-band data on a socket made of fetch. */
+#ifndef POLLPRI
+#define POLLPRI 0x8
+#endif
+
+/* wasi-libc's sockaddr_un is `{ sa_family_t sun_family; }` and nothing else —
+ * "WASI has no UNIX-domain sockets", says the comment above it. busybox's
+ * xconnect.c names sun_path in two branches that ENABLE_FEATURE_UNIX_LOCAL
+ * compiles out at runtime and the compiler still has to parse.
+ *
+ * Claiming wasi-libc's own guard is the same move struct winsize makes below:
+ * this header is force-included first, so the definition here is the one
+ * everybody sees and <sys/un.h> later finds its work already done. There are
+ * still no unix sockets; there is now a member for dead code to mention. */
+#ifndef __wasilibc___struct_sockaddr_un_h
+#define __wasilibc___struct_sockaddr_un_h
+struct sockaddr_un { unsigned short sun_family; char sun_path[108]; };
+#endif
+
 #ifndef TIOCGWINSZ
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414

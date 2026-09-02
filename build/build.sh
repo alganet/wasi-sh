@@ -155,6 +155,11 @@ patch -p1 -d "$BB" < "$here/ash-shebang-path.patch"
 # in how it keeps builtintab's hand-counted offsets honest.
 patch -p1 -d "$BB" < "$here/ash-compgen.patch"
 
+# wget's https:// URLs, spoken as plaintext on 443. Without it wget refuses the
+# scheme most of the web answers on — and a script does not choose its scheme,
+# a redirect hands it one. The TLS is the host's; see the patch's own comment.
+patch -p1 -d "$BB" < "$here/wget-https.patch"
+
 # --- configure (ash-only + LFS + read-frac + math-base) ------------------------
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null
@@ -163,14 +168,14 @@ yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null
 # sockaddr_un.sun_path) and the ash-only config never links them — drop them
 # from the object list instead of letting them abort the libbb build.
 # (Kbuild.src, not Kbuild: make regenerates the latter from the former.)
-sed -i.orig '/lib-y += xconnect\.o/d' "$BB/libbb/Kbuild.src"
+# EXPERIMENT: keep xconnect.o and see what breaks
 
 # --- compiler wrappers ----------------------------------------------------------
 SHIM="$here/shim"
 CFLAGS_WASM="-mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
   -fno-sanitize=all \
   -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID \
-  -D_WASI_EMULATED_PROCESS_CLOCKS -D_GNU_SOURCE -DSOCK_RDM=4 \
+  -D_WASI_EMULATED_PROCESS_CLOCKS -D_GNU_SOURCE -DSOCK_RDM=4 -D__wasilibc_use_wasip2 \
   -include $SHIM/wasi_compat.h -I$SHIM \
   -Wno-implicit-function-declaration -Wno-int-conversion -Wno-error"
 
