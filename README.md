@@ -146,11 +146,15 @@ preference. `persistentFs()` is the seam either way:
 
 ```js
 import { IndexedDB } from '@zenfs/dom';
-import { persistentFs } from 'wasi-sh/fs';
+import { indexedDbFlushPoint, persistentFs } from 'wasi-sh/fs';
 
 const store = await persistentFs(
   await IndexedDB.create({ storeName: 'my-project' }),
-  { onError: (err) => console.error('it did not save:', err) },
+  {
+    onError: (err) => console.error('it did not save:', err),
+    // Not optional for this backend. See below.
+    commit: indexedDbFlushPoint({ database: 'my-project' }),
+  },
 );
 
 await run({ inline: true, fs: store, command: 'echo hi > /a.txt' });
@@ -176,6 +180,37 @@ invisible; `onError` is told as it happens and `flush()` raises it.
 And **`syncSync()` cannot flush an async backend** — it is the shim's one flush
 point, at every `proc_exit`, and nothing synchronous can await OPFS, so what it
 reports is what has already failed. `flush()` is the awaitable half.
+
+##### `commit`, and why `IndexedDB` needs one
+
+Those three are the `Async` mixin's gaps. There is a fourth, for the backend
+where the mixin is not there at all, and it is the worst of them because
+everything above it goes on returning successfully.
+
+`WebAccess.create()` returns an `Async(IndexFS)`, so its `sync()` awaits the
+write-back chain and `flush()` means what it says. **`IndexedDB.create()`
+returns a bare `StoreFS`**, whose `sync()` is `async sync() { }` — an empty
+function — over a store whose own `sync()` is `Promise.resolve()`. Its writes
+are neither queued on a promise this adapter can watch nor thrown from the call,
+so without a `commit` its `flush()` resolves at once and promises nothing, and
+`onError` never fires. Measured, the same writes through `flush()`:
+
+| files | `IndexedDB`, no `commit` | `WebAccess` |
+| --- | --- | --- |
+| 300 | **0 ms** | 355 ms |
+| 1200 | **0 ms** | 1686 ms |
+
+`indexedDbFlushPoint({ database, store })` is the barrier, and it is built out
+of one guarantee: transactions whose scopes overlap and of which one is
+`readwrite` run **in the order they were created**, per database, across every
+connection. So waiting for a `readonly` transaction created now is a way of
+waiting for every write issued before it — which needs the two names the
+embedder already chose and no ZenFS internal at all.
+
+**There is no way to detect this from here**, which is why it is an argument
+rather than a default: a bare `StoreFS` over an asynchronous store is
+indistinguishable from one over a synchronous store, and the synchronous one is
+`InMemory`, which is perfectly honest. Recorded as ZENFS.md finding 11.
 
 Measured in Chromium against OPFS, 2,000 files / 15 MB: hydrate **~500 ms**,
 a `writeSync` the guest sees as **0 ms**, its write-back **~13 ms** behind it.
@@ -838,7 +873,7 @@ driven from the page.
 | `wasi-sh/node` | `run`, `runScript`, `compileWasm`, `readTree` (fs sugar; node-only) |
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
 | `wasi-sh/ring` | `createRing`, `RingWriter`, `RingReader`, `frameRequest` — the SAB rings |
-| `wasi-sh/fs` | `memoryFs`, `persistentFs`, `journalFs`/`journalWriter` and the `fs` contract — the filesystem, pluggable |
+| `wasi-sh/fs` | `memoryFs`, `persistentFs`, `indexedDbFlushPoint`, `journalFs`/`journalWriter` and the `fs` contract — the filesystem, pluggable |
 | `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
 | `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register builtins, a store, a host port |

@@ -16,7 +16,7 @@
 // installing exactly one thing.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { persistentFs } from '../src/fs.mjs';
+import { indexedDbFlushPoint, persistentFs } from '../src/fs.mjs';
 import { conformanceCases } from '../src/fs-conformance.mjs';
 import { makeBacking } from './backing.mjs';
 
@@ -305,3 +305,92 @@ if (!zenfs) {
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// Gap 4: a backend whose `sync()` is not a flush point.
+//
+// No ZenFS here, because there is nothing of ZenFS's in the case — this is the
+// SHAPE `@zenfs/dom`'s `IndexedDB.create()` has and `WebAccess.create()` does
+// not: a store with the synchronous contract, whose writes land later, with no
+// `_promise` for persistentFs to watch and an `async sync() {}` that answers
+// before anything has happened. Measured in a browser it kept 3 files of 2041;
+// modelled here it is four lines.
+
+/** A store that takes writes now and lands them on a later turn. */
+function deferredStore() {
+  const landed = new Map();
+  let queue = Promise.resolve();
+  const later = (fn) => { queue = queue.then(() => new Promise((r) => setTimeout(r, 1))).then(fn); };
+  const stat = (path) => landed.has(path) ? landed.get(path) : null;
+  const cache = new Map();
+  return {
+    landed,
+    /** The barrier this backend's embedder would supply as `commit`. */
+    commit: () => queue,
+    // The half that answers now, out of a cache, exactly as a StoreFS does.
+    statSync(path) {
+      const at = cache.get(path);
+      if (!at) { const err = new Error(`${path}: no such file`); err.code = 'ENOENT'; throw err; }
+      return { mode: at.mode, size: at.data ? at.data.length : 0, uid: 0, gid: 0, atimeMs: 0, mtimeMs: 0, ctimeMs: 0 };
+    },
+    readdirSync() { return []; },
+    readSync(path, buffer) { const at = cache.get(path); if (at?.data) buffer.set(at.data.subarray(0, buffer.length)); },
+    createFileSync(path, options) { cache.set(path, { mode: options.mode, data: new Uint8Array(0) }); later(() => landed.set(path, 'created')); },
+    mkdirSync(path, options) { cache.set(path, { mode: options.mode, data: null }); later(() => landed.set(path, 'dir')); },
+    writeSync(path, data) { cache.set(path, { mode: 0o644, data }); later(() => landed.set(path, DEC.decode(data))); },
+    touchSync() {},
+    rmdirSync(path) { cache.delete(path); later(() => landed.delete(path)); },
+    unlinkSync(path) { cache.delete(path); later(() => landed.delete(path)); },
+    renameSync() {},
+    // The line the whole finding is about.
+    async sync() {},
+    syncSync() {},
+    _statForTest: stat,
+  };
+}
+
+test('gap 4: without a commit, flush() over such a backend promises nothing', async () => {
+  const backing = deferredStore();
+  const store = await persistentFs(backing);
+  store.writeSync('/a.txt', ENC.encode('one'), 0);
+  await store.flush();
+  // Pinned deliberately as the BUG rather than left unasserted: this is what
+  // `sync()` alone buys, and a change that quietly fixed it here would want to
+  // be seen rather than to pass.
+  assert.equal(backing.landed.get('/a.txt'), undefined, 'flush() returned before the write landed');
+});
+
+test('gap 4: a commit is awaited by flush(), and then the write is really there', async () => {
+  const backing = deferredStore();
+  const store = await persistentFs(backing, { commit: backing.commit });
+  store.writeSync('/a.txt', ENC.encode('one'), 0);
+  store.writeSync('/b.txt', ENC.encode('two'), 0);
+  await store.flush();
+  assert.equal(backing.landed.get('/a.txt'), 'one');
+  assert.equal(backing.landed.get('/b.txt'), 'two');
+});
+
+test('gap 4: a commit that fails is reported like any other failed write', async () => {
+  const backing = deferredStore();
+  const seen = [];
+  const store = await persistentFs(backing, {
+    onError: (err) => seen.push(err.message),
+    commit: async () => { throw new Error('quota exceeded'); },
+  });
+  store.writeSync('/a.txt', ENC.encode('one'), 0);
+  await assert.rejects(() => store.flush(), /a write did not reach the store.*quota exceeded/);
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /quota exceeded/);
+});
+
+test('a commit that is not a function is refused where it is passed', async () => {
+  await assert.rejects(
+    () => persistentFs(deferredStore(), { commit: 'yes please' }),
+    /`commit` is a function returning a promise/,
+  );
+});
+
+test('indexedDbFlushPoint says so where there is no IndexedDB, rather than later', () => {
+  assert.throws(() => indexedDbFlushPoint({ database: 'x', factory: null }), /there is no IndexedDB here/);
+  assert.throws(() => indexedDbFlushPoint({}), /needs \{ database \}/);
+});
