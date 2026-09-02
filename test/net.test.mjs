@@ -270,6 +270,25 @@ test('https is spoken as plaintext on 443', e2e, async () => {
   assert.equal(net.seen[0].port, 443, 'the port is the only thing left saying https');
 });
 
+// `-O -` is how anybody uses wget at a prompt, and it is the one form that
+// cannot work by accident here: it writes to fd 1 and closes it on the way out,
+// which is free where wget is a process and takes the SHELL's stdout where it
+// is an applet in the shell's own. See build/wget-stdout.patch — the symptom
+// was every command after this one failing with "write error: Bad file
+// descriptor", naming neither wget nor the descriptor it took.
+test('wget -O - leaves the shell its stdout', e2e, async () => {
+  const net = cannedNet(() => httpOk('a body'));
+  const r = await run({
+    inline: true,
+    net,
+    command: 'wget -q -O - http://example.test/thing; echo "and then $?"',
+  });
+
+  assert.equal(r.stderr, '');
+  assert.equal(r.stdout, 'a bodyand then 0\n');
+  assert.equal(r.exitCode, 0);
+});
+
 test("wget reports the server's error as its own", e2e, async () => {
   const net = cannedNet(() => 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
   const r = await run({ inline: true, net, args: ['wget', '-O', '-', 'http://example.test/missing'] });
