@@ -212,6 +212,18 @@ export class Session {
   // unconditionally takes it away from the guest.
   interrupt() { this._ring.interrupt(); }
 
+  // Deliver a POSIX signal. `interrupt()` is `raise(2)`.
+  raise(signo) { this._ring.raise(signo); }
+
+  // The one-byte cell a guest with its own signal handling polls, for handing
+  // to whatever is hosted inside this session.
+  //
+  // It crosses `postMessage` as a live view rather than a copy — a Uint8Array
+  // over a SharedArrayBuffer is structured-cloneable and stays shared — which
+  // is the only way it can reach a worker that must read it while nothing on
+  // this thread is running. CPython's `setInterruptBuffer()` takes it as it is.
+  signalBuffer() { return this._ring.signal; }
+
   // Report a terminal resize (cols × rows). Stores the live geometry and
   // synthesizes a SIGWINCH in the guest: a shell with `trap ... WINCH` runs
   // its handler, and `stty size` / ioctl(TIOCGWINSZ) then return the new size.

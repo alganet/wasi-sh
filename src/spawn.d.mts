@@ -119,6 +119,14 @@ export class Session {
    * it away from the guest.
    */
   interrupt(): void;
+  /** Deliver a POSIX signal; `interrupt()` is `raise(2)`. */
+  raise(signo: number): void;
+  /**
+   * The one-byte cell a guest with its own signal handling polls. Crosses
+   * postMessage as a live view, so a worker can be handed it and read it while
+   * nothing on this thread is running.
+   */
+  signalBuffer(): Uint8Array;
   /** Hard-kill the worker. Settles `exited` (and fires onExit) with 137. */
   terminate(): void;
   /** Subscribe to output bytes. Returns an unsubscribe function. */
