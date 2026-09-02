@@ -1,6 +1,12 @@
 export const HEADER_BYTES: number;
 
 /**
+ * The signal raised for ^C, and the default for `RingWriter.raise()`. POSIX's
+ * number, because the guest reading it already knows what to do with it.
+ */
+export const SIGINT: number;
+
+/**
  * A SharedArrayBuffer sized for `dataBytes` of ring capacity — the format both
  * channels use. An inbound host-request ring is not a copy of the stdin one, it
  * is the same ring: a request channel needs head/tail/flags/seq and nothing
@@ -49,6 +55,12 @@ export class RingWriter {
    * that is.
    */
   interrupt(): void;
+  /**
+   * Deliver a POSIX signal, both ways at once: the count `interruptCount()`
+   * reports, and the byte at `RingInput.signalBuffer()` for a guest that polls
+   * memory rather than calling anything of ours. `interrupt()` is `raise(SIGINT)`.
+   */
+  raise(signo?: number): void;
 }
 
 /** The WasiShim `input` contract (see shim.d.mts). */
@@ -66,6 +78,13 @@ export interface RingInput {
   takeWinch(): boolean;
   /** Cooperative interrupts posted so far. Read once at entry, then compare. */
   interruptCount(): number;
+  /**
+   * The one-byte signal cell, for a guest that checks memory at its own safe
+   * points instead of calling `interruptCount()` — CPython's
+   * `setInterruptBuffer()` takes it directly. Handed out rather than read here
+   * because nothing on this thread runs while the guest does.
+   */
+  signalBuffer(): Uint8Array;
 }
 
 export class RingReader {
@@ -82,5 +101,6 @@ export class RingReader {
   winchPending(): boolean;
   takeWinch(): boolean;
   interruptCount(): number;
+  signalBuffer(): Uint8Array;
   toInput(): RingInput;
 }

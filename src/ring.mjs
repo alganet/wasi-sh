@@ -45,9 +45,21 @@ const IDX_WIN_ROWS = 4;
 const IDX_WIN_COLS = 5;
 const IDX_WINCH = 6;
 const IDX_INTR = 7;
-const CTRL_WORDS = 8;
+// A POSIX signal number for a guest that polls MEMORY rather than calling a
+// closure. See `signalBuffer()`. Its own word so that the byte view over it is
+// aligned and so that nothing shares a cache line with the counter above.
+const IDX_SIGNAL = 8;
+const CTRL_WORDS = 9;
 const FLAG_EOF = 1;
 export const HEADER_BYTES = CTRL_WORDS * 4;
+
+/**
+ * The signal this session raises for ^C, and the default for `raise()`.
+ *
+ * POSIX's number, not one of ours, because the whole point of the byte it is
+ * written into is that a guest already knows what to do with it.
+ */
+export const SIGINT = 2;
 
 // A SharedArrayBuffer sized for `dataBytes` of ring capacity.
 //
@@ -127,6 +139,11 @@ export class RingWriter {
   // `channel`/`sizeOption` only ever appear in failures — see RingOverflowError.
   constructor(sab, { channel = 'stdin', sizeOption = 'stdinBufferSize' } = {}) {
     this.ctrl = new Int32Array(sab, 0, CTRL_WORDS);
+    // A ONE-BYTE view over IDX_SIGNAL. A byte rather than the whole word
+    // because that is the shape a guest polls — CPython's interrupt buffer is
+    // `buf[0]` — and writing it as a byte means the value lands in the same
+    // place on a big-endian host as on a little-endian one.
+    this.signal = new Uint8Array(sab, IDX_SIGNAL * 4, 1);
     this.data = new Uint8Array(sab, HEADER_BYTES);
     this.cap = sab.byteLength - HEADER_BYTES;
     this.channel = channel;
@@ -183,6 +200,23 @@ export class RingWriter {
   // work that never looks is untouched, and an interrupt posted while nothing
   // is running lands between two counts nobody is comparing.
   interrupt() {
+    this.raise(SIGINT);
+  }
+
+  // Deliver a POSIX signal, both ways at once.
+  //
+  // `IDX_INTR` is a COUNT, read by whoever chose to compare it — that is
+  // `ctx.interrupted()`, and it is what a host builtin polls at its own safe
+  // points. But a guest compiled with its own signal handling does not call
+  // anything of ours: it reads a byte out of shared memory at its own check,
+  // and the only way to reach it is to write the number there. CPython behind
+  // Emscripten is the case this exists for, and it clears the byte itself once
+  // it has raised — so re-arming needs nothing from this side.
+  //
+  // Both are written for every signal, because a session can have one of each
+  // kind of guest in it and neither knows about the other.
+  raise(signo = SIGINT) {
+    Atomics.store(this.signal, 0, signo & 0xff);
     Atomics.add(this.ctrl, IDX_INTR, 1);
     this._wake();
   }
@@ -201,6 +235,11 @@ export class RingWriter {
 export class RingReader {
   constructor(sab) {
     this.ctrl = new Int32Array(sab, 0, CTRL_WORDS);
+    // A ONE-BYTE view over IDX_SIGNAL. A byte rather than the whole word
+    // because that is the shape a guest polls — CPython's interrupt buffer is
+    // `buf[0]` — and writing it as a byte means the value lands in the same
+    // place on a big-endian host as on a little-endian one.
+    this.signal = new Uint8Array(sab, IDX_SIGNAL * 4, 1);
     this.data = new Uint8Array(sab, HEADER_BYTES);
     this.cap = sab.byteLength - HEADER_BYTES;
   }
@@ -300,6 +339,16 @@ export class RingReader {
       winchPending: () => this.winchPending(),
       takeWinch: () => this.takeWinch(),
       interruptCount: () => this.interruptCount(),
+      signalBuffer: () => this.signalBuffer(),
     };
   }
+
+  // The signal cell, for a guest that polls memory instead of calling us.
+  //
+  // Handed out rather than read here on purpose: nothing on this thread runs
+  // while the guest does, so the ONLY way a signal reaches a running
+  // Emscripten-hosted runtime is for it to hold this view and check it itself.
+  // Point CPython's `setInterruptBuffer()` at it and ^C works with no further
+  // wiring; a guest that ignores it is exactly as interruptible as before.
+  signalBuffer() { return this.signal; }
 }
