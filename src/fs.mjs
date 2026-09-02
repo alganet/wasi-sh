@@ -430,6 +430,32 @@ export class MemoryFs {
 //   cache. Nothing synchronous can await OPFS, so the honest answer is to
 //   report what already failed and let the embedder await the rest.
 //
+//   AND `sync()` IS NOT A FLUSH POINT ON EVERY BACKEND. The three gaps above
+//   are the `Async` mixin's; this fourth one is the gap where the mixin is not
+//   there at all, and it is the worst of them because everything above it goes
+//   on returning successfully. `@zenfs/dom`'s `WebAccessFS` is
+//   `Async(IndexFS)`, so its `sync()` awaits the write-back chain and means
+//   something. `@zenfs/dom`'s `IndexedDB.create()` returns a BARE `StoreFS`,
+//   whose `sync()` is `async sync() { }` — an empty function — over a store
+//   whose own `sync()` is `Promise.resolve()`. Its writes are neither queued on
+//   a `_promise` this adapter can watch nor thrown from the call, so:
+//
+//     * `flush()` resolves immediately and promises nothing;
+//     * `onError` never fires, because there is no queue to attach to;
+//     * and `journalWriter` below, which flushes before it moves its tail,
+//       moves it over writes that have not landed.
+//
+//   Measured, in Chromium and Firefox both: 300/600/1200 files through
+//   `IndexedDB` flush in 0 ms at every size, where the same writes through
+//   `WebAccess` take 355/738/1686 ms. A page that reloaded on the strength of
+//   the first number kept 3 files of 2041.
+//
+//   There is no way to TELL from here — a bare `StoreFS` over an asynchronous
+//   store is indistinguishable from one over a synchronous store, which is
+//   `InMemory` and perfectly honest. So the backend's own barrier is the
+//   embedder's to supply: `persistentFs(backing, { commit })`, awaited by
+//   `flush()`. {@link indexedDbFlushPoint} is that barrier for this case.
+//
 // AND ONE LIMIT THAT IS LAW 1 RATHER THAN A GAP TO CLOSE — read this before
 // reaching for it. **A guest that never exits never flushes.** The write-back
 // is a promise chain and promises need the event loop, which a running guest
@@ -501,6 +527,10 @@ const PREPARED = Symbol.for('wasi-sh.persistentFs');
  *
  * @param backing a store to prepare, async-backed or not
  * @param options.onError called with each write-back failure, as it is seen
+ * @param options.commit awaited by `flush()` after `sync()` — the backend's own
+ *   barrier, for a backend whose `sync()` is not one. See gap 4 above, and
+ *   {@link indexedDbFlushPoint}. Without it, `flush()` over such a backend
+ *   returns in no time and means nothing.
  * @returns backing, hydrated, with `flush()` attached
  */
 export async function persistentFs(backing, options = {}) {
@@ -540,7 +570,10 @@ export async function persistentFs(backing, options = {}) {
   // Raising CLEARS it: repeating one stale error at every later exit would bury
   // the next real one under it.
   let latched = null;
-  const { onError } = options;
+  const { onError, commit } = options;
+  if (commit !== undefined && typeof commit !== 'function') {
+    throw new TypeError('persistentFs: `commit` is a function returning a promise, or nothing');
+  }
   const reported = new WeakSet();
   const record = (err) => {
     // NOT a write failure, and on one engine it is every write. `@zenfs/core`'s
@@ -695,6 +728,12 @@ export async function persistentFs(backing, options = {}) {
    * OPFS. Call it where the answer is worth having — before a tab closes,
    * around a checkpoint — not per write: the queue drains on its own, and each
    * await costs a round trip through the backend.
+   *
+   * **`sync()` alone is not a flush point on every backend**, which is gap 4
+   * above and the reason `options.commit` exists. Where one is supplied it is
+   * awaited HERE, after `sync()` and before the failures are raised, so that a
+   * caller who is given a `flush` can go on believing the one thing its name
+   * says.
    */
   Object.defineProperty(backing, 'flush', {
     value: async function flush() {
@@ -702,6 +741,13 @@ export async function persistentFs(backing, options = {}) {
       // call's whole promise is that the queue is empty when it returns.
       materializeAll();
       if (typeof backing.sync === 'function') await backing.sync();
+      if (commit) {
+        // A backend-supplied barrier, and its failure is a failed write like
+        // any other: reported through the same latch, so an embedder that only
+        // reads `onError` still hears about it.
+        try { await commit(); }
+        catch (err) { record(err); }
+      }
       watch();
       // One turn, so a rejection the line above only just attached to has been
       // delivered. `sync()` swallows it, so without this the first flush after
@@ -725,6 +771,124 @@ export async function persistentFs(backing, options = {}) {
   };
 
   return backing;
+}
+
+/**
+ * A `commit` for a store kept in IndexedDB — gap 4's barrier, built out of the
+ * one guarantee IndexedDB makes about ordering and nothing else.
+ *
+ * **The guarantee.** Transactions whose scopes overlap and of which one is
+ * `readwrite` never run concurrently: they run in the order they were CREATED,
+ * per database, across every connection to it. So a `readonly` transaction
+ * created now cannot complete until every `readwrite` transaction created
+ * before it has committed — which makes waiting for one a way of waiting for
+ * all of them, without knowing what they were or who issued them.
+ *
+ * That is the whole of it, and it is why this reaches for no ZenFS internal:
+ * it needs the database's name and the object store's, both of which the
+ * embedder already chose. It works for any writer of that database, including
+ * one that is not this process's.
+ *
+ * ```js
+ * const store = await persistentFs(await IndexedDB.create({ storeName: 'app@1' }), {
+ *   commit: indexedDbFlushPoint({ database: 'app@1' }),
+ * });
+ * ```
+ *
+ * **It never creates anything.** `indexedDB.open(name)` with no version CREATES
+ * an empty database when the name is unknown — and an empty one with no object
+ * store in it is what a store opened over it then fails on. So this refuses a
+ * database that is not there rather than making one, which is also the honest
+ * answer: there is nothing to have committed.
+ *
+ * The connection is kept, because one open per flush is a round trip the
+ * barrier is trying to be cheaper than — and closed on `versionchange`, so
+ * holding it never blocks somebody else's `deleteDatabase`.
+ *
+ * @param options.database the IndexedDB database name
+ * @param options.store the object store within it (defaults to the database name,
+ *   which is what `@zenfs/dom`'s `IndexedDB` backend does)
+ * @param options.factory an `IDBFactory` (defaults to `globalThis.indexedDB`)
+ * @returns an async function to hand to `persistentFs`'s `commit`
+ */
+export function indexedDbFlushPoint(options = {}) {
+  const { database, factory = globalThis.indexedDB } = options;
+  const store = options.store || database;
+  if (typeof database !== 'string' || !database) {
+    throw new TypeError('indexedDbFlushPoint: needs { database }');
+  }
+  if (!factory) throw new TypeError('indexedDbFlushPoint: there is no IndexedDB here');
+
+  // The CONNECTION PROMISE rather than the connection, which is not a
+  // stylistic difference: the barrier is awaited once per drained batch and an
+  // embedder is free to call `flush()` beside the drain, so two callers can be
+  // inside `connect()` at once. Memoizing the resolved value lets both of them
+  // past the guard and opens two connections, of which one is then held by
+  // nothing and blocks the next `deleteDatabase` — which is the one thing a
+  // page with a damaged store has left to try. Memoizing the promise is what
+  // makes the second caller wait for the first one's answer.
+  let opening = null;
+  // ONE error object for "there is no such database", reused. A store whose
+  // database has been deleted under it — an eviction, or somebody clearing site
+  // data — fails every write from then on, and this barrier fails with them; a
+  // fresh Error each time would be reported on every flush for the rest of the
+  // session, because `persistentFs` dedupes by identity. Said once is right:
+  // the writes underneath are raising their own failures beside it.
+  let gone = null;
+  const forget = () => { opening = null; };
+  const connect = () => {
+    if (opening) return opening;
+    opening = (async () => {
+      const known = typeof factory.databases === 'function'
+        ? (await factory.databases()).some((one) => one.name === database)
+        : true;   // an engine too old to list them; the upgrade guard below covers it
+      return new Promise((resolve, reject) => {
+        const request = factory.open(database);
+        // The one case that must not be allowed to proceed: an upgrade means
+        // the database was not there, and going on would leave an empty one
+        // behind for the next `IndexedDB.create()` to fail on. Aborted, and
+        // reported as what it MEANS rather than as what the abort says —
+        // "Version change transaction was aborted in upgradeneeded event
+        // handler" is this function's own plumbing talking.
+        request.onupgradeneeded = () => {
+          gone = gone || new Error(`indexedDbFlushPoint: '${database}' is no longer there`);
+          request.transaction.abort();
+          reject(gone);
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          if (!known || !db.objectStoreNames.contains(store)) {
+            db.close();
+            gone = gone || new Error(`indexedDbFlushPoint: there is no '${store}' in '${database}' to commit`);
+            reject(gone);
+            return;
+          }
+          // So that a delete from anywhere is never blocked by this connection.
+          db.onversionchange = () => { db.close(); forget(); };
+          db.onclose = forget;
+          resolve(db);
+        };
+        request.onerror = () => reject(request.error || new Error('indexedDbFlushPoint: could not open the database'));
+        request.onblocked = () => reject(new Error('indexedDbFlushPoint: the database is blocked'));
+      });
+    })().catch((err) => { forget(); throw err; });
+    return opening;
+  };
+
+  return async function indexedDbCommit() {
+    const db = await connect();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(store, 'readonly');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('indexedDbFlushPoint: the barrier was aborted'));
+      // One request, because a transaction with nothing in it is allowed to be
+      // optimised away — and the CHEAPEST one, because this runs per drained
+      // batch: a key cursor nobody advances reads one key, where `count()` is
+      // free to walk the store.
+      tx.objectStore(store).openKeyCursor();
+    });
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1561,14 @@ export async function journalWriter(backing, options = {}) {
         // The flush comes BEFORE the tail moves, so a drained journal on the
         // other side means applied-and-flushed rather than merely dequeued.
         // That is what lets journalFs.syncSync() be a true flush point.
+        //
+        // **It is only as true as the store's own flush**, which gap 4 over
+        // `persistentFs` says is not automatic: over a backend whose `sync()`
+        // is an empty function this line returns without waiting for anything,
+        // the tail moves over writes that have not landed, and `pending()` and
+        // `idle()` below report a durability nobody has. A store prepared with
+        // `persistentFs(backing, { commit })` is what makes this line mean what
+        // it says.
         try { await store.flush(); }
         catch (err) { report(err); }
         Atomics.store(ctrl, J_TAIL, tail);
