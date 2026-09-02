@@ -20,6 +20,14 @@
 // gap in the map this replaced is already a field of `InodeLike`: byte offsets
 // (no more read-whole-file-then-slice), truncate, mode bits, and timestamps.
 //
+// **The buffer a `writeSync` is handed is the store's to keep.** It is a copy
+// made for that call, so a store that defers its write — every persistent one
+// does — may hold it and read it whenever it gets round to it. Said here
+// because the copy is made somewhere else (shim.mjs's `writeFd`) and looks like
+// a spare one from there: the guest's iovec points into wasm memory it reuses
+// on its next line, and passing that through by reference persisted two files
+// as one file's bytes, with correct reads and a clean flush() the whole time.
+//
 // Timestamps are the one worth naming. The old map had none — filestat wrote
 // 0 for atim/mtim/ctim — and a PHP runtime with opcache linked never
 // invalidates a script whose mtime does not change. `InodeLike` makes them

@@ -818,8 +818,18 @@ export class WasiShim {
   // $(...) capture. Calling this.stdout() instead would print `cmd | grep x`
   // straight to the terminal and hand grep an empty pipe — the same
   // fd-number-vs-fd-type mistake poll_oneoff already made once (see its
-  // comment). Bytes are always COPIED: worker.mjs posts stdout with a transfer
-  // list, which would detach a handler's reused scratch buffer.
+  // comment).
+  //
+  // BYTES ARE ALWAYS COPIED, and every branch below owes that for a different
+  // reason. `b` is a view into the guest's linear memory — scratch space it
+  // reuses on its next line — so anything that keeps it past the return keeps a
+  // buffer whose contents are somebody else's business by then. worker.mjs
+  // posts stdout with a transfer list, which would detach a handler's reused
+  // buffer; a pipe holds its chunks until something reads them; and a store
+  // that DEFERS its write, which every persistent one does, reads it after this
+  // call is over. That last one was a live corruption: two files written
+  // through one guest buffer both persisted as the second one's bytes, while
+  // reads inside the session were right and flush() reported success.
   writeFd(fd,b){
     const f=this.fds.get(fd);
     if(!f) return E.BADF;
@@ -854,7 +864,10 @@ export class WasiShim {
         if(!st) return E.NOENT;
         start=st.size;
       }
-      try { this.store.writeSync(f.path,b,start); } catch(e) { return wasiErrno(e); }
+      // Copied, for the reason at the top of this method: a persistent store
+      // writes back on a later turn of the event loop, and by then this
+      // buffer is whatever the guest has since put there.
+      try { this.store.writeSync(f.path,b.slice(),start); } catch(e) { return wasiErrno(e); }
       p.v=start+b.length;
     }
     return 0;
