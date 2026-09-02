@@ -14,4 +14,6 @@ export { run } from './run.mjs';
 export { spawn, Session } from './spawn.mjs';
 export { fetchTree } from './files.mjs';
 export { WasiShim, WasiExit } from './shim.mjs';
+// The command namespace as a live object, for a session whose builtins change.
+export { builtinRegistry } from './options.mjs';
 export { createRing, createStdinRing, RingWriter, RingReader, RingOverflowError, frameRequest } from './ring.mjs';

@@ -514,17 +514,21 @@ export class WasiShim {
         // answers 0 at index 0 and completion simply learns nothing about it —
         // the same shape as a session with no builtins.
         //
-        // The list is snapshotted on first use, not rebuilt per index: this is
-        // called once per candidate per completion, and a names() that answered
-        // differently mid-walk would skip or repeat entries. Registration
-        // happens once, before _start(), so there is nothing to invalidate.
+        // The list is rebuilt when the walk RESTARTS and cached within it.
+        // Both halves matter and they used to be one: this is called once per
+        // candidate per completion, so a names() that answered differently
+        // mid-walk would skip or repeat entries — but registration no longer
+        // "happens once, before _start()", because a provider can gain and lose
+        // names while the session runs (see builtinRegistry). Snapshotting for
+        // the life of the shell would keep offering a command that has been
+        // removed and never offer one that arrived.
         //
         // A name too long for the guest's buffer is dropped HERE rather than
         // reported, because one length cannot say both "skip" and "end" — see
         // host_builtin_name() in build/shim/wasistubs.c.
         __host_builtin_name:(i,buf,len)=>{
           if(!w.builtins||typeof w.builtins.names!=='function') return 0;
-          if(!w.builtinNames){
+          if(i===0||!w.builtinNames){
             try { const l=w.builtins.names(); w.builtinNames=Array.isArray(l)?l.map(String):[]; }
             catch { w.builtinNames=[]; }
           }

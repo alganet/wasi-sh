@@ -119,6 +119,62 @@ export function hostBuiltins(spec) {
   };
 }
 
+// A provider whose namespace CHANGES while the session runs.
+//
+// hostBuiltins() above already passes any object with lookup() and run()
+// straight through, so a mutable namespace was always possible; what was
+// missing is that nothing said so, and every embedder wrote the same Map by
+// hand. This is that Map, with the contract's three methods on it.
+//
+// It exists because "registration happens once, before _start()" stopped being
+// true: a handler can define and remove commands from inside the running
+// session, so the namespace a completion walks is not the one the shell
+// started with. `define` and `remove` are what it calls.
+//
+// Names are checked rather than trusted, and the check is not fussiness: ash
+// resolves a name containing a slash as a PATH, never as a builtin, so
+// define('bin/thing') would register a command nothing can ever reach. Better
+// to refuse it where the mistake is than to leave a command that silently is
+// not one.
+export function builtinRegistry(initial) {
+  const map = new Map();
+  const registry = {
+    /** Add or replace a command. Returns the registry, so calls chain. */
+    define(name, handler) {
+      if (typeof name !== 'string' || name === '') {
+        throw new Error('builtinRegistry.define: a command needs a non-empty name');
+      }
+      if (/[/\0\s]/.test(name)) {
+        throw new Error(
+          `builtinRegistry.define: '${name}' can never be reached as a builtin — ash resolves a `
+          + 'name with a slash, a NUL or whitespace in it as a path or as two words, not as a command'
+        );
+      }
+      if (typeof handler !== 'function') {
+        throw new Error(`builtinRegistry.define: '${name}' needs a handler function`);
+      }
+      map.set(name, handler);
+      return registry;
+    },
+    /** Drop a command. True if it was there. */
+    remove(name) { return map.delete(name); },
+    /** Is it registered? The embedder's question, not the guest's. */
+    has(name) { return map.has(name); },
+    lookup: (name) => map.has(name),
+    names: () => [...map.keys()],
+    run(ctx) {
+      const fn = map.get(ctx.argv[0]);
+      // Reachable when a name is removed between `lookup` and `run` — the two
+      // are separate calls from the guest, and a handler that unloads itself
+      // is exactly the case this file now exists to serve.
+      if (!fn) { ctx.stderr(`${ctx.argv[0]}: not found\n`); return 127; }
+      return fn(ctx);
+    },
+  };
+  for (const [name, handler] of Object.entries(initial || {})) registry.define(name, handler);
+  return registry;
+}
+
 // The public `builtins` option: a map, a provider, or a factory returning
 // either. The factory is the only reason this is async — it exists so a worker
 // can `await` a heavy dependency (a wasm interpreter, an OPFS handle) ONCE,

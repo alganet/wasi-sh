@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WasiShim, WasiExit } from '../src/shim.mjs';
-import { hostBuiltins, resolveBuiltins } from '../src/options.mjs';
+import { builtinRegistry, hostBuiltins, resolveBuiltins } from '../src/options.mjs';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -389,7 +389,7 @@ test('a name too long for the guest buffer is skipped, not truncated', () => {
   assert.deepEqual(allNames(env, memory, 16), ['short'], 'and the walk continues past it');
 });
 
-test('names() is read once, so a list that changes mid-walk cannot skip entries', () => {
+test('names() is read once per walk, so a list that changes mid-walk cannot skip entries', () => {
   // The guest asks for one index at a time. Re-reading per index would let a
   // shrinking list drop a name the walk had not reached yet.
   let calls = 0;
@@ -400,6 +400,96 @@ test('names() is read once, so a list that changes mid-walk cannot skip entries'
   });
   assert.deepEqual(allNames(env, memory), ['aaa', 'bbb', 'ccc']);
   assert.equal(calls, 1, 'one call for the whole walk');
+});
+
+test('a later walk sees a namespace that changed since the last one', () => {
+  // The other half of the rule above, and it used to be the opposite: the list
+  // was snapshotted for the life of the session, because registration happened
+  // once before _start() and there was nothing to invalidate. A handler that
+  // may await can define and remove commands now (see builtinRegistry and
+  // suspend.test.mjs), so a snapshot would offer a command that has gone and
+  // never offer one that arrived — for the rest of the session.
+  let calls = 0;
+  const pool = ['aaa', 'bbb'];
+  const { env, memory } = makeShim({
+    lookup: (n) => pool.includes(n), run: () => 0,
+    names() { calls++; return pool.slice(); },
+  });
+  assert.deepEqual(allNames(env, memory), ['aaa', 'bbb']);
+  pool.push('ccc');
+  assert.deepEqual(allNames(env, memory), ['aaa', 'bbb', 'ccc'], 'the new one is offered');
   pool.length = 0;
-  assert.deepEqual(allNames(env, memory), ['aaa', 'bbb', 'ccc'], 'the snapshot stands for this session');
+  assert.deepEqual(allNames(env, memory), [], 'and a namespace that emptied offers nothing');
+  assert.equal(calls, 3, 'once per walk, not once per index');
+});
+
+// ─── builtinRegistry ─────────────────────────────────────────────────────────
+//
+// The command namespace as a live object. hostBuiltins() already passed any
+// provider through, so what this adds is that somebody wrote it down — and the
+// validation, which exists because the failure it prevents is silent.
+
+test('builtinRegistry is a provider, so hostBuiltins passes it through', () => {
+  const registry = builtinRegistry({ hi: () => 0 });
+  assert.equal(hostBuiltins(registry), registry, 'wrapping it would freeze the namespace');
+});
+
+test('an initial map is defined up front', () => {
+  const registry = builtinRegistry({ a: () => 0, b: () => 0 });
+  assert.deepEqual(registry.names().sort(), ['a', 'b']);
+  assert.equal(registry.lookup('a'), true);
+});
+
+test('define and remove change what lookup and names answer', () => {
+  const registry = builtinRegistry();
+  assert.equal(registry.lookup('x'), false);
+  registry.define('x', () => 0);
+  assert.equal(registry.lookup('x'), true);
+  assert.deepEqual(registry.names(), ['x']);
+  assert.equal(registry.remove('x'), true);
+  assert.equal(registry.lookup('x'), false);
+  assert.deepEqual(registry.names(), []);
+  assert.equal(registry.remove('x'), false, 'and says it was not there');
+});
+
+test('define replaces rather than duplicating', () => {
+  const registry = builtinRegistry();
+  registry.define('x', () => 1);
+  registry.define('x', () => 2);
+  assert.deepEqual(registry.names(), ['x']);
+  assert.equal(registry.run({ argv: ['x'] }), 2);
+});
+
+// ash resolves a name containing a slash as a PATH, never as a builtin, so
+// these would register a command nothing can ever reach. Refused where the
+// mistake is rather than left as a command that silently is not one.
+test('a name ash could never resolve is refused', () => {
+  const registry = builtinRegistry();
+  for (const bad of ['bin/thing', 'two words', 'tab\there', 'nul\0byte']) {
+    assert.throws(() => registry.define(bad, () => 0), /never be reached|non-empty/, bad);
+  }
+  assert.throws(() => registry.define('', () => 0), /non-empty/);
+  assert.throws(() => registry.define(null, () => 0), /non-empty/);
+});
+
+test('a handler that is not a function is refused', () => {
+  const registry = builtinRegistry();
+  assert.throws(() => registry.define('x', 'not a function'), /needs a handler function/);
+});
+
+test('a name removed between lookup and run is 127, not a crash', () => {
+  // The two are separate calls from the guest, and a handler that unloads
+  // itself is exactly the case this exists to serve.
+  const registry = builtinRegistry({ x: () => 0 });
+  registry.remove('x');
+  const seen = [];
+  assert.equal(registry.run({ argv: ['x'], stderr: (m) => seen.push(m) }), 127);
+  assert.match(seen.join(''), /x: not found/);
+});
+
+test('inherited properties are not commands here either', () => {
+  const registry = builtinRegistry();
+  for (const name of ['toString', 'constructor', 'valueOf']) {
+    assert.equal(registry.lookup(name), false);
+  }
 });

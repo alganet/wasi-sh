@@ -124,6 +124,26 @@ export type BuiltinHandler = (ctx: BuiltinContext) => number;
 export type BuiltinMap = Record<string, BuiltinHandler>;
 
 /**
+ * A command namespace that changes while the session runs — see
+ * `builtinRegistry()`.
+ *
+ * A HostBuiltins with two more methods on it, so it can be passed as
+ * `builtins` unchanged. Its point is `define`: the set of commands can change
+ * while the shell is running, so a handler can register or drop one from
+ * inside the session.
+ */
+export interface BuiltinRegistry extends HostBuiltins {
+  /** Add or replace a command. Throws on a name ash could never resolve. */
+  define(name: string, handler: BuiltinHandler): BuiltinRegistry;
+  /** Drop a command. True if it was there. */
+  remove(name: string): boolean;
+  /** Is it registered? */
+  has(name: string): boolean;
+  names(): string[];
+}
+
+
+/**
  * The resolved contract the shim consumes. Implement it directly instead of
  * passing a map when the namespace is dynamic (a whole bin/ directory, a lazy
  * index) rather than a fixed set of keys.
