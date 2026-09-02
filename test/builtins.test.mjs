@@ -493,3 +493,42 @@ test('inherited properties are not commands here either', () => {
     assert.equal(registry.lookup(name), false);
   }
 });
+
+// ─── suspendable, on an engine that has no JSPI ──────────────────────────────
+
+test('suspendable is ignored rather than fatal without WebAssembly.Suspending', () => {
+  const had = WebAssembly.Suspending;
+  try {
+    delete WebAssembly.Suspending;
+    const shim = new WasiShim({ builtins: { lookup: () => true, run: () => 0 }, suspendable: true });
+    assert.equal(shim.suspendable, false, 'the shim must not claim what the engine cannot do');
+    // And it still builds an import object, which is the half that matters: a
+    // session on an old browser is the session it always was, not a failure to
+    // instantiate.
+    assert.doesNotThrow(() => shim.imports());
+  } finally {
+    if (had) WebAssembly.Suspending = had;
+  }
+});
+
+test('and the refusal then names the option, so the way out is in the message', () => {
+  const had = WebAssembly.Suspending;
+  try {
+    delete WebAssembly.Suspending;
+    const { call, out } = makeShim({ lookup: () => true, run: async () => 0 });
+    assert.notEqual(call(['tool']), 0);
+    assert.match(out.stderr.join(''), /suspendable:true/);
+  } finally {
+    if (had) WebAssembly.Suspending = had;
+  }
+});
+
+test('with JSPI present, asking for it is honoured', { skip: typeof WebAssembly.Suspending !== 'function' && 'no JSPI in this process' }, () => {
+  const shim = new WasiShim({ builtins: { lookup: () => true, run: () => 0 }, suspendable: true });
+  assert.equal(shim.suspendable, true);
+});
+
+test('not asking for it leaves the shim synchronous even where JSPI exists', () => {
+  const shim = new WasiShim({ builtins: { lookup: () => true, run: () => 0 } });
+  assert.equal(shim.suspendable, false, 'it is opt-in, so an existing embedder is unchanged');
+});

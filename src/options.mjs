@@ -127,9 +127,10 @@ export function hostBuiltins(spec) {
 // hand. This is that Map, with the contract's three methods on it.
 //
 // It exists because "registration happens once, before _start()" stopped being
-// true: a handler can define and remove commands from inside the running
-// session, so the namespace a completion walks is not the one the shell
-// started with. `define` and `remove` are what it calls.
+// true. A handler that may await (see WasiShimOptions.suspendable) can go and
+// FETCH the thing a new command needs — an interpreter, a tool — and then
+// define the command, from inside the session, while the shell waits at the
+// import. `define` and `remove` are what it calls when it gets back.
 //
 // Names are checked rather than trusted, and the check is not fussiness: ash
 // resolves a name containing a slash as a PATH, never as a builtin, so

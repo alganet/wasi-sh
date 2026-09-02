@@ -124,13 +124,23 @@ self.addEventListener('message', async (e) => {
       // Only a session can be one, and only if it said so: see the fd table in
       // shim.mjs for why the shell's own line editor is opt-in.
       tty: !!tty,
+      // May this session's builtins await? The worker module decides, because
+      // the worker module is where the builtins are — and the shim answers
+      // back through `shim.suspendable`, having checked the engine really has
+      // JSPI. See the _start entry below, which is the other half.
+      suspendable: !!config.suspendable,
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);
     self.postMessage({ type: 'ready' });
     let code = 0;
     try {
-      instance.exports._start();
+      // Entered through WebAssembly.promising when a handler may suspend, and
+      // called plainly when none can. Both halves are required and neither
+      // works alone: a Suspending import inside a guest that was not entered
+      // through a promising export traps at the first suspension.
+      if (shim.suspendable) await WebAssembly.promising(instance.exports._start)();
+      else instance.exports._start();
     } catch (ex) {
       if (ex instanceof WasiExit) code = ex.code;
       else { self.postMessage({ type: 'error', msg: String(ex && ex.message || ex) }); return; }

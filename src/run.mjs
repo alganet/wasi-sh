@@ -37,12 +37,16 @@ async function runInline(options) {
     requests: fixedRequests(toRequestBytes(options.requests)),
     builtins: await resolveBuiltins(options.builtins),
     host: await resolveHost(options.host),
+    suspendable: !!options.suspendable,
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
   shim.bindMemory(instance.exports.memory);
   let exitCode = 0;
   try {
-    instance.exports._start();
+    // See worker.mjs: a Suspending import needs a promising export above it,
+    // and the shim has already checked the engine has both.
+    if (shim.suspendable) await WebAssembly.promising(instance.exports._start)();
+    else instance.exports._start();
   } catch (e) {
     if (e instanceof WasiExit) exitCode = e.code;
     else throw e;

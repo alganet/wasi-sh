@@ -143,13 +143,22 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, requests, tty=false }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, requests, tty=false, suspendable=false }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
     this.stderr = stderr || this.stdout;
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
     this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
+    // May a host builtin await? Feature-detected rather than trusted, so an
+    // embedder that asks for it on an engine without JSPI gets the shell it
+    // always had and a clear refusal the first time a handler returns a
+    // promise — not a session that fails to instantiate. Read back by the
+    // caller (run(), serve()) to decide whether to enter through
+    // WebAssembly.promising, which is the other half and useless alone.
+    this.suspendable = !!suspendable
+      && typeof WebAssembly.Suspending === 'function'
+      && typeof WebAssembly.promising === 'function';
     this.host = host;                   // { request(verb, payload)->bytes } — see hostDevice()
     this.requests = requests;           // inbound: an `input`-shaped channel of request lines
     this.mem = null; this.view = null; this.u8 = null;
@@ -466,6 +475,110 @@ export class WasiShim {
         } else if(otherRead===null && devPoll===null && timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
         w.dv().setUint32(out,nev,true); return 0; },
     };
+    // ---- host builtins: everything the two shapes of the run import share ----
+    //
+    // There are two because a handler may now be allowed to AWAIT — see the
+    // `suspendable` option — and the difference between them is exactly one
+    // keyword. Everything up to the handler call is identical and has to be:
+    // argv, env and cwd are read out of linear memory HERE, before any
+    // suspension, because a suspended guest's memory is still live and a
+    // pointer read after the fact would be read against whatever the shell did
+    // next.
+    const builtinCtx=(cwdPtr,argc,argvPtr,envpPtr)=>{
+      const argv=w.cstrv(argvPtr,argc>0?argc:4096);
+      const cwd=w.cstr(cwdPtr)||'/';
+      // The interrupt baseline, read BEFORE the handler runs. A ^C posted
+      // while the shell sat at its prompt, or during the applet before this
+      // one, is already in the count — so comparing against it means
+      // "interrupted since this command started" and this command does not
+      // inherit somebody else's cancel. An input with no interrupt channel
+      // (run(), a fixed stdin) leaves interrupted() permanently false.
+      const intr0=(w.input&&w.input.interruptCount)?w.input.interruptCount():null;
+      return {
+        argv, cwd,
+        // The guest's LIVE environ (exports plus this command's VAR=x
+        // prefixes), not the spawn-time env — this.env is frozen at
+        // construction, which is exactly why the hook passes envp at all.
+        env:envpPtr?envObj(w.cstrv(envpPtr)):envObj(w.env),
+        // Blocking, regardless of any O_NONBLOCK `read -t` left on fd 0.
+        // Empty means EOF. The slice matters: readFd may hand back a view
+        // into a caller-mounted buffer.
+        stdin:(max=65536)=>w.readFd(0,max,false).data.slice(),
+        // writeFd answers an errno and this used to drop it, so a write
+        // a device REFUSED looked delivered — a builtin replying through
+        // /dev/host on a session with no port returned success with
+        // nothing sent. It throws now, which the containment below turns
+        // into a failed command and a non-zero $?: the two things a script
+        // can act on. Nothing else here can fail — a pipe with no reader
+        // buffers rather than EPIPE, fork-free.
+        stdout:(b)=>{ const e=w.writeFd(1,bytesOf(b)); if(e) throw new Error(`write to stdout failed: ${errnoName(e)}`); },
+        stderr:(b)=>{ const e=w.writeFd(2,bytesOf(b)); if(e) throw new Error(`write to stderr failed: ${errnoName(e)}`); },
+        fs:w.hostFs(cwd),
+        // Has a ^C landed since this command started? Cooperative and
+        // POLLED: the handler runs on the guest's own stack, so nothing
+        // can unwind it from outside and there is no safe point but the
+        // ones the handler itself chooses. A long loop checks it and
+        // returns 130 (128+SIGINT), which is what a shell script reads as
+        // "interrupted" in `$?`.
+        //
+        // It does NOT end a blocking ctx.stdin(): that read parks in
+        // Atomics.wait and an interrupt wakes the wait but does not make
+        // bytes appear, so the read parks again. A builtin that wants to
+        // be interruptible while waiting for input must read with its own
+        // timeout and check between attempts.
+        //
+        // A SUSPENDED handler cannot poll it either — there is no stack
+        // running to do the polling — so work that awaits is work a ^C
+        // cannot reach until it comes back.
+        interrupted:()=> intr0!==null && w.input.interruptCount()!==intr0,
+      };
+    };
+    // A JS exception thrown out of a wasm import unwinds the ENTIRE guest
+    // stack: the instance is dead and no guest setjmp can catch it. That is
+    // the same hazard --wrap exit/die_func exists for with applets, and it
+    // must be contained the same way — a handler bug costs one command, not
+    // the shell. A nested WasiExit is caught HERE too: letting it escape
+    // would make an inner module's exit(1) silently become the outer shell's
+    // exit code (worker.mjs treats a WasiExit as a clean shutdown).
+    const builtinThrew=(name,e)=>{
+      if(e instanceof WasiExit) return e.code&0xff;
+      w.writeFd(2,strBytes(`${name}: ${(e&&e.message)||e}\n`));
+      return 1;
+    };
+    const builtinStatus=(status)=>{
+      const n=Number(status);
+      return Number.isFinite(n)?(n&0xff):0;   // wait(2) truncation: -1 -> 255, 256 -> 0
+    };
+    // The synchronous shape, and the one every session had until suspension
+    // was an option. A promise here is not slow, it is NOT DELIVERED — the
+    // guest is a synchronous stack frame below us and a thenable coerces to
+    // i32 0, i.e. silent success while the real work lands later against
+    // whatever fd 1 has become by then. Fail loudly instead.
+    const builtinRunSync=(cwdPtr,argc,argvPtr,envpPtr)=>{
+      if(!w.builtins) return -1;
+      const ctx=builtinCtx(cwdPtr,argc,argvPtr,envpPtr);
+      let status;
+      try { status=w.builtins.run(ctx); }
+      catch(e){ return builtinThrew(ctx.argv[0]||'',e); }
+      if(status&&typeof status.then==='function'){
+        status.catch(()=>{});   // nobody owns this rejection
+        w.writeFd(2,strBytes(`${ctx.argv[0]||''}: handler returned a Promise; host builtins must be synchronous here. Do async setup once in serve({ async builtins() {...} }), or pass suspendable:true to let a handler await mid-session (needs WebAssembly.Suspending)\n`));
+        return 1;
+      }
+      return builtinStatus(status);
+    };
+    // The suspending shape. `await` on a value that is not a promise is a
+    // microtask and nothing more, so a synchronous handler costs the same
+    // here as it does above — measured at 6.3 µs per call either way, which
+    // is why there is one import rather than a fast one and a slow one.
+    const builtinRunSuspending=async(cwdPtr,argc,argvPtr,envpPtr)=>{
+      if(!w.builtins) return -1;
+      const ctx=builtinCtx(cwdPtr,argc,argvPtr,envpPtr);
+      let status;
+      try { status=await w.builtins.run(ctx); }
+      catch(e){ return builtinThrew(ctx.argv[0]||'',e); }
+      return builtinStatus(status);
+    };
     return {
       wasi_snapshot_preview1: p1,
       env: {
@@ -545,79 +658,15 @@ export class WasiShim {
         // are copied out of linear memory first; stdio goes through the fd
         // TABLE, so a pipeline stage, a redirect and a $(...) capture all land
         // where the shell put them.
-        __host_builtin_run:(cwdPtr,argc,argvPtr,envpPtr)=>{
-          if(!w.builtins) return -1;
-          const argv=w.cstrv(argvPtr,argc>0?argc:4096);
-          const name=argv[0]||'';
-          const cwd=w.cstr(cwdPtr)||'/';
-          // The interrupt baseline, read BEFORE the handler runs. A ^C posted
-          // while the shell sat at its prompt, or during the applet before
-          // this one, is already in the count — so comparing against it means
-          // "interrupted since this command started" and this command does not
-          // inherit somebody else's cancel. An input with no interrupt channel
-          // (run(), a fixed stdin) leaves interrupted() permanently false.
-          const intr0=(w.input&&w.input.interruptCount)?w.input.interruptCount():null;
-          const ctx={
-            argv, cwd,
-            // The guest's LIVE environ (exports plus this command's VAR=x
-            // prefixes), not the spawn-time env — this.env is frozen at
-            // construction, which is exactly why the hook passes envp at all.
-            env:envpPtr?envObj(w.cstrv(envpPtr)):envObj(w.env),
-            // Blocking, regardless of any O_NONBLOCK `read -t` left on fd 0.
-            // Empty means EOF. The slice matters: readFd may hand back a view
-            // into a caller-mounted buffer.
-            stdin:(max=65536)=>w.readFd(0,max,false).data.slice(),
-            // writeFd answers an errno and this used to drop it, so a write
-            // a device REFUSED looked delivered — a builtin replying through
-            // /dev/host on a session with no port returned success with
-            // nothing sent. It throws now, which the containment below turns
-            // into a failed command and a non-zero $?: the two things a script
-            // can act on. Nothing else here can fail — a pipe with no reader
-            // buffers rather than EPIPE, fork-free.
-            stdout:(b)=>{ const e=w.writeFd(1,bytesOf(b)); if(e) throw new Error(`write to stdout failed: ${errnoName(e)}`); },
-            stderr:(b)=>{ const e=w.writeFd(2,bytesOf(b)); if(e) throw new Error(`write to stderr failed: ${errnoName(e)}`); },
-            fs:w.hostFs(cwd),
-            // Has a ^C landed since this command started? Cooperative and
-            // POLLED: the handler runs on the guest's own stack, so nothing
-            // can unwind it from outside and there is no safe point but the
-            // ones the handler itself chooses. A long loop checks it and
-            // returns 130 (128+SIGINT), which is what a shell script reads as
-            // "interrupted" in `$?`.
-            //
-            // It does NOT end a blocking ctx.stdin(): that read parks in
-            // Atomics.wait and an interrupt wakes the wait but does not make
-            // bytes appear, so the read parks again. A builtin that wants to
-            // be interruptible while waiting for input must read with its own
-            // timeout and check between attempts.
-            interrupted:()=> intr0!==null && w.input.interruptCount()!==intr0,
-          };
-          let status;
-          try { status=w.builtins.run(ctx); }
-          catch(e){
-            // A JS exception thrown out of a wasm import unwinds the ENTIRE
-            // guest stack: the instance is dead and no guest setjmp can catch
-            // it. That is the same hazard --wrap exit/die_func exists for with
-            // applets, and it must be contained the same way — a handler bug
-            // costs one command, not the shell. A nested WasiExit is caught
-            // HERE too: letting it escape would make an inner module's exit(1)
-            // silently become the outer shell's exit code (worker.mjs treats a
-            // WasiExit as a clean shutdown).
-            if(e instanceof WasiExit) return e.code&0xff;
-            w.writeFd(2,strBytes(`${name}: ${(e&&e.message)||e}\n`));
-            return 1;
-          }
-          if(status&&typeof status.then==='function'){
-            // There is nothing to await into — the guest is a synchronous
-            // stack frame below us, and a thenable coerces to i32 0, i.e.
-            // silent success while the real work lands later against whatever
-            // fd 1 has become by then. Fail loudly instead.
-            status.catch(()=>{});   // nobody owns this rejection
-            w.writeFd(2,strBytes(`${name}: handler returned a Promise; host builtins must be synchronous (do async setup once in serve({ async builtins() {...} }))\n`));
-            return 1;
-          }
-          const n=Number(status);
-          return Number.isFinite(n)?(n&0xff):0;   // wait(2) truncation: -1 -> 255, 256 -> 0
-        },
+        //
+        // Wrapped in WebAssembly.Suspending when the session asked for it and
+        // the engine has it, which is what lets a handler await without the
+        // guest below it having to know: JSPI suspends the whole wasm stack,
+        // ash's setjmp frames included. Verified across $(...), pipelines,
+        // functions, redirects and `||` in node, Chromium and Firefox.
+        __host_builtin_run: w.suspendable
+          ? new WebAssembly.Suspending(builtinRunSuspending)
+          : builtinRunSync,
       },
     };
   }

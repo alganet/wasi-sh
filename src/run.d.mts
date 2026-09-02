@@ -70,6 +70,17 @@ export interface RunOptions {
    */
   builtins?: BuiltinMap | HostBuiltins | (() => BuiltinMap | HostBuiltins | Promise<BuiltinMap | HostBuiltins>);
   /**
+   * Let a host builtin await — see WasiShimOptions.suspendable. Needs JSPI;
+   * ignored without it.
+   *
+   * `inline: true` only, and for the same reason `builtins` is: off-thread,
+   * the handlers come from `serve()` inside the worker module, so the decision
+   * about whether they may await belongs there too — pass
+   * `serve({ suspendable: true })`. One owner, rather than two places that
+   * can disagree about one session.
+   */
+  suspendable?: boolean;
+  /**
    * The host port — what this script may reach outside the sandbox, as verbs
    * on /dev/host. A verb → handler map, a HostPort, or a factory (awaited
    * once) returning either. Omitted, the device is there and every open is
