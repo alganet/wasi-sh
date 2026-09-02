@@ -92,6 +92,10 @@ const EMPTY = new Uint8Array(0);
 const errnoName = (n) => Object.keys(E).find((k) => E[k] === n) || String(n);
 const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70 };
 const FT = { CHAR:2, DIR:3, REG:4 };
+// FD_SEEK (bit 2) | FD_TELL (bit 5) of the WASI rights word. Their ABSENCE on a
+// character device is how wasi-libc's isatty() recognizes a terminal, so these
+// are exactly the rights a tty fd must not claim.
+const RIGHTS_NOT_A_TTY = (1n << 2n) | (1n << 5n);
 
 // Stores speak LINUX errno; WASI numbers its own list alphabetically. The two
 // overlap enough to look interchangeable and disagree exactly where it hurts —
@@ -139,7 +143,7 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, requests }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, requests, tty=false }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
@@ -178,10 +182,25 @@ export class WasiShim {
     // request that can never arrive.
     this.addDevice('/dev/hostreq', this.requestDevice());
     // fd table. 0/1/2 std, 3 = preopen "/".
+    //
+    // `tty` is what makes isatty() true on them, and isatty() is the whole gate
+    // on ash's own line editor: shell/ash.c sets `iflag` only when isatty(0)
+    // AND isatty(1), and without iflag it never calls read_line_input() — so
+    // there is no prompt, no echo, no history, no arrow keys and no tab
+    // completion, whatever libbb/lineedit.c was compiled with. Measured: with
+    // the bit on and nothing else changed, the banner and the `# ` prompt
+    // appear and the guest echoes its own keystrokes in raw mode.
+    //
+    // OFF by default, and that is a compatibility decision rather than a
+    // preference. An embedder that edits lines in the page — both of ours did,
+    // and examples/repl.html is the pattern — holds the line until Enter and
+    // echoes it itself, so a guest that also echoes prints every line twice.
+    // Opting in with spawn({ tty: true }) is how a terminal says "the shell
+    // owns the line", and run() never says it: a fixed stdin is not a terminal.
     this.fds = new Map();
-    this.fds.set(0, { type:'stdin' });
-    this.fds.set(1, { type:'stdout' });
-    this.fds.set(2, { type:'stderr' });
+    this.fds.set(0, { type:'stdin', tty });
+    this.fds.set(1, { type:'stdout', tty });
+    this.fds.set(2, { type:'stderr', tty });
     this.fds.set(3, { type:'dir', path:'/', preopen:true });
     this.nextFd = 4;
     this.pipes = [];
@@ -216,7 +235,13 @@ export class WasiShim {
         else { for(let i=0;i<len;i++)a[i]=(Math.random()*256)|0; }
         return 0; },
       fd_close:(fd)=>{ const f=w.fds.get(fd); w.fds.delete(fd); if(f&&f.type==='pipe') w.gcPipe(f.pipe); return 0; },
-      fd_fdstat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const ft=f.type==='dir'?FT.DIR:(f.type==='file'?FT.REG:FT.CHAR); w.dv().setUint8(out,ft); w.dv().setUint16(out+2,0,true); w.dv().setBigUint64(out+8,~0n,true); w.dv().setBigUint64(out+16,~0n,true); return 0; },
+      // The rights word is where isatty() lives. wasi-libc answers isatty(fd)
+      // with "filetype is CHARACTER_DEVICE **and** neither FD_SEEK nor FD_TELL
+      // is granted" — a terminal is the thing you cannot seek — so claiming
+      // every right on stdio is what has been reporting "not a tty" all along.
+      // Dropping the two bits on a tty fd is the entire change; see the fd
+      // table for what it unlocks and why it is opt-in.
+      fd_fdstat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const ft=f.type==='dir'?FT.DIR:(f.type==='file'?FT.REG:FT.CHAR); const rights=f.tty?(~0n&~RIGHTS_NOT_A_TTY):~0n; w.dv().setUint8(out,ft); w.dv().setUint16(out+2,0,true); w.dv().setBigUint64(out+8,rights,true); w.dv().setBigUint64(out+16,rights,true); return 0; },
       fd_fdstat_set_flags:(fd,flags)=>{ const f=w.fds.get(fd); if(f) f.nonblock=(flags&4)!==0; return 0; },
       fd_prestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f||!f.preopen) return E.BADF; w.dv().setUint8(out,0); w.dv().setUint32(out+4,strBytes(f.path).length,true); return 0; },
       fd_prestat_dir_name:(fd,buf,len)=>{ const f=w.fds.get(fd); if(!f||!f.preopen) return E.BADF; w.bytes().set(strBytes(f.path).subarray(0,len),buf); return 0; },
@@ -481,6 +506,36 @@ export class WasiShim {
           if(!w.builtins) return 0;
           // A throwing lookup() must not cost the session a `type foo`.
           try { return w.builtins.lookup(len>0?w.str(namePtr,len):w.cstr(namePtr))?1:0; } catch { return 0; }
+        },
+        // Enumeration, for tab completion (build/ash-compgen.patch): write the
+        // i'th registered name into the guest's buffer and return its length,
+        // 0 once the list is out. `names()` is the contract's OPTIONAL third
+        // method, so a provider that only knows how to look one name up
+        // answers 0 at index 0 and completion simply learns nothing about it —
+        // the same shape as a session with no builtins.
+        //
+        // The list is snapshotted on first use, not rebuilt per index: this is
+        // called once per candidate per completion, and a names() that answered
+        // differently mid-walk would skip or repeat entries. Registration
+        // happens once, before _start(), so there is nothing to invalidate.
+        //
+        // A name too long for the guest's buffer is dropped HERE rather than
+        // reported, because one length cannot say both "skip" and "end" — see
+        // host_builtin_name() in build/shim/wasistubs.c.
+        __host_builtin_name:(i,buf,len)=>{
+          if(!w.builtins||typeof w.builtins.names!=='function') return 0;
+          if(!w.builtinNames){
+            try { const l=w.builtins.names(); w.builtinNames=Array.isArray(l)?l.map(String):[]; }
+            catch { w.builtinNames=[]; }
+          }
+          const names=w.builtinNames;
+          for(let n=0,k=0;n<names.length;n++){
+            const b=strBytes(names[n]);
+            if(b.length===0||b.length>len) continue;
+            if(k++!==i) continue;
+            w.bytes().set(b,buf); return b.length;
+          }
+          return 0;
         },
         // The handler runs ON THE GUEST'S OWN STACK, mid-import. argv/env/cwd
         // are copied out of linear memory first; stdio goes through the fd

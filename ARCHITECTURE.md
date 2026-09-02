@@ -609,8 +609,29 @@ it. What is *not* undone is the nested shell's own allocations — a few KB
 abandoned per nested shell, the same bargain every applet in this build makes.
 One assumption is worth naming: `ttyfd` is a descriptor, and putting a number
 back does not reopen anything. That is sound only while a nested shell cannot
-close it, which holds because `setjobctl(0)` returns early unless job control is
-on and it never is — there is no `/dev/tty` to acquire.
+close it — and a nested shell *can*, once job control is on: `exitshell()` calls
+`setjobctl(0)`, whose "turning it off" branch `close()`s `ttyfd`, and the
+restore would then hand the outer shell a closed fd.
+
+**This used to rest on the tty being unreachable, and that reasoning is gone.**
+The claim was "`setjobctl(0)` returns early unless job control is on, and it
+never is, because there is no `/dev/tty` to acquire" — which stopped being true
+the moment `isatty()` started telling the truth for a `tty: true` session.
+`setjobctl(1)` does not need `/dev/tty`: when the open fails it walks *down*
+from fd 2 looking for any tty, finds stdin, and turns job control on with no
+message at all. Measured at an interactive prompt before this was fixed: `$-`
+read `smi` and `set -o` reported `monitor on`.
+
+So job control is now compiled **out** (`CONFIG_ASH_JOB_CONTROL` is not set),
+which is what actually holds the invariant: `JOBS` is 0, `setjobctl` is
+`((void)0)`, and `ttyfd` does not exist to be closed. It costs `jobs`, `fg` and
+`bg`, which this build could never have implemented anyway — there is nothing
+to background. It also took `kill` with it, which was NOT intended and is not
+the same kind of loss: `kill` sits inside the same `#if JOBS` block upstream,
+and `kill -l` is real work that needs no processes. `CONFIG_KILL=y` brings it
+back as the applet. `ASH_STATE_LIST()` guards `cmdnextc` under the same `#if JOBS`,
+because that global lives inside it and naming it unconditionally is a build
+error rather than a missed save.
 
 **This supersedes an earlier design statement.** Host builtins used to be
 deliberately unreachable by path, on the grounds that a virtual `/bin` would

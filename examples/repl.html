@@ -5,6 +5,8 @@
 <!-- wasi-sh use case B with a real terminal: xterm.js loaded from a CDN.
      xterm is NOT a dependency of wasi-sh — the integration is the two marked
      lines below (keystrokes → session.write, session.onOutput → term.write).
+     They are the WHOLE integration because the shell is given a tty and does
+     its own line editing: prompt, echo, history, arrows and tab completion.
 
      Interactive sessions need cross-origin isolation (SharedArrayBuffer):
      serve with `npm run serve`, or on a static host add COOP/COEP headers or
@@ -61,30 +63,31 @@ term.open(document.getElementById("term")); fit.fit();
 addEventListener("resize", () => fit.fit());
 const say = (s) => term.write(s);
 
-// ── tiny REPL: local line editing at the prompt, sentinel to detect that a
-//    command finished. The shell runs each typed line, then we ask it to print
-//    \x1e<status>\x1e so we know to draw the next prompt (and strip the marker).
-const RS = "\x1e";
-let line = "";       // current input line
-let running = false; // a command is executing
-let acc = "";        // output accumulator (to catch the sentinel across chunks)
-const PROMPT = "\x1b[36m$\x1b[0m ";
-// Break the line only when output left the cursor mid-line (printf without
-// \n); output that already ended in a newline gets the prompt right below it.
-// term.write is async — the empty write's callback runs after everything
-// queued before it has been processed, so cursorX is trustworthy there.
-const prompt = () => term.write("", () =>
-  term.write((term.buffer.active.cursorX > 0 ? "\r\n" : "") + PROMPT));
-
+// ── No line editor here, and that is the point ──────────────────────────────
+// The shell has its own: prompt, echo, history, arrow keys, ^C and TAB
+// COMPLETION, all inside the guest (libbb/lineedit.c). `tty: true` below is
+// what turns it on — it makes isatty(0)/isatty(1) true, which is the only
+// thing ash checks before running its editor.
+//
+// So this page does not track a current line, does not draw a prompt, and does
+// not need a sentinel to know when a command finished. Every byte goes down,
+// every byte comes back up. That is the whole integration.
 let session;
 try {
   say("Loading busybox.wasm…\r\n");
   session = await spawn({
     args: ["busybox", "sh"],
+    // The shell owns the line. Drop this and you get the old arrangement: no
+    // prompt, no echo, and a page that has to edit lines itself.
+    tty: true,
+    // PS1 is plain text on purpose: this build has FEATURE_EDITING_FANCY_PROMPT
+    // off, so the editor measures the prompt with strlen() — a colour escape in
+    // here would count as visible width and put the cursor in the wrong column.
+    //
     // COLUMNS/LINES seed the guest's initial size (fit.fit() ran above, so
     // term.cols/rows are the real geometry). A later resize is delivered live
     // via session.resize() below — see the term.onResize wiring.
-    env: { PS1: "", LC_ALL: "C", COLUMNS: String(term.cols), LINES: String(term.rows) },
+    env: { PS1: "$ ", LC_ALL: "C", COLUMNS: String(term.cols), LINES: String(term.rows) },
   });
 } catch (e) {
   say("\r\n\x1b[31m" + (e?.message || e) + "\x1b[0m\r\n");
@@ -134,76 +137,36 @@ term.parser.registerOscHandler(52, (data) => {
   return true;
 });
 
-function runLine(cmd){
-  const trimmed = cmd.trim();
-  if (!trimmed){ prompt(); return; }
-  running = true;
-  // run the line, then emit the exit status wrapped in RS markers — no
-  // trailing newline: the closing marker is the last byte, so nothing is
-  // left over for the parser to flush as a stray blank line.
-  session.write(cmd + "\n");
-  session.write('printf "' + RS + '%d' + RS + '" "$?"\n');
-}
+session.onOutput((bytes) => term.write(bytes));                 // shell → terminal
 
-const dec = new TextDecoder();
-session.onOutput((bytes) => {                                  // shell → terminal
-  acc += dec.decode(bytes);
-  // process complete \x1e...\x1e markers; write everything else
-  for (;;){
-    const i = acc.indexOf(RS);
-    if (i < 0){ term.write(acc); acc = ""; return; }
-    term.write(acc.slice(0, i));            // text before the marker
-    const rest = acc.slice(i + 1);
-    const j = rest.indexOf(RS);
-    if (j < 0){ acc = RS + rest; return; }  // marker not complete yet — wait
-    // full marker consumed (status in rest.slice(0,j)); command finished
-    acc = rest.slice(j + 1);
-    running = false;
-    prompt();
-  }
-});
 session.exited.then((code) => say("\r\n[shell exited: " + code + "]\r\n"));
 session.onError((e) => say("\r\n[error: " + e.message + "]\r\n"));
 
-term.onData(d => {
-  if (running){                                                // keyboard → shell
-    // …except ^C, which is the one key that must NOT go to stdin. There are no
-    // signals here, so the 0x03 byte is simply read as input by whatever is
-    // running; session.interrupt() is the ^C. It stops an applet at its next
-    // safe point and a host builtin that polls ctx.interrupted(); a loop
-    // written in shell, and a command parked in a blocking read, it cannot
-    // reach. Anything typed BEFORE the ^C still belongs to the command; what
-    // follows it belongs to a command that is being cancelled.
-    const i = d.indexOf("\x03");
-    if (i < 0){ session.write(d); return; }
-    if (i > 0) session.write(d.slice(0, i));
-    term.write("^C"); session.interrupt();
-    return;
-  }
-  for (const ch of d){
-    if (ch === "\r"){ term.write("\r\n"); const l = line; line = ""; runLine(l); }
-    else if (ch === "\x7f" || ch === "\b"){ if (line){ line = line.slice(0,-1); term.write("\b \b"); } }
-    else if (ch === "\x03"){ line = ""; term.write("^C"); prompt(); }
-    else if (ch === "\x0c"){ term.write("\x1b[2J\x1b[H"); term.write(PROMPT + line); }  // Ctrl-L clear
-    else if (ch >= " "){ line += ch; term.write(ch); }
-  }
+term.onData((d) => {                                           // keyboard → shell
+  session.write(d);
+  // ^C goes down as a BYTE — the guest's editor wants it, and at a prompt it
+  // is what abandons the half-typed line. It also gets sent as an interrupt,
+  // because a wasm guest has no signals: session.interrupt() is what actually
+  // stops a runaway applet. Unconditional, and safe to be: a ^C posted while
+  // nothing is running cancels nothing, by contract.
+  if (d.includes("\x03")) session.interrupt();
 });
 
-// clickable examples: fill the line, echo it, run it
+// clickable examples: type the command into the shell
 for (const btn of document.querySelectorAll("#bar button")){
   btn.addEventListener("click", () => {
-    if (running) return;
-    const cmd = btn.getAttribute("data-cmd");
-    term.write(cmd + "\r\n"); line = "";
-    runLine(cmd); term.focus();
+    // Typed, not run: the guest echoes it and runs it, exactly as if the keys
+    // had been pressed. Nothing here has to know whether the shell is busy.
+    session.write(btn.getAttribute("data-cmd") + "\r");
+    term.focus();
   });
 }
 
 say("\x1b[38;5;250mbusybox ash — fork-free command substitution, pipes & subshell isolation.\x1b[0m\r\n");
 say("\x1b[38;5;244mType a command, or click an example above. (builtins only — no exec)\x1b[0m\r\n");
+say("\x1b[38;5;244mThe shell edits its own line: TAB completes, Up/Down are history.\x1b[0m\r\n");
 say("\x1b[38;5;244mThe 'Browser bridges' row talks to the tab title and the system clipboard, both ways.\x1b[0m\r\n");
 say("\x1b[38;5;244mCtrl-C while a command runs is a cooperative interrupt — try 'runaway awk'.\x1b[0m\r\n");
-prompt();
 term.focus();
 </script>
 </body>

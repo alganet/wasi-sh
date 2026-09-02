@@ -133,6 +133,22 @@ export interface HostBuiltins {
   lookup(name: string): boolean;
   /** Execute; the return value becomes `$?`. */
   run(ctx: BuiltinContext): number;
+  /**
+   * Every registered name, for tab completion — `compgen -c` and the guest's
+   * own Tab both list them beside the applets, this shell's builtins, its
+   * functions and its aliases.
+   *
+   * OPTIONAL, and deliberately so: listing is a bigger promise than looking
+   * up, and a lazy namespace that can answer `lookup('php')` may have no way
+   * to enumerate itself. Omit it and completion simply never mentions these
+   * commands; everything else about them is unchanged. A plain map gets it for
+   * free — its keys are the list.
+   *
+   * Read once, on the first completion, and not re-read afterwards: the walk
+   * asks for one name at a time and a list that changed underneath it would
+   * skip or repeat entries.
+   */
+  names?(): string[];
 }
 
 /**
@@ -193,6 +209,16 @@ export interface WasiShimOptions {
   stdout?: (bytes: Uint8Array) => void;
   stderr?: (bytes: Uint8Array) => void;
   input?: ShimInput;
+  /**
+   * Report fds 0/1/2 as a terminal, i.e. make `isatty()` true on them by
+   * withholding FD_SEEK and FD_TELL from their rights — which is exactly what
+   * "not seekable, therefore a tty" means to wasi-libc.
+   *
+   * That single bit is what turns ash interactive and hands the guest its own
+   * line editor: prompt, echo, history, arrows and Tab completion. Default
+   * false; see spawn({ tty }) for why it is opt-in.
+   */
+  tty?: boolean;
   /**
    * Host builtins: JS-backed names added to the shell's command namespace.
    * Absent, the shell behaves exactly as it did before — an unregistered name

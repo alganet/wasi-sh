@@ -30,6 +30,24 @@ export interface SpawnOptions {
    * consuming, which is the host's problem to size.
    */
   requestBufferSize?: number;
+  /**
+   * Give the guest a terminal, and with it ITS OWN line editing: a prompt,
+   * echo, history, arrow keys, ^C and Tab completion, all from
+   * libbb/lineedit.c inside the shell.
+   *
+   * What it actually does is make `isatty(0)` and `isatty(1)` true, which is
+   * the only thing ash checks before setting `iflag` and calling
+   * read_line_input(). Without it the editor is compiled in and never runs.
+   *
+   * Default false, because a terminal cannot edit the same line twice. Turn it
+   * on ONLY if your terminal stops doing its own line editing: forward every
+   * byte with `term.onData(d => session.write(d))` and render what comes back,
+   * including the echo. A page that holds the line until Enter and echoes it
+   * itself will print every line twice with this on.
+   *
+   * Not for run(): a fixed stdin is not a terminal.
+   */
+  tty?: boolean;
   /** Bring-your-own Worker. */
   worker?: Worker;
   /** Alternate URL for the wasi-sh worker module. */

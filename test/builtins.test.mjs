@@ -313,3 +313,93 @@ test('ctx.interrupted() is false when the session has no interrupt channel', () 
   assert.equal(call(['work']), 0);
   assert.deepEqual(seen, [false]);
 });
+
+// ─── the hooks: enumeration, for tab completion ──────────────────────────────
+// lookup() answers one name at a time — all find_command() needs, and all a
+// lazy namespace can promise. Listing is therefore a SEPARATE optional method,
+// and its presence is the signal: see build/ash-compgen.patch.
+
+// Read the i'th name the way host_builtin_name() does: into a guest buffer,
+// with the returned length deciding where it ends.
+function readName(env, memory, i, len = 255) {
+  const buf = 4096;
+  const n = env.__host_builtin_name(i, buf, len);
+  if (n <= 0) return null;
+  return dec.decode(new Uint8Array(memory.buffer, buf, n));
+}
+const allNames = (env, memory, len) => {
+  const out = [];
+  for (let i = 0; i < 64; i++) {
+    const name = readName(env, memory, i, len);
+    if (name == null) break;
+    out.push(name);
+  }
+  return out;
+};
+
+test('hostBuiltins: a map derives names() from its own keys', () => {
+  const p = hostBuiltins({ alpha: () => 0, beta: () => 0 });
+  assert.deepEqual(p.names().sort(), ['alpha', 'beta']);
+});
+
+test('hostBuiltins: names() and lookup() cannot disagree', () => {
+  // A key holding a non-function is not a builtin, and offering it as a
+  // completion would complete to a command that reports "not found".
+  const p = hostBuiltins({ real: () => 0, notAFunction: 42 });
+  assert.deepEqual(p.names(), ['real']);
+  assert.equal(p.lookup('notAFunction'), false);
+});
+
+test('the name hook walks the registry and then stops', () => {
+  const { env, memory } = makeShim(hostBuiltins({ one: () => 0, two: () => 0 }));
+  assert.deepEqual(allNames(env, memory).sort(), ['one', 'two']);
+  assert.equal(env.__host_builtin_name(2, 4096, 255), 0, 'past the end is 0, which ends the guest loop');
+});
+
+test('a provider without names() contributes no completions, and that is not an error', () => {
+  // The extension point for a dynamic namespace: it can answer lookup('php')
+  // without being able to enumerate itself. Completion simply never mentions
+  // it; dispatch is untouched.
+  const provider = { lookup: (n) => n === 'lazy', run: () => 0 };
+  const { env, memory } = makeShim(provider);
+  assert.equal(env.__host_builtin_lookup(0, 0), 0, 'nothing registered under the empty name');
+  assert.equal(provider.lookup('lazy'), true, 'but the provider still resolves its own');
+  assert.deepEqual(allNames(env, memory), [], 'and the list is simply empty');
+});
+
+test('no builtins at all: the name hook is the same empty answer', () => {
+  const { env, memory } = makeShim(undefined);
+  assert.deepEqual(allNames(env, memory), []);
+});
+
+test('a throwing names() costs the session nothing', () => {
+  const { env, memory } = makeShim({
+    lookup: () => false, run: () => 0,
+    names() { throw new Error('the index is broken'); },
+  });
+  assert.deepEqual(allNames(env, memory), []);
+});
+
+test('a name too long for the guest buffer is skipped, not truncated', () => {
+  // Half a command name is a candidate that completes to something which does
+  // not exist. The skip happens here because one length cannot say both "skip
+  // this one" and "the list ended" — see host_builtin_name() in wasistubs.c.
+  const long = 'x'.repeat(40);
+  const { env, memory } = makeShim(hostBuiltins({ short: () => 0, [long]: () => 0 }));
+  assert.deepEqual(allNames(env, memory, 16), ['short'], 'and the walk continues past it');
+});
+
+test('names() is read once, so a list that changes mid-walk cannot skip entries', () => {
+  // The guest asks for one index at a time. Re-reading per index would let a
+  // shrinking list drop a name the walk had not reached yet.
+  let calls = 0;
+  const pool = ['aaa', 'bbb', 'ccc'];
+  const { env, memory } = makeShim({
+    lookup: (n) => pool.includes(n), run: () => 0,
+    names() { calls++; return pool.slice(); },
+  });
+  assert.deepEqual(allNames(env, memory), ['aaa', 'bbb', 'ccc']);
+  assert.equal(calls, 1, 'one call for the whole walk');
+  pool.length = 0;
+  assert.deepEqual(allNames(env, memory), ['aaa', 'bbb', 'ccc'], 'the snapshot stands for this session');
+});

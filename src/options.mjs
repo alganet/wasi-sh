@@ -84,11 +84,20 @@ export function toBytes(data) {
 //   lookup(name) -> bool     is this a host builtin? (`type` and `command -v`
 //                            ask, so it must answer WITHOUT running anything)
 //   run(ctx)     -> status   execute it, synchronously
+//   names()      -> string[] OPTIONAL: every name, for tab completion
 // A plain { name: handler } map is the 95% case. An object that ALREADY has
 // both methods is passed through untouched — that is the extension point for a
 // dynamic namespace (a whole bin/ directory, a lazy index). Requiring BOTH
 // methods is what keeps a map containing a command literally named `run` from
 // being mistaken for a provider.
+//
+// names() is third and optional because listing is a strictly bigger promise
+// than looking up: lookup() answers one question and a lazy index can always
+// do that, while enumerating may be something it genuinely cannot offer. Its
+// PRESENCE is the signal, exactly as input.winchPending's is in shim.mjs — a
+// provider without it simply contributes no completions, which is also what a
+// session with no builtins at all does. A map has nothing to decide: its keys
+// ARE the list.
 // hasOwn is not paranoia: a bare `typeof map[name] === 'function'` claims
 // toString, constructor and valueOf as builtins, so `type toString` would
 // answer yes and then dispatch into Object.prototype.
@@ -98,6 +107,10 @@ export function hostBuiltins(spec) {
   const pick = (name) => (Object.hasOwn(spec, name) && typeof spec[name] === 'function' ? spec[name] : null);
   return {
     lookup: (name) => pick(name) != null,
+    // Own keys only, and filtered through the same pick() lookup() uses, so
+    // the list and the answer cannot disagree: a key holding a non-function is
+    // not a builtin, and Object.keys would otherwise offer it as one.
+    names: () => Object.keys(spec).filter((name) => pick(name) != null),
     run(ctx) {
       const fn = pick(ctx.argv[0]);
       if (!fn) { ctx.stderr(`${ctx.argv[0]}: not found\n`); return 127; }

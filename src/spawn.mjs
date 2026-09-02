@@ -107,6 +107,11 @@ export async function spawn(options = {}) {
     env,
     sab,
     reqSab,
+    // Hand the shell its own line editor: history, arrow keys, ^C and tab
+    // completion, all inside the guest. It is what makes isatty() true, and
+    // the terminal must then stop editing lines itself — see shim.mjs's fd
+    // table, and README's "Terminals: bring your own".
+    tty: !!options.tty,
   };
   worker.postMessage(msg, msg.wasmBytes ? [msg.wasmBytes.buffer] : []);
   // Bounded: a custom worker module that top-level-awaits before installing a

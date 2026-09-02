@@ -149,6 +149,12 @@ patch -p1 -d "$BB" < "$here/applet-interrupt.patch"
 # also touches, and shebang_expand(), which ash-shebang.patch introduces.
 patch -p1 -d "$BB" < "$here/ash-shebang-path.patch"
 
+# `compgen`, so a terminal that edits its lines in the HOST can still ask this
+# shell what completes a word. Depends on ash-hostbuiltin.patch (host builtins
+# are one of the kinds of name it lists) and follows ash-shebang.patch's `env`
+# in how it keeps builtintab's hand-counted offsets honest.
+patch -p1 -d "$BB" < "$here/ash-compgen.patch"
+
 # --- configure (ash-only + LFS + read-frac + math-base) ------------------------
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null

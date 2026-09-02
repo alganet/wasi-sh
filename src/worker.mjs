@@ -88,7 +88,7 @@ self.addEventListener('message', async (e) => {
     return;
   }
   started = true;
-  const { module, wasmBytes, files, args, env, sab, reqSab, stdin, requests } = e.data;
+  const { module, wasmBytes, files, args, env, sab, reqSab, stdin, requests, tty } = e.data;
   try {
     const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
     // Builtin setup and wasm compilation are independent; overlapping them
@@ -117,6 +117,9 @@ self.addEventListener('message', async (e) => {
       // channel is stdin's contract aimed the other way, so there is no
       // adapter between them.
       requests: reqSab ? new RingReader(reqSab).toInput() : fixedRequests(requests),
+      // Only a session can be one, and only if it said so: see the fd table in
+      // shim.mjs for why the shell's own line editor is opt-in.
+      tty: !!tty,
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);
