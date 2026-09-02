@@ -14,3 +14,6 @@ package-lock.json
 
 # local-only investigation notes (never committed)
 /BUSYBOX_TOOLS.md
+
+# The wasm toolchain: `pip install ziglang` into a venv, per build/build.sh.
+.venv/

@@ -80,7 +80,8 @@ into the busybox applets compiled into the wasm, never as processes:
 - **Hashes**: `md5sum sha1sum sha256sum cksum crc32`
 - **Misc**: `date env printenv basename dirname realpath test printf getopt
   uname nproc stty` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
-  globs, functions)
+  globs, functions), and `compgen` for completing a word from outside the
+  shell's own line editor
 
 You can add to that list: see [Host builtins](#host-builtins-your-own-commands)
 for registering your own commands, written in JS.
@@ -278,7 +279,10 @@ get it wrong:
 
 - **No processes, ever.** There is no fork/exec: no external programs, no
   backgrounding (`&`), no job control, and no exec-wrappers — `nohup`, `nice`,
-  `time`, `timeout` cannot work. Networking (`wget`, `nc`), `/proc` tools
+  `time`, `timeout` cannot work. Job control is compiled out rather than merely
+  unused, so `jobs`, `fg` and `bg` do not exist here at all. `kill` does — as
+  the applet rather than the shell builtin, which is the more honest of the two
+  anyway, since there are no job specs for `%1` to name. Networking (`wget`, `nc`), `/proc` tools
   (`ps`, `top`), and interactive full-screen tools (`vi`, `less`) are out of
   scope.
 - **Shebangs are read, but there is still no exec.** `./bin/thing` works when
@@ -350,9 +354,67 @@ duplex; a terminal is anything that feeds `session.write()` and renders
 Wiring [xterm.js](https://xtermjs.org) is two lines:
 
 ```js
+const session = await spawn({ tty: true });      // the shell edits its own line
 term.onData((d) => session.write(d));            // keyboard → shell
 session.onOutput((b) => term.write(b));          // shell → screen
 ```
+
+### `tty: true`, and who edits the line
+
+Those really are the only two lines, because **`tty: true` gives the shell its
+own line editor**: a prompt, echo, history, arrow keys, `^C`, and **tab
+completion** over applets, builtins, shell functions, aliases, `$VAR`s, your
+host builtins and the filesystem. It is busybox's `libbb/lineedit.c`, running
+in the guest — nothing to write and nothing to keep in sync.
+
+What the option actually does is make `isatty(0)` and `isatty(1)` true. That is
+the only thing ash checks before setting `iflag` and calling
+`read_line_input()`, so without it the editor is compiled in and never runs —
+which is what this build did until now.
+
+**It is opt-in, and the reason is that a line cannot be edited twice.** A page
+that keeps its own editor — accumulating keys, echoing them itself, sending the
+line on Enter — will print every line twice with this on. Pick one:
+
+| | `tty: true` | default |
+|---|---|---|
+| who echoes | the guest | you |
+| who draws the prompt | the guest (`PS1`) | you |
+| history, arrows, Tab | free | yours to build |
+| what you send | every byte, as typed | a finished line |
+| `^C` | send the byte **and** `session.interrupt()` | `interrupt()` only while a command runs |
+
+`run()` is never a tty: a fixed stdin is not a terminal.
+
+One caveat if you set `PS1`: this build has `FEATURE_EDITING_FANCY_PROMPT`
+off, so the editor measures the prompt with `strlen()`. A colour escape in
+`PS1` counts as visible width and puts the cursor in the wrong column — keep it
+plain text.
+
+### Completion for a terminal that edits its own lines
+
+Keeping your own line editor is a legitimate choice, and sometimes the only one
+— a guest parked at a prompt is parked on **stdin**, so a session that also has
+to answer something else (a request channel, a dev server) cannot host one.
+
+`compgen` is the same completion engine, callable as a command:
+
+```
+compgen -c WORD    command names: applets, builtins, functions, aliases,
+                   host builtins, and a PATH scan
+compgen -f WORD    files and directories
+compgen -d WORD    directories only
+```
+
+One candidate per line on stdout, status 1 when there are none. Two things to
+know, both inherited from the editor so that the two agree:
+
+- candidates are **basenames, not paths** — `compgen -f src/te` answers
+  `terminal.mjs`, and you re-attach `src/`;
+- a **directory carries a trailing slash**, a file does not (so completing a
+  directory should not append a space).
+
+Use `--` when the word may start with a dash: `compgen -f -- -l`.
 
 One knob matters: the guest has no tty line discipline (no ONLCR), so its
 output is LF-only — set `convertEol: true` so the terminal supplies the
@@ -401,6 +463,19 @@ cancels what chose to look, and the count says what "look" means — a ^C posted
 while nothing is running cancels nothing, rather than waiting to cancel the next
 thing you type.
 
+**Under `tty: true` the guard is unnecessary, and you cannot write it anyway** —
+the page no longer knows whether a command is running. Send the byte *and* the
+interrupt, unconditionally: the byte is what the guest's editor uses to abandon
+a half-typed line, and the interrupt cancels nothing when nothing is running,
+which is exactly the sentence above being useful.
+
+```js
+term.onData((d) => {                                // tty: true
+  session.write(d);
+  if (d.includes('\x03')) session.interrupt();
+});
+```
+
 **Applets look on your behalf.** A runaway `seq`, `cat`, `grep`, `sort`, `awk`
 or `sed` stops at its next read, write or loop turn and the shell reads 130 in
 `$?`, with its filesystem and every warm instance intact. **Host builtins look
@@ -412,7 +487,9 @@ those two.
 Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`
 and `<input>` with no terminal library at all, and `examples/repl.html` for
-an xterm-based REPL (xterm from a CDN; not a dependency).
+an xterm-based REPL on `tty: true` (xterm from a CDN; not a dependency) — the
+whole of its terminal integration is the three lines above, because the shell
+does the editing.
 
 ## Host builtins: your own commands
 
@@ -480,6 +557,26 @@ lives.
 Precedence is functions → shell builtins → applets → **host builtins** → the
 path search. Applets win, so registering `grep` does nothing: what the shipped
 toolbox means cannot be changed out from under a script.
+
+**They complete like any other command.** A map's keys are the list, so Tab at a
+`tty: true` prompt and `compgen -c` both offer your names with no extra wiring.
+
+If you registered a *provider* instead of a map — the extension point for a
+dynamic namespace, an object with its own `lookup(name)` and `run(ctx)` — add an
+optional `names()` to be completable:
+
+```js
+serve({ builtins: {
+  lookup: (name) => index.has(name),
+  run: (ctx) => index.get(ctx.argv[0])(ctx),
+  names: () => [...index.keys()],     // optional: what Tab and compgen offer
+} });
+```
+
+It is optional because listing promises more than looking up, and a lazy index
+may genuinely be unable to. Leave it out and your commands still resolve and
+still run — completion just never mentions them. It is read once per session,
+on the first completion.
 
 ### In a browser: register them in the worker
 

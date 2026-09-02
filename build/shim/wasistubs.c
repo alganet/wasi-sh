@@ -67,13 +67,20 @@ int setsid(void){ return 0; }
 int tcsetpgrp(int fd,int p){ (void)fd;(void)p; return 0; }
 int tcgetpgrp(int fd){ (void)fd; return 0; }
 #include <errno.h>
-int cfsetispeed(void*t,unsigned s){ (void)t;(void)s; return 0; }
-int cfsetospeed(void*t,unsigned s){ (void)t;(void)s; return 0; }
-/* stty (CONFIG_STTY) reads line speed; no tty here, so report B0. Without these
- * the applet leaves cfget*speed as unresolved env imports and the module can't
- * instantiate. */
-unsigned cfgetispeed(const void*t){ (void)t; return 0; }
-unsigned cfgetospeed(const void*t){ (void)t; return 0; }
+/* The termios family, with the REAL prototypes rather than void*-typed
+ * look-alikes: the line-discipline state below has to be a `struct termios`,
+ * and once <termios.h> is in scope every declaration in it has to be matched.
+ *
+ * Line speed is the one part that stays fictional. There is no line, so a
+ * speed set is accepted and dropped and a speed read reports B0 — which is
+ * what stty (CONFIG_STTY) printed before this file held any state at all.
+ * Without these four the applet leaves cf*speed as unresolved env imports and
+ * the module cannot instantiate. */
+#include <termios.h>
+int cfsetispeed(struct termios*t,speed_t s){ (void)t;(void)s; return 0; }
+int cfsetospeed(struct termios*t,speed_t s){ (void)t;(void)s; return 0; }
+speed_t cfgetispeed(const struct termios*t){ (void)t; return 0; }
+speed_t cfgetospeed(const struct termios*t){ (void)t; return 0; }
 int clock_settime(int c,const void*t){ (void)c;(void)t; return 0; }
 void *getmntent(void*f){ (void)f; return 0; }
 void *setmntent(const char*f,const char*m){ (void)f;(void)m; return 0; }
@@ -86,8 +93,50 @@ char *mkdtemp(char*t){ (void)t; return 0; }
 int mknod(const char*p,unsigned m,unsigned long long d){ (void)p;(void)m;(void)d; errno=ENOSYS; return -1; }
 int setresgid(unsigned a,unsigned b,unsigned c){ (void)a;(void)b;(void)c; return 0; }
 int setresuid(unsigned a,unsigned b,unsigned c){ (void)a;(void)b;(void)c; return 0; }
-int tcgetattr(int fd,void*t){ (void)fd;(void)t; return 0; }
-int tcsetattr(int fd,int o,const void*t){ (void)fd;(void)o;(void)t; return 0; }
+/* Line discipline, as a value rather than a device. There is no tty and no
+ * kernel to hold these bits, so this file holds them: one process-wide
+ * `struct termios` that tcgetattr reads and tcsetattr writes back.
+ *
+ * It has to be a real struct and not the no-op pair this used to be, for one
+ * reason that decides the whole feature. lineedit.c gives up on editing when
+ *
+ *     (initial_settings.c_lflag & (ECHO|ICANON)) == ICANON
+ *
+ * which is the "somebody ran `stty -echo` before us" test. A no-op tcgetattr
+ * leaves the caller's struct as get_termios_and_make_raw() memset it — all
+ * zeroes — so the test read 0 == ICANON and happened to say "keep editing".
+ * The right answer by accident: the same zeroes claim a terminal with no ECHO,
+ * no ISIG and VMIN/VTIME of 0, and `stty` printed that fiction to the user.
+ *
+ * Seeded to what a cooked terminal actually looks like, the test means what
+ * POSIX says: with ECHO|ICANON both set the editor engages, and after a real
+ * `stty -echo` it correctly falls back to a plain read. Nothing here has to
+ * ENFORCE the bits — the shim performs no echo and no canonicalization either
+ * way, so the only reader that matters is the guest asking what it set. */
+#include <string.h>
+static struct termios tty_state;
+static int tty_state_ready;
+static void tty_state_init(void){
+  if (tty_state_ready) return;
+  tty_state_ready = 1;
+  memset(&tty_state, 0, sizeof(tty_state));
+  tty_state.c_iflag = ICRNL | IXON | BRKINT | IMAXBEL;
+  tty_state.c_oflag = OPOST | ONLCR;
+  tty_state.c_cflag = CS8 | CREAD | B38400;
+  tty_state.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
+  tty_state.c_cc[VINTR] = 3;    /* ^C */
+  tty_state.c_cc[VQUIT] = 28;   /* ^\ */
+  tty_state.c_cc[VERASE] = 127; /* DEL */
+  tty_state.c_cc[VKILL] = 21;   /* ^U */
+  tty_state.c_cc[VEOF] = 4;     /* ^D */
+  tty_state.c_cc[VSTART] = 17;  /* ^Q */
+  tty_state.c_cc[VSTOP] = 19;   /* ^S */
+  tty_state.c_cc[VSUSP] = 26;   /* ^Z */
+  tty_state.c_cc[VMIN] = 1;
+  tty_state.c_cc[VTIME] = 0;
+}
+int tcgetattr(int fd,struct termios*t){ (void)fd; tty_state_init(); memcpy(t,&tty_state,sizeof(tty_state)); return 0; }
+int tcsetattr(int fd,int o,const struct termios*t){ (void)fd;(void)o; tty_state_init(); memcpy(&tty_state,t,sizeof(tty_state)); return 0; }
 int vfork(void){ errno=ENOSYS; return -1; }
 int wait(int*s){ (void)s; errno=ECHILD; return -1; }
 int waitpid(int p,int*s,int o){ (void)p;(void)s;(void)o; errno=ECHILD; return -1; }
@@ -377,6 +426,35 @@ extern int __host_builtin_lookup(const char *name, int len);
 int host_builtin_lookup(const char *name)
 {
 	return __host_builtin_lookup(name, (int)strlen(name)) ? 1 : 0;
+}
+
+/* Enumerate the registry, for tab completion (build/ash-compgen.patch).
+ *
+ * lookup() answers one name at a time, which is all find_command() ever needs
+ * and all a lazy namespace can promise — so listing is a SEPARATE, OPTIONAL
+ * capability rather than a widening of it. The JS side writes the i'th name
+ * into BUF and returns its length, 0 past the end of the list, and 0 again when
+ * the embedder implemented no names() at all. Those two are deliberately the
+ * same answer: "nothing more to offer" is the only thing a caller can act on.
+ *
+ * The returned pointer is this file's static buffer and is valid until the next
+ * call. That is enough because ash_command_name()'s one caller xstrdup()s it
+ * immediately, and it keeps the ABI to a length rather than an allocation the
+ * guest would have to free.
+ *
+ * A name too long for BUF is dropped by the JS side when it builds the list,
+ * not reported here — a "skip this one" answer cannot be told apart from "the
+ * list ended" through a single length, and truncating instead would offer a
+ * candidate that completes to a command which does not exist. */
+extern int __host_builtin_name(int index, char *buf, int len);
+const char *host_builtin_name(int i)
+{
+	static char buf[256];
+	int n = __host_builtin_name(i, buf, (int)sizeof(buf) - 1);
+	if (n <= 0 || n > (int)sizeof(buf) - 1)
+		return 0;
+	buf[n] = '\0';
+	return buf;
 }
 
 /* Run a registered builtin to completion, SYNCHRONOUSLY — a wasm import cannot

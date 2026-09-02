@@ -155,7 +155,7 @@ nested shell. That is the bargain every applet in this build makes.
  	_exit(exitstatus);
  	/* NOTREACHED */
  }
-@@ -15580,6 +15628,171 @@
+@@ -15580,6 +15628,182 @@
  extern int etext();
  #endif
  
@@ -226,13 +226,25 @@ nested shell. That is the bargain every applet in this build makes.
 +/* shell_tty_info is deliberately absent: it sits inside an `#if 0` upstream.
 + *
 + * ttyfd is a DESCRIPTOR, and putting a number back does not reopen anything —
-+ * so this is only sound while a nested shell cannot close it. It cannot here:
-+ * setjobctl(0) returns early unless job control is on, and it never is, because
-+ * there is no /dev/tty to acquire (every session starts "can't access tty; job
-+ * control turned off"). If a tty ever appears, a nested shell's exitshell()
-+ * would close the outer's ttyfd and this restore would hand back a closed fd. */
++ * so this is only sound while a nested shell cannot close it, and a nested
++ * shell CAN once job control is on: exitshell() -> setjobctl(0) takes the
++ * "turning job control off" branch, which close()s ttyfd, and this restore
++ * then hands the outer shell a closed fd.
++ *
++ * That is why this build compiles JOBS out (CONFIG_ASH_JOB_CONTROL is not set)
++ * rather than relying on the tty being unreachable. It used to rely on exactly
++ * that — "setjobctl(0) returns early unless job control is on, and it never
++ * is, because there is no /dev/tty to acquire" — and that reasoning died the
++ * moment isatty() started telling the truth: setjobctl's fallback walks DOWN
++ * from fd 2 looking for any tty, finds stdin, and turns job control on with no
++ * /dev/tty and no message. Measured at the prompt: `$-` read `smi`.
++ *
++ * With JOBS off the whole list below expands to nothing, cmdnextc included —
++ * it is `static char *cmdnextc` inside the same `#if JOBS` block, and naming it
++ * unconditionally is a build error, not a missed save. */
 +# define ASH_STATE_JOBS(F) \
-+	F(jobctl) F(initialpgrp) F(ttyfd) F(jobtab) F(njobs) F(curjob)
++	F(jobctl) F(initialpgrp) F(ttyfd) F(jobtab) F(njobs) F(curjob) \
++	F(cmdnextc)
 +#else
 +# define ASH_STATE_JOBS(F)
 +#endif
@@ -257,7 +269,6 @@ nested shell. That is the bargain every applet in this build makes.
 +	ASH_STATE_EDITING(F) \
 +	ASH_STATE_ALIAS(F) \
 +	ASH_STATE_JOBS(F) \
-+	F(cmdnextc) \
 +	F(expdest) F(argbackq) F(ifsfirst) F(ifslastp) F(exparg) \
 +	F(cmdtable) F(builtinloc) \
 +	F(funcblock) F(funcstring_end) \

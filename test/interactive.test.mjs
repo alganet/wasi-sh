@@ -18,7 +18,8 @@ const TWIN = `
   import { parentPort, workerData } from 'node:worker_threads';
   const { WasiShim, WasiExit } = await import(workerData.shimUrl);
   const { RingReader } = await import(workerData.ringUrl);
-  const { module, files, args, env, sab } = workerData;
+  const { hostBuiltins } = await import(workerData.optionsUrl);
+  const { module, files, args, env, sab, tty } = workerData;
   const dec = new TextDecoder();
   let out = '';
   const emit = (b) => { const s = dec.decode(b); out += s; parentPort.postMessage({ type: 'out', text: s }); };
@@ -27,6 +28,12 @@ const TWIN = `
     stdout: emit,
     stderr: emit,
     input: new RingReader(sab).toInput(),
+    // A tty is what gives the guest its OWN line editor; see the tab-completion
+    // block at the end of this file.
+    tty,
+    // Constructed HERE, not passed in: a function does not survive
+    // structured clone, so a builtin can only be registered inside the worker.
+    builtins: hostBuiltins({ mytool: (ctx) => { ctx.stdout('mytool ran\\n'); return 0; } }),
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
   shim.bindMemory(instance.exports.memory);
@@ -36,19 +43,24 @@ const TWIN = `
   parentPort.postMessage({ type: 'exit', code, out });
 `;
 
-function spawnTwin(script, { env = {} } = {}) {
+// `script` is the shell script to run. Pass null for tty:true instead: a
+// PROMPT is the thing under test there, and a shell given a script file to run
+// never shows one.
+function spawnTwin(script, { env = {}, tty = false, files = {} } = {}) {
   const sab = createStdinRing();
   const writer = new RingWriter(sab);
   const worker = new Worker(TWIN, {
     eval: true,
     workerData: {
       module: wasm,
-      files: { '/t.sh': script },
-      args: ['busybox', 'sh', '/t.sh'],
+      files: script == null ? files : { '/t.sh': script, ...files },
+      args: script == null ? ['busybox', 'sh'] : ['busybox', 'sh', '/t.sh'],
       env: { PATH: '/', LC_ALL: 'C', ...env },
       sab,
+      tty,
       shimUrl: new URL('../src/shim.mjs', import.meta.url).href,
       ringUrl: new URL('../src/ring.mjs', import.meta.url).href,
+      optionsUrl: new URL('../src/options.mjs', import.meta.url).href,
     },
   });
   // `live()` is output SO FAR: the winch tests below assert on what the guest
@@ -251,4 +263,116 @@ test('repeated resizes each fire (bb_got_signal is cleared, no read -t spin)', a
   assert.match(m.out, /R1=40 100/, 'first resize');
   assert.match(m.out, /R2=20 70/,  'second resize (would be lost to the spin without the fix)');
   assert.match(m.out, /R3=50 120/, 'third resize');
+});
+
+// ─── the guest's own line editor ─────────────────────────────────────────────
+// Everything above drives a shell running a SCRIPT. These drive a shell at its
+// PROMPT, which until now this build could not reach at all.
+//
+// ash calls read_line_input() only when `iflag` is set, and it sets `iflag`
+// only when isatty(0) && isatty(1) (shell/ash.c). wasi-libc answers isatty()
+// from the WASI rights word, and the shim used to claim every right on stdio —
+// FD_SEEK and FD_TELL included — which is precisely what "not a terminal"
+// means. So libbb/lineedit.c was compiled in and never ran: no prompt, no echo,
+// no history, no arrows, no Tab. `tty: true` drops those two bits.
+//
+// These assert on `live()` rather than the exit snapshot, because a shell at a
+// prompt has not exited: the whole point is what it printed while parked.
+
+// The editor redraws with \r + erase, so what is on screen is the tail of the
+// stream, not a substring of it. Strip the control sequences and take the last
+// prompt line.
+const screen = (s) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/[\r\n]/).filter(Boolean).pop() || '';
+const settle = (ms = 400) => new Promise((res) => setTimeout(res, ms));
+
+test('a tty gives the guest a prompt, and it echoes its own keystrokes', async () => {
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  assert.match(live(), /BusyBox v1\.38\.0.*built-in shell \(ash\)/s, 'the interactive banner');
+  assert.match(live(), /# $/, 'and a prompt, which a non-interactive shell never prints');
+  writer.write(enc.encode('ec'));
+  await settle();
+  // Nothing echoes for the shell here — no host, no line discipline — so this
+  // is the guest doing it in raw mode, which only the line editor does.
+  assert.match(screen(live()), /# ec$/, 'the guest echoed the keystrokes itself');
+  writer.end();
+});
+
+test('Tab completes a command name', async () => {
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('ec\t'));
+  await settle();
+  assert.match(screen(live()), /# echo $/, '"ec" + Tab became "echo " — one match, so a trailing space');
+  writer.end();
+});
+
+test('Tab completes a file name, and marks a directory with a slash', async () => {
+  const { writer, live } = spawnTwin(null, {
+    tty: true, files: { '/only.txt': 'x', '/adir/inside.txt': 'y' },
+  });
+  await settle();
+  writer.write(enc.encode('cat on\t'));
+  await settle();
+  assert.match(screen(live()), /# cat only\.txt $/, 'a file completes with a trailing space');
+  writer.write(enc.encode('\x15cd adi\t'));  // ^U clears the line
+  await settle();
+  assert.match(screen(live()), /# cd adir\/$/, 'a directory completes with a slash and NO space, so the path can go on');
+  writer.end();
+});
+
+test('an ambiguous Tab inserts the common prefix; a second Tab lists', async () => {
+  const { writer, live } = spawnTwin(null, {
+    tty: true, files: { '/pre_one.txt': 'a', '/pre_two.txt': 'b' },
+  });
+  await settle();
+  writer.write(enc.encode('cat pre\t'));
+  await settle();
+  assert.match(screen(live()), /# cat pre_$/, 'the common prefix "pre_" went in, and no more');
+  writer.write(enc.encode('\t'));
+  await settle();
+  assert.match(live(), /pre_one\.txt/, 'the second Tab listed both candidates');
+  assert.match(live(), /pre_two\.txt/);
+  writer.end();
+});
+
+test('completion sees host builtins, which no other name source knows about', async () => {
+  // `mytool` is registered in the twin above. It is not an applet, not a shell
+  // builtin, not a function and not a file on PATH — the registry lives in JS,
+  // behind a lookup(name) that answers one name at a time. Completing it is the
+  // whole reason the host-builtin contract grew an optional names().
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('myto\t'));
+  await settle();
+  assert.match(screen(live()), /# mytool $/, '"myto" + Tab found the JS-backed command');
+  writer.write(enc.encode('\r'));
+  await settle();
+  assert.match(live(), /mytool ran/, 'and the name it completed to actually runs');
+  writer.end();
+});
+
+test('the Up arrow recalls the previous line', async () => {
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('echo first\r'));
+  await settle();
+  assert.match(live(), /^first$/m, 'the command ran');
+  writer.write(enc.encode('\x1b[A'));
+  await settle();
+  assert.match(screen(live()), /# echo first$/, 'Up put it back on the line');
+  writer.end();
+});
+
+test('without a tty none of that happens, and that is the default', async () => {
+  // The compatibility guarantee: an embedder that edits lines in the page (both
+  // of ours do) must not suddenly get a second echo of every line from the
+  // guest. Opting in is the only way to turn the editor on.
+  const { writer, live } = spawnTwin(null, {});
+  await settle();
+  assert.equal(live(), '', 'no banner and no prompt');
+  writer.write(enc.encode('ec\t'));
+  await settle();
+  assert.equal(live(), '', 'and no echo — the bytes are just stdin');
+  writer.end();
 });
