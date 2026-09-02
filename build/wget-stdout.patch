@@ -1,0 +1,25 @@
+--- a/networking/wget.c
++++ b/networking/wget.c
+@@ -1641,7 +1641,21 @@
+ 	while (*argv)
+ 		download_one_url(*argv++);
+ 
+-	if (G.output_fd >= 0)
++	/* Not the shell's own stdout.
++	 *
++	 * `-O -` sets output_fd to 1 rather than opening anything, and closing
++	 * it here is correct everywhere wget is a PROCESS: the descriptor dies
++	 * with it either way. This build has no fork, so an applet runs in the
++	 * shell's own process and that close lands on the shell — every command
++	 * after `wget -O - URL` then fails with "sh: write error: Bad file
++	 * descriptor", which names neither wget nor the fd it took away.
++	 *
++	 * It is the same class of gap as the zeroed scratch buffer and the
++	 * leaked stdio state that build.sh's other patches close, one resource
++	 * over: what an applet assumes process death will clean up. A real
++	 * `-O FILE` is above stderr and is still closed here.
++	 */
++	if (G.output_fd > STDERR_FILENO)
+ 		xclose(G.output_fd);
+ 
+ 	if (G.log_fd >= 0)

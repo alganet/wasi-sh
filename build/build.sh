@@ -160,6 +160,14 @@ patch -p1 -d "$BB" < "$here/ash-compgen.patch"
 # a redirect hands it one. The TLS is the host's; see the patch's own comment.
 patch -p1 -d "$BB" < "$here/wget-https.patch"
 
+# ...and wget not closing the shell's stdout on the way out. `-O -` writes to
+# fd 1 and closes it at the end, which is right for a process and wrong here:
+# with no fork the applet IS the shell, so the next command met "sh: write
+# error: Bad file descriptor". Independent of the patch above and of every
+# other one; see its own comment for why this is the same gap as the scratch
+# buffer and the stdio state, one resource over.
+patch -p1 -d "$BB" < "$here/wget-stdout.patch"
+
 # --- configure (ash-only + LFS + read-frac + math-base) ------------------------
 cp "$here/busybox.config" "$BB/.config"
 yes "" | make -C "$BB" oldconfig HOSTCC=cc >/dev/null

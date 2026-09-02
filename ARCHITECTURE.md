@@ -328,8 +328,8 @@ applets. `run_nofork_applet` saves/restores option parsing state, installs
 applet's status.
 
 The valuable userland is NOEXEC, so the patch promotes **all** applets to that
-dispatch path, and closes the three gaps a missing fork opens (each was found
-as a real bug during bring-up):
+dispatch path, and closes the gaps a missing fork opens (each was found as a
+real bug during bring-up):
 
 1. **Scratch-buffer globals** — applets like grep keep their globals overlaid
    on `bb_common_bufsiz1` and assume a freshly zeroed process; the second grep
@@ -357,6 +357,17 @@ as a real bug during bring-up):
    (`awk 'BEGIN{exit 3}'` sets `$?=3` and the shell lives), and calls the real
    exit otherwise (ash's own `exit` builtin). Note `xfunc_error_retval` is a
    `uint8_t` — declaring it wider clobbers adjacent globals.
+4. **Descriptors an applet closes** (`build/wget-stdout.patch`) — the fourth,
+   and the one sockets brought. `wget -O -` writes to fd 1 without opening
+   anything and `xclose()`s it on the way out, which is free where wget is a
+   process and takes the SHELL's stdout where it is a function call: every
+   command after it failed with `sh: write error: Bad file descriptor`, naming
+   neither wget nor the descriptor. The patch skips the close for anything at
+   or below stderr. Not general — `run_nofork_applet` could dup the three std
+   fds aside and put them back, and that is three dups and three dup2s on
+   every applet call — so it is one line in the one applet in this build known
+   to do it. `archival/bbunzip.c` does the same with `-c` and is not built
+   here; an applet set that grows to include it wants the general fix.
 
 `FEATURE_PREFER_APPLETS` extends the same trick to `find -exec` and `xargs`
 (via `spawn_and_wait`), so `find . -name '*.sh' -exec echo {} \;` runs its
