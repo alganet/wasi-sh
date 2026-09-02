@@ -118,7 +118,7 @@ export interface BuiltinContext {
  * contained: the message goes to stderr and the command fails, but the shell
  * survives.
  */
-export type BuiltinHandler = (ctx: BuiltinContext) => number;
+export type BuiltinHandler = (ctx: BuiltinContext) => number | Promise<number>;
 
 /** A name → handler map, the 95% case. */
 export type BuiltinMap = Record<string, BuiltinHandler>;
@@ -128,9 +128,9 @@ export type BuiltinMap = Record<string, BuiltinHandler>;
  * `builtinRegistry()`.
  *
  * A HostBuiltins with two more methods on it, so it can be passed as
- * `builtins` unchanged. Its point is `define`: the set of commands can change
- * while the shell is running, so a handler can register or drop one from
- * inside the session.
+ * `builtins` unchanged. Its point is `define`: a handler that may await (see
+ * WasiShimOptions.suspendable) can fetch what a new command needs and then
+ * register the command, from inside the running session.
  */
 export interface BuiltinRegistry extends HostBuiltins {
   /** Add or replace a command. Throws on a name ash could never resolve. */
@@ -245,6 +245,30 @@ export interface WasiShimOptions {
    * is a plain 127 "not found".
    */
   builtins?: HostBuiltins;
+  /**
+   * May a host builtin AWAIT?
+   *
+   * Off by default, and the default is the contract every session had until
+   * now: a handler returning a promise is refused, loudly, because the guest
+   * is a synchronous stack frame below the import and a thenable coerces to
+   * i32 0 — silent success with the real work landing later.
+   *
+   * On, and given an engine with JSPI, the guest's whole wasm stack suspends
+   * for the duration of the handler — ash's own setjmp frames included, so a
+   * $(...) capture, a pipeline stage, a redirect and `$?` all still mean what
+   * they meant. That is what lets a command go and fetch an interpreter and
+   * then register more commands with `builtinRegistry`, mid-session.
+   *
+   * Feature-detected rather than trusted: without `WebAssembly.Suspending`
+   * this is ignored and the shell is the one it always was. Read
+   * `shim.suspendable` back for what was actually decided — the caller needs
+   * it, because the export must be entered through `WebAssembly.promising`
+   * for a suspending import to be legal.
+   *
+   * Costs nothing when nothing suspends: measured at 6.3 µs per builtin call
+   * either way.
+   */
+  suspendable?: boolean;
   /**
    * The host port: what a script can reach outside the sandbox, as verbs on
    * /dev/host. A request is a line written there — a verb, optionally a space

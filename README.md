@@ -406,7 +406,9 @@ wrong:
   session survive.
 - **Host builtins are builtins**, so every limit above applies to them
   unchanged: `myTool &`, `(myTool)`, `exec myTool`, `timeout myTool` and
-  `find -exec myTool` all fail exactly as they would for `echo`. And a handler
+  `find -exec myTool` all fail exactly as they would for `echo`. A handler that
+  *awaits* is not interruptible while it does (see `suspendable`), because
+  `ctx.interrupted()` is polled and a suspended handler has no stack to poll it. And a handler
   runs **outside** the sandbox with your page's or process's full authority —
   `run()` is a hermetic script runner *until* you register one, after which the
   trust boundary is your handler. Validate `argv`.
@@ -641,11 +643,13 @@ It does not end a blocking `ctx.stdin()`: the wait wakes, but no bytes appeared,
 so the read parks again. A builtin that wants to be interruptible while waiting
 for input has to read with its own timeout and check between attempts.
 
-**Handlers must be synchronous.** The guest is a synchronous wasm stack frame
-below the call — there is nothing to await into. Returning a promise is
-reported as an error rather than silently succeeding at exit 0. Throwing is
-contained: the message goes to stderr and the command fails, but the shell
-lives.
+**Handlers are synchronous by default.** The guest is a synchronous wasm stack
+frame below the call — there is nothing to await into. Returning a promise is
+reported as an error rather than silently succeeding at exit 0. Pass
+`suspendable: true` to change that; see [Handlers that
+await](#handlers-that-await-and-a-namespace-that-changes) below. Throwing is
+contained either way: the message goes to stderr and the command fails, but the
+shell lives.
 
 Precedence is functions → shell builtins → applets → **host builtins** → the
 path search. Applets win, so registering `grep` does nothing: what the shipped
@@ -690,6 +694,57 @@ await run({ inline: true, builtins: commands, script: 'hello; bye; hello 2>/dev/
 It refuses a name ash could never resolve as a command — anything with a slash,
 a NUL or whitespace in it — because a command that silently is not one is worse
 than the mistake it came from.
+
+### Handlers that await, and a namespace that changes
+
+Some commands cannot be made synchronous. A command that has to *fetch* what it
+runs — an interpreter, a tool, a package — needs the event loop, and a live
+session never turns one: it is a single `_start()` frame, running or parked in
+`Atomics.wait`.
+
+`suspendable: true` lifts that, using [JSPI][jspi]. The guest's whole wasm stack
+suspends for the duration of the handler and resumes where it left off, so a
+handler may be `async`:
+
+```js
+import { builtinRegistry } from 'wasi-sh';
+
+const commands = builtinRegistry();
+commands.define('load', async (ctx) => {
+  const runtime = await bootSomething();          // the event loop is free here
+  commands.define('something', (c) => runtime.run(c.argv.slice(1)));
+  return 0;
+});
+
+await run({ inline: true, suspendable: true, builtins: commands,
+            script: 'load\nsomething --version' });
+```
+
+`builtinRegistry()` is the other half: a `HostBuiltins` provider with `define`,
+`remove` and `has` on it, so the command namespace can change while the shell is
+running. `lookup` and completion both read it live.
+
+This is not a partial suspension of the JS side — ash's own `setjmp`/`longjmp`
+frames are suspended with everything else, so `$?`, a `$(...)` capture, a
+pipeline stage, a redirect and `||` all still mean what they meant. That is
+covered end to end in `test/suspend.test.mjs`.
+
+Three things to know before reaching for it:
+
+- **It needs JSPI.** Available by default in Chromium 137+ and Firefox, and in
+  node behind `--experimental-wasm-jspi`. Without it the option is *ignored*
+  rather than fatal: you get the shell you always had, and the first handler to
+  return a promise is refused with a message saying so. Check `shim.suspendable`
+  if you need to know which you got.
+- **`ctx.interrupted()` cannot be polled while suspended.** There is no stack
+  running to do the polling, so a ^C reaches a handler that awaits only once it
+  is back. Long *awaits* are not interruptible; long *loops* still are.
+- **It costs nothing when nothing suspends.** A synchronous handler under a
+  suspending import measured 6.28 µs per call against 6.35 µs without one — the
+  same number, which is why there is one import rather than a fast one and a
+  slow one.
+
+[jspi]: https://github.com/WebAssembly/js-promise-integration
 
 ### In a browser: register them in the worker
 
@@ -846,6 +901,12 @@ synchronous `_start()` frame, so the worker's event loop never turns while the
 shell is running: a message posted into it is not slow, it is *not delivered*.
 A request travels through shared memory the guest reads at its blocking point
 instead — the same mechanism a terminal resize uses.
+
+(A [suspending handler](#handlers-that-await-and-a-namespace-that-changes) is
+the one exception, and it does not change the design: while one awaits, the
+worker's event loop *does* turn and queued messages are delivered. What it
+cannot do is get them to the guest any sooner — the shell is suspended below
+the handler, and it reads its next request where it always did.)
 
 A request is a **line**, the framing the outbound half already uses. The reply
 is an ordinary outbound verb, because a request the guest is still handling has
