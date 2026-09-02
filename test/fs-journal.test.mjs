@@ -138,7 +138,16 @@ if (!zenfs) {
   });
 
   test('a write-back that fails reaches the guest, with the reason', async () => {
-    const backing = makeBacking(zenfs);
+    // SEEDED rather than created by the guest, and the count below is why. A
+    // file the guest creates is hollow until it is written, and a flush
+    // materializes it with a zero-length write of its own — so a create+write
+    // the drain splits across two batches really does attempt two writes and
+    // really does report two failures. Truthful, but a coincidence of batching.
+    // One write is what makes `1` mean "reported once" rather than "batched
+    // once", which is the regression this is here for: passing `onError`
+    // through to persistentFs made a single failed write arrive at the embedder
+    // twice, once as it happened and once when the flush raised it.
+    const backing = makeBacking(zenfs, { '/nope.txt': 'seeded' });
     const raw = await backing.make();
     const seen = [];
     const writer = await journalWriter(raw, { onError: (err) => seen.push(err) });
@@ -148,7 +157,28 @@ if (!zenfs) {
     assert.match(raised.raised, /a write did not reach the backing store: .*quota exceeded/);
     assert.equal(raised.code, 'EIO');
     assert.equal(await guest.next(), 'quiet after');
-    assert.equal(seen.length, 1, 'and the writer\'s own thread was told too');
+    assert.equal(seen.length, 1, 'and the writer\'s own thread was told once, not twice');
+    await guest.done();
+    await writer.stop();
+  });
+
+  test('a failed materialize is reported too, though nothing wrote the file', async () => {
+    // The other half of the case above, and the one a seeded file cannot
+    // reach: `touch a` and nothing else. The guest asks the backend for no
+    // bytes at all, so the only write that ever happens is the empty one
+    // persistentFs adds to make the file real (ZENFS.md finding 10) — and if
+    // THAT fails, the guest still has to hear about it, or `touch` on a full
+    // disk looks like it worked.
+    const backing = makeBacking(zenfs);
+    const raw = await backing.make();
+    const seen = [];
+    const writer = await journalWriter(raw, { onError: (err) => seen.push(err) });
+    raw.failOn = '/nope.txt';
+    const guest = startGuest('reports-a-failed-materialize', writer.sab, writer.snapshot);
+    const raised = await guest.next();
+    assert.match(raised.raised, /a write did not reach the backing store: .*quota exceeded/);
+    assert.equal(raised.code, 'EIO');
+    assert.equal(seen.length, 1, 'one write was attempted, so one failure is reported');
     await guest.done();
     await writer.stop();
   });

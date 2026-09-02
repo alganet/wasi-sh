@@ -69,13 +69,29 @@ async function runScenario() {
       fs.syncSync();
       say('survived');
     } else if (scenario === 'reports-a-failure') {
-      fs.createFileSync('/nope.txt', NEW_FILE);
+      // Writes to a file the backing store was SEEDED with, rather than
+      // creating one. A file this guest created is `hollow` in persistentFs
+      // until something writes to it, and a flush materializes it with a
+      // zero-length write of its own (ZENFS.md finding 10) — so a create+write
+      // that the drain happens to split across two batches attempts TWO writes
+      // to the failing path and honestly reports two failures. That is correct
+      // behaviour and a nondeterministic count; the failure being counted here
+      // is the writer reporting ONE write twice, which needs one write to be
+      // unambiguous. The hollow path gets its own case below.
       fs.writeSync('/nope.txt', ENC.encode('too much'), 0);
       try { fs.syncSync(); fail(new Error('syncSync did not raise')); }
       catch (err) { say({ raised: err.message, code: err.code }); }
       // Cleared by raising, exactly as persistentFs does it, so the next real
       // failure is not buried under a stale one.
       try { fs.syncSync(); say('quiet after'); } catch (err) { fail(err); }
+    } else if (scenario === 'reports-a-failed-materialize') {
+      // An empty file, never written to. Nothing the guest does asks the
+      // backend for a byte, so the only write that ever reaches it is the
+      // materialize persistentFs does at the flush — and that one failing is
+      // the case a seeded file cannot cover.
+      fs.createFileSync('/nope.txt', NEW_FILE);
+      try { fs.syncSync(); fail(new Error('syncSync did not raise')); }
+      catch (err) { say({ raised: err.message, code: err.code }); }
     } else if (scenario === 'refuses-a-bad-op-without-journaling') {
       try { fs.mkdirSync('/srv', NEW_DIR); } catch (err) { say({ refused: err.code }); }
       fs.createFileSync('/after.txt', NEW_FILE);
