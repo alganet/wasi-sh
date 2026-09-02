@@ -139,7 +139,12 @@ test('removing an entry moves the parent mtime', async () => {
 test('rename moves ctime, not mtime', async () => {
   const fs = memoryFs({ '/f.txt': 'x' });
   const { mtimeMs, ctimeMs } = fs.statSync('/f.txt');
-  await new Promise((r) => setTimeout(r, 2));
+  // Wait for the CLOCK to move rather than for a duration. `setTimeout(2)` can
+  // return with `Date.now()` still reading the same millisecond on a loaded
+  // machine, and then the ctime below is legitimately equal and this fails for
+  // a reason that has nothing to do with rename. Seen once in six full runs.
+  const started = Date.now();
+  while (Date.now() === started) await new Promise((r) => setTimeout(r, 1));
   fs.renameSync('/f.txt', '/g.txt');
   const after = fs.statSync('/g.txt');
   assert.equal(after.mtimeMs, mtimeMs, 'mv must not look like an edit');
