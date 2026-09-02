@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import {
-  createStdinRing, RingWriter, RingReader, RingOverflowError, HEADER_BYTES,
+  createStdinRing, RingWriter, RingReader, RingOverflowError, HEADER_BYTES, SIGINT,
 } from '../src/ring.mjs';
 
 const enc = new TextEncoder();
@@ -228,6 +228,52 @@ test('an interrupt posted while nothing is running cannot cancel the next thing'
   assert.equal(r.interruptCount() !== base, false, 'not interrupted');
   w.interrupt();                          // ^C DURING that command
   assert.equal(r.interruptCount() !== base, true, 'interrupted');
+});
+
+test('raise() also writes the signal a guest polls in memory', () => {
+  // The count above is delivery for anything that CALLS us — a host builtin at
+  // its safe points. A guest with its own signal handling calls nothing: it
+  // reads a byte at a check it already runs, and while it runs this thread does
+  // not, so writing that byte is the only way to reach it.
+  const { w, r } = pair();
+  const cell = r.toInput().signalBuffer();
+  assert.equal(cell.length, 1, 'one byte, which is the shape a guest polls');
+  assert.equal(cell[0], 0);
+
+  w.interrupt();
+  assert.equal(cell[0], SIGINT, 'interrupt() is raise(SIGINT)');
+  assert.equal(r.interruptCount(), 1, 'and the count is still raised, for whoever polls that');
+});
+
+test('the guest clears the signal cell, so it re-arms with no help from us', () => {
+  // CPython zeroes the byte once it has raised KeyboardInterrupt. Nothing on
+  // this side consumes it, which is why a second raise() is all re-arming takes.
+  const { w, r } = pair();
+  const cell = r.toInput().signalBuffer();
+  w.interrupt();
+  Atomics.store(cell, 0, 0);              // what the guest does
+  assert.equal(cell[0], 0);
+  w.raise(15);                            // SIGTERM, to show the number is not baked in
+  assert.equal(cell[0], 15);
+  assert.equal(r.interruptCount(), 2);
+});
+
+test('the signal cell does not overlap the ring or its other fields', () => {
+  // It has its own word in the header. If it aliased head/tail/seq, a ^C would
+  // corrupt the stream rather than interrupt it.
+  const { sab, w, r } = pair(64);
+  const before = new Int32Array(sab.slice(0, HEADER_BYTES));
+  w.write(enc.encode('hello'));
+  const mid = r.read(5);
+  w.raise(SIGINT);
+  assert.equal(dec.decode(mid), 'hello');
+  assert.equal(r.readable, false, 'the ring is where it was left');
+  // every control word except the signal and the counters it moves is untouched
+  const after = new Int32Array(sab, 0, before.length);
+  for (let i = 0; i < before.length; i++) {
+    if (i === 0 || i === 1 || i === 3 || i === 7 || i === 8) continue; // head, tail, seq, intr, signal
+    assert.equal(after[i], before[i], `control word ${i} moved`);
+  }
 });
 
 test('interrupt() bumps seq so a parked guest wakes', () => {
