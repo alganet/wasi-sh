@@ -88,7 +88,7 @@ self.addEventListener('message', async (e) => {
     return;
   }
   started = true;
-  const { module, wasmBytes, files, args, env, sab, reqSab, stdin, requests, tty } = e.data;
+  const { module, wasmBytes, files, args, env, sab, reqSab, stdin, requests, tty, suspendInput } = e.data;
   try {
     const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
     // Builtin setup and wasm compilation are independent; overlapping them
@@ -140,6 +140,14 @@ self.addEventListener('message', async (e) => {
       // back through `shim.suspendable`, having checked the engine really has
       // JSPI. See the _start entry below, which is the other half.
       suspendable: !!config.suspendable,
+      // And may it suspend when there is nothing to READ? A separate
+      // capability from the one above: builtins that await are the session's
+      // business, a guest that stops owning the thread between keystrokes is
+      // the terminal's. It travels with the spawn rather than with serve()
+      // because it is the caller's terminal, not the worker's builtins, that
+      // needs it. See shim.mjs, which checks the engine and answers back
+      // through `shim.suspendInput`.
+      suspendInput: !!suspendInput,
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);

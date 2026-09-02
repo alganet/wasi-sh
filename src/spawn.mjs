@@ -112,6 +112,13 @@ export async function spawn(options = {}) {
     // the terminal must then stop editing lines itself — see shim.mjs's fd
     // table, and README's "Terminals: bring your own".
     tty: !!options.tty,
+    // Let the guest SUSPEND when it has nothing to read, instead of parking
+    // the worker thread. Without it a shell drawing its own prompt owns the
+    // thread between keystrokes, and nothing else in that worker — a host
+    // builtin the page wants to call, a message, a timer — runs until a key
+    // arrives. Needs JSPI; the shim checks and says so through
+    // `shim.suspendInput`.
+    suspendInput: !!options.suspendInput,
   };
   worker.postMessage(msg, msg.wasmBytes ? [msg.wasmBytes.buffer] : []);
   // Bounded: a custom worker module that top-level-awaits before installing a

@@ -39,6 +39,9 @@ async function runInline(options) {
     host: await resolveHost(options.host),
     net: options.net,
     suspendable: !!options.suspendable,
+    // run() has a fixed stdin, which never blocks and so never suspends —
+    // passed through only so a caller cannot be surprised by it being ignored.
+    suspendInput: !!options.suspendInput,
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
   shim.bindMemory(instance.exports.memory);

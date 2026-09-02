@@ -447,8 +447,11 @@ Deeper technical detail on all of this: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 wasi-sh has **no terminal dependency** and never will. A `Session` is a byte
 duplex; a terminal is anything that feeds `session.write()` and renders
-`session.onOutput()` bytes. Geometry travels as plain env
-(`COLUMNS`/`LINES`), set by whoever owns the terminal.
+`session.onOutput()` bytes. Geometry travels through the ring —
+`session.resize(cols, rows)`, live — and `spawn()` seeds it from the caller's
+`COLUMNS`/`LINES` and then drops them from the guest's environment, because
+busybox's `stty size` prefers those when they exist and would report that first
+value forever.
 
 Wiring [xterm.js](https://xtermjs.org) is two lines:
 
@@ -484,6 +487,39 @@ line on Enter — will print every line twice with this on. Pick one:
 | `^C` | send the byte **and** `session.interrupt()` | `interrupt()` only while a command runs |
 
 `run()` is never a tty: a fixed stdin is not a terminal.
+
+### `suspendInput: true`, and who owns the thread
+
+`tty: true` on its own has a cost that only shows up in a worker: **a shell
+waiting for a keystroke owns the thread**. The guest parks in `Atomics.wait`,
+and everything else on that worker stops with it — a message from the page, a
+timer, a host builtin somebody wanted to call. So a shell that draws its own
+prompt and a worker that answers for anything else were mutually exclusive.
+
+`suspendInput: true` lifts that, using the same [JSPI][jspi] as `suspendable`
+pointed at the other direction: the guest suspends while it WAITS rather than
+while it calls out. Its stack is set aside, the thread goes back to its queue,
+and the read resumes when bytes arrive.
+
+```js
+const session = await spawn({ tty: true, suspendInput: true });
+```
+
+Both halves are needed and neither works alone — a suspending import inside a
+guest that was not entered through a promising export traps at the first
+suspension, and `spawn()` handles that for you. Check `shim.suspendInput` for
+whether the engine actually had JSPI; without it the option is simply off and
+the shell behaves as it did before.
+
+One platform needs help. Node does not wake a parked agent on
+`Atomics.notify` — the promise stays pending through a notify *and* through
+`Atomics.waitAsync`'s own timeout, so nothing self-corrects
+([v8:13238][v8-13238]). `RingReader` therefore polls on a `wakeTick`, which
+defaults to 10 ms under node and **0 everywhere else**: browsers wake on the
+notify, so an idle guest there costs nothing. Pass `wakeTick` to a `RingReader`
+yourself to change it.
+
+[v8-13238]: https://groups.google.com/g/v8-reviews/c/J2DrwAc0IwI
 
 One caveat if you set `PS1`: this build has `FEATURE_EDITING_FANCY_PROMPT`
 off, so the editor measures the prompt with `strlen()`. A colour escape in
