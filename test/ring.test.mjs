@@ -246,3 +246,57 @@ test('toInput() exposes interruptCount() for the shim', () => {
   w.interrupt();
   assert.equal(input.interruptCount(), 1);
 });
+
+// After 2 GiB through a ring, its Int32 counters wrap — and a dev environment's
+// session is exactly the one that runs long enough to. src/fs.mjs's journal has
+// carried the same counters and the same wrap since it was written, and says so
+// (see jBehind/jIndex); this ring did not, and every consequence below is a
+// different way for the shell's stdin to stop working for good.
+const IDX_HEAD = 0, IDX_TAIL = 1;
+
+/** Put both counters `before` bytes short of the Int32 wrap, as a long session does. */
+function nearTheWrap(sab, before = 8) {
+  const ctrl = new Int32Array(sab, 0, 8);
+  // 2**31 exactly is where an Int32 cell turns negative, so a write of more
+  // than `before` bytes is the one that crosses it.
+  const at = 2 ** 31 - before;
+  Atomics.store(ctrl, IDX_HEAD, at);
+  Atomics.store(ctrl, IDX_TAIL, at);
+  return ctrl;
+}
+
+test('a ring that has carried 2 GiB still carries bytes', () => {
+  const { sab, w, r } = pair();
+  nearTheWrap(sab, 4);
+  // Straddles the wrap: four bytes before it, four after.
+  w.write(enc.encode('abcdefgh'));
+  assert.equal(w.pending, 8, 'the producer counts what it wrote');
+  assert.equal(r.readable, true, 'and the consumer sees it');
+  assert.equal(dec.decode(r.read(1024)), 'abcdefgh');
+  assert.equal(w.pending, 0, 'and the counters agree it was consumed');
+});
+
+test('the overflow guard survives the wrap', () => {
+  // The guard is `cap - (head - tail)`, and a wrapped difference reads as about
+  // -4 billion: free space looks limitless, the write is accepted, and every
+  // byte of it lands at a negative index — which a typed array drops on the
+  // floor. A silent no-op is the worst answer available here.
+  const { sab, w } = pair(64);
+  nearTheWrap(sab, 4);
+  w.write(enc.encode('1234'));                     // fills to the wrap exactly
+  assert.equal(w.pending, 4);
+  assert.throws(() => w.write(new Uint8Array(80)), RingOverflowError, 'an overfull ring still says so');
+});
+
+test('a wrapped ring reports EOF rather than throwing into the guest', () => {
+  // `read()` sizes its output with `head - tail`; wrapped, that is negative, and
+  // `new Uint8Array(-4e9)` is a RangeError thrown out of a wasm import — where
+  // the shell has nowhere to put it.
+  const { sab, w, r } = pair();
+  nearTheWrap(sab, 2);
+  w.write(enc.encode('xy'));
+  w.end();
+  assert.equal(dec.decode(r.read(1024)), 'xy');
+  assert.equal(r.closed, true, 'drained and ended is EOF');
+  assert.deepEqual(r.read(1024), new Uint8Array(0), 'and a read past it is empty, not an exception');
+});

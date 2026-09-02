@@ -7,8 +7,12 @@
 // (32 bytes), then the data ring.
 // head (written by the producer) and tail (written by the consumer) are
 // MONOTONIC byte counters — only the data index is reduced modulo capacity —
-// so `head - tail` is always the number of unread bytes and the ABA problem
-// can't happen. flags bit 0 marks stdin EOF (set once by RingWriter.end()).
+// so the distance between them is always the number of unread bytes and the
+// ABA problem can't happen. Monotonic in Int32 CELLS, though, so after 2 GiB
+// through the channel they wrap negative, and a terminal session is exactly the
+// thing that runs long enough. Two's complement makes that harmless provided
+// every comparison goes through `behind()` below and every index through
+// `index()` — which is why neither counter is ever compared or used raw here. flags bit 0 marks stdin EOF (set once by RingWriter.end()).
 //
 // seq is a wakeup sequence word bumped by every producer event (write, end, OR
 // resize). Consumers load seq FIRST, re-check their condition, then Atomics.wait
@@ -57,6 +61,18 @@ export function createRing(dataBytes = 65536) {
   return new SharedArrayBuffer(HEADER_BYTES + dataBytes);
 }
 export { createRing as createStdinRing };
+
+// The distance between two monotonic counters, across the Int32 wrap: `(a - b)
+// | 0` is the real one whenever it is under 2 GiB, which a ring's capacity
+// guarantees, while `a - b` on the raw values reads as about -4 billion the
+// moment one side has wrapped and the other has not. src/fs.mjs's journal
+// carries the same pair for the same reason (jBehind/jIndex there); they are
+// two lines each and duplicated rather than shared, because neither module
+// otherwise knows the other exists.
+const behind = (a, b) => (a - b) | 0;
+// And the same wrap makes a raw `%` negative — which a typed array does not
+// throw over, it just drops the write on the floor.
+const index = (position, capacity) => ((position % capacity) + capacity) % capacity;
 
 const ENC = new TextEncoder();
 
@@ -117,7 +133,7 @@ export class RingWriter {
     this.sizeOption = sizeOption;
   }
   get capacity() { return this.cap; }
-  get pending() { return Atomics.load(this.ctrl, IDX_HEAD) - Atomics.load(this.ctrl, IDX_TAIL); }
+  get pending() { return behind(Atomics.load(this.ctrl, IDX_HEAD), Atomics.load(this.ctrl, IDX_TAIL)); }
   get ended() { return (Atomics.load(this.ctrl, IDX_FLAGS) & FLAG_EOF) !== 0; }
 
   _wake() {
@@ -130,10 +146,10 @@ export class RingWriter {
     if (this.ended) throw new Error(`${this.channel} ring already ended`);
     const head = Atomics.load(this.ctrl, IDX_HEAD);
     const tail = Atomics.load(this.ctrl, IDX_TAIL);
-    const free = this.cap - (head - tail);
+    const free = this.cap - behind(head, tail);
     if (bytes.length > free) throw new RingOverflowError(bytes.length, free, this.channel, this.sizeOption);
-    for (let i = 0; i < bytes.length; i++) this.data[(head + i) % this.cap] = bytes[i];
-    Atomics.store(this.ctrl, IDX_HEAD, head + bytes.length);
+    for (let i = 0; i < bytes.length; i++) this.data[index(head + i, this.cap)] = bytes[i];
+    Atomics.store(this.ctrl, IDX_HEAD, (head + bytes.length) | 0);
     this._wake();
     return bytes.length;
   }
@@ -188,7 +204,7 @@ export class RingReader {
     this.data = new Uint8Array(sab, HEADER_BYTES);
     this.cap = sab.byteLength - HEADER_BYTES;
   }
-  get readable() { return Atomics.load(this.ctrl, IDX_TAIL) < Atomics.load(this.ctrl, IDX_HEAD); }
+  get readable() { return behind(Atomics.load(this.ctrl, IDX_HEAD), Atomics.load(this.ctrl, IDX_TAIL)) > 0; }
   get ended() { return (Atomics.load(this.ctrl, IDX_FLAGS) & FLAG_EOF) !== 0; }
   // EOF for the shim: producer ended AND everything buffered was consumed.
   get closed() { return this.ended && !this.readable; }
@@ -231,10 +247,10 @@ export class RingReader {
   read(max) {
     const head = Atomics.load(this.ctrl, IDX_HEAD);
     const tail = Atomics.load(this.ctrl, IDX_TAIL);
-    const n = Math.min(max, head - tail);
+    const n = Math.min(max, behind(head, tail));
     const out = new Uint8Array(n);
-    for (let i = 0; i < n; i++) out[i] = this.data[(tail + i) % this.cap];
-    Atomics.store(this.ctrl, IDX_TAIL, tail + n);
+    for (let i = 0; i < n; i++) out[i] = this.data[index(tail + i, this.cap)];
+    Atomics.store(this.ctrl, IDX_TAIL, (tail + n) | 0);
     return out;
   }
 
