@@ -871,6 +871,51 @@ One worker hosts exactly one shell: a second `run()`/`spawn()` over the same
 Working example: [`examples/host-builtins.html`](examples/host-builtins.html)
 and its [worker](examples/host-builtins.worker.mjs).
 
+### `serve({ ready })`: the session, once there is one
+
+`builtins()` cannot hand you the guest's filesystem, and the reason is the
+order: it is resolved **before** the shim exists, because the shim is what its
+result is passed to. So the only way a worker could reach the filesystem the
+guest runs over was to be inside a host builtin — which means having the guest
+**call** you.
+
+For a guest that is a terminal, that is no way at all. A shell at its prompt is
+parked on stdin; it is not going to call anything. A page with a file tree
+beside that terminal ends up posting verbs at a shell it only wanted to type
+into, and the shell becomes a middleman between two pieces of JS.
+
+`ready` fires once, after the guest is instantiated and before it starts:
+
+```js
+serve({
+  ready({ fs, suspendInput }) {
+    if (!suspendInput) return warnTheUser();   // see below
+    self.addEventListener('message', (e) => {
+      if (e.data?.type === 'read') {
+        self.postMessage({ bytes: fs.read(e.data.path) });   // no guest involved
+      }
+    });
+  },
+});
+```
+
+| | |
+|---|---|
+| `fs` | the same narrow view a host builtin gets as `ctx.fs`, rooted at `/` |
+| `suspendable` | whether the engine really gave JSPI to awaiting **builtins** |
+| `suspendInput` | whether it gave it to a **guest waiting for input** |
+
+It is synchronous: the guest starts on the next line, and a hook that could
+await would be a window in which the shell is instantiated, not started, and
+the worker believes otherwise. Do the awaiting in `builtins()`, which is what it
+is for.
+
+**`suspendInput` is worth checking here.** A worker that answers messages while
+the guest sits at a prompt needs the guest to hand the thread back, and without
+JSPI it does not — so those messages are never taken, and whatever was waiting
+on them waits for somebody to press a key. Reading the flag turns that from a
+hang into a sentence.
+
 ## The host port: reaching outside the sandbox
 
 A host builtin extends the shell's *command* namespace. The **host port**

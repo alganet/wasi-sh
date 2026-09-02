@@ -151,6 +151,35 @@ self.addEventListener('message', async (e) => {
     });
     const instance = await WebAssembly.instantiate(compiled, shim.imports());
     shim.bindMemory(instance.exports.memory);
+    // The session, once there IS one, for a worker that has work of its own.
+    //
+    // `builtins(session)` cannot answer this: it is resolved before the shim
+    // exists, because the shim is what its result is passed to. So a worker
+    // that wants the filesystem the guest is about to run over has had exactly
+    // one way to reach it — be inside a host builtin, which means having the
+    // guest CALL you, which means the guest must be parked somewhere it can be
+    // told to. For a guest that is a terminal, parked on its own stdin, that is
+    // no way at all: the page ends up posting verbs at a shell it only wanted
+    // to type into.
+    //
+    // Synchronous on purpose. The guest starts on the next line, and a hook
+    // that could await would be a window in which the shell is instantiated,
+    // not started, and the worker thinks otherwise.
+    if (config.ready) {
+      try {
+        config.ready({
+          // The same narrow view a host builtin gets as `ctx.fs` — see
+          // hostFs() in shim.mjs for why it is not the store — rooted at `/`,
+          // because a worker has no cwd to be relative to.
+          fs: shim.hostFs('/'),
+          // What the engine actually granted, rather than what was asked for.
+          suspendable: shim.suspendable,
+          suspendInput: shim.suspendInput,
+        });
+      } catch (ex) {
+        throw new Error(`serve({ ready }): failed: ${(ex && ex.message) || ex}`);
+      }
+    }
     self.postMessage({ type: 'ready' });
     let code = 0;
     try {
