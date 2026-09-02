@@ -422,6 +422,51 @@ if (!zenfs) {
     await writer.stop();
   });
 
+  // A writer that dies while the journal is FULL used to cost every later write
+  // the whole timeout — ten seconds each, from a shell, waiting on a drain that
+  // is never coming. syncSync() has always given up the moment the writer
+  // stops; the reserve path checked the state once on the way in and then
+  // waited only for space, so a writer that stopped while a write was already
+  // parked was invisible to it.
+  //
+  // A second thread is what makes that reachable at all: the parked write is
+  // inside Atomics.wait, so nothing on this one could change the state under
+  // it. Which is also the real shape of the bug — the writer is always another
+  // thread.
+  test('a parked write gives up when the writer stops, not at the timeout', async () => {
+    const sab = createJournal(65536);
+    const ctrl = new Int32Array(sab, 0, 8);
+    const writer = await journalWriter(memoryFs(), { sab });
+    const fs = journalFs(sab, writer.snapshot, { timeout: 4000 });
+    await writer.stop();
+    // A buffer that CLAIMS a live writer with nobody draining it, which is
+    // exactly what a writer whose thread has gone leaves behind.
+    Atomics.store(ctrl, 5, 1);                       // J_STATE = J_DRAINING
+
+    const stopper = new Worker(`
+      const { workerData } = require('node:worker_threads');
+      const ctrl = new Int32Array(workerData, 0, 8);
+      setTimeout(() => {
+        Atomics.store(ctrl, 5, 2);                   // J_STATE = J_STOPPED
+        Atomics.add(ctrl, 2, 1);                     // J_SEQ, and wake whoever is parked
+        Atomics.notify(ctrl, 2);
+      }, 200);
+    `, { eval: true, workerData: sab });
+
+    try {
+      fs.createFileSync('/big.txt', { mode: 0o644, uid: 0, gid: 0 });
+      // More than the journal holds, so it fills, then parks for room.
+      const started = Date.now();
+      assert.throws(() => fs.writeSync('/big.txt', new Uint8Array(200000).fill(3), 0),
+        /the journal writer has stopped/,
+        'it names the writer rather than blaming the drain for being slow');
+      const took = Date.now() - started;
+      assert.ok(took < 2000, `it waited ${took}ms for a drain that was never coming`);
+    } finally {
+      await stopper.terminate();
+    }
+  });
+
   // The end of the line, and the criterion MOAR §4.3b wrote down: a REAL shell
   // parked on /dev/hostreq, a file written from inside it, and the backing
   // store holding those bytes while that shell is still parked. This is the
