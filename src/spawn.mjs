@@ -175,10 +175,12 @@ export class Session {
       const t = setTimeout(() => {
         this._exit(134);
         reject(new Error(
-          `spawn(): the worker did not report ready within ${ms}ms. If it is a custom `
-          + 'worker module, make sure it calls serve() synchronously at the top, before '
-          + 'any top-level await — a startup message that arrives while the module is '
-          + 'suspended is delivered to no one. Raise readyTimeoutMs if setup is simply slow.'
+          `spawn(): the worker did not report ready within ${ms}ms. Two things cause `
+          + 'this. Either setup is simply slow — a serve({ builtins }) that fetches a '
+          + 'runtime is bounded by the visitor\'s connection, not by this default, and '
+          + 'wants a readyTimeoutMs of its own. Or a custom worker module top-level-'
+          + 'awaited before calling serve(), and the startup message arrived while the '
+          + 'module was suspended, so it was delivered to no one.'
         ));
       }, ms);
       const clear = (fn) => (v) => { clearTimeout(t); fn(v); };
