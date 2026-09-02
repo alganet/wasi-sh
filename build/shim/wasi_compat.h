@@ -32,6 +32,20 @@
  * this header is force-included first, so the definition here is the one
  * everybody sees and <sys/un.h> later finds its work already done. There are
  * still no unix sockets; there is now a member for dead code to mention. */
+/* wasi-libc hides getsockname/getpeername behind __wasilibc_use_wasip2, a
+ * macro whose actual meaning is "the target is wasm32-wasip2" — which this is
+ * not. Defining it to unlock two declarations would also silently redefine
+ * every MSG_* constant, so the two are declared here instead.
+ *
+ * They are the ONLY socket functions that have to be declared. busybox builds
+ * with -Wno-implicit-function-declaration, so an undeclared socket() or
+ * connect() is merely a warning — but get_lsa() takes the ADDRESS of these
+ * two, and an implicitly-declared function has none. That is the whole of the
+ * hard error, and it is worth knowing before anybody reaches for the macro. */
+struct sockaddr;
+int getsockname(int, struct sockaddr *, unsigned *);
+int getpeername(int, struct sockaddr *, unsigned *);
+
 #ifndef __wasilibc___struct_sockaddr_un_h
 #define __wasilibc___struct_sockaddr_un_h
 struct sockaddr_un { unsigned short sun_family; char sun_path[108]; };

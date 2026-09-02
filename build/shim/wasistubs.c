@@ -623,9 +623,15 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 /*
  * No alarm, and nothing to deliver one with: there are no signals here, so a
- * clock that promised to interrupt something could only lie. wget's status bar
- * asks for one per second and redraws on incoming data regardless, which is
- * the behaviour that survives.
+ * clock that promised to interrupt something could only lie.
+ *
+ * What that costs is worth stating, because `wget -T` still parses. busybox
+ * enforces a timeout two ways: a poll-based countdown while the BODY
+ * transfers, which works here, and a SIGALRM around connect and the response
+ * header, which cannot. The gap is exactly the window where a guest could
+ * otherwise wait for ever — so the deadline that matters belongs to whatever
+ * implements the net, on the far side of a call this thread is parked inside.
+ * sockfetch has one; a `net` of your own should too.
  */
 unsigned alarm(unsigned seconds)
 {
