@@ -1,0 +1,28 @@
+--- a/networking/wget.c
++++ b/networking/wget.c
+@@ -561,6 +561,25 @@
+ 			h->port = bb_lookup_std_port(P_HTTPS, "tcp", 443);
+ 			h->protocol = P_HTTPS;
+ 		} else
++#else
++		/* https, spoken as plaintext on 443.
++		 *
++		 * This build has no TLS and wants none: the socket underneath is
++		 * the embedder's, and whatever carries the bytes from there has
++		 * already done the encrypting and the verifying. A handshake here
++		 * would encrypt a call to the host and back.
++		 *
++		 * Refusing the URL instead is the one thing that cannot be right.
++		 * A script does not choose its scheme — a redirect hands it one,
++		 * an API is published with one — so "not an http or ftp url" for
++		 * the scheme most of the web answers on would put the workaround
++		 * in every caller. The port is what the host reads the scheme back
++		 * out of, so 443 is not a detail here; it is the message.
++		 */
++		if (strcmp(url, "https") == 0) {
++			h->port = bb_lookup_std_port("https", "tcp", 443);
++			h->protocol = P_HTTP;
++		} else
+ #endif
+ 		if (strcmp(url, P_HTTP) == 0) {
+ 			goto http;
