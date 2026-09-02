@@ -308,6 +308,32 @@ test('a partial write reports the bytes that landed, not an errno', () => {
   assert.equal(t.view().getUint32(0x700, true), 4, 'only the first iovec landed');
 });
 
+test('the bytes handed to a store are the guest\'s, copied', () => {
+  // A store that DEFERS its write — every persistent one does — reads the
+  // buffer after the call it was handed to has returned. The guest's iovec
+  // points into wasm linear memory, which is scratch space it reuses on the
+  // very next line, so a buffer passed through by reference is a file that
+  // persists as whatever some later write happened to put there.
+  //
+  // Reproduced before it was fixed, and it is not subtle: two files written
+  // through the same address both ended up as the second one's bytes, while
+  // reads inside the session were right and flush() reported success. That is
+  // the worst shape a persistence bug can have — invisible until a reload.
+  const kept = [];
+  const base = memoryFs({ '/a.txt': '', '/b.txt': '' });
+  const store = wrapStore(base, {
+    writeSync: (path, buffer, offset) => { kept.push([path, buffer]); base.writeSync(path, buffer, offset); },
+  });
+  const t = makeShim({ fs: store });
+  // Both go through 0x500, exactly as a guest reusing one buffer does.
+  writeFd(t, openPath(t, '/a.txt'), 'aaaa');
+  writeFd(t, openPath(t, '/b.txt'), 'bbbb');
+  assert.equal(kept.length, 2, 'both writes reached the store');
+  assert.equal(dec.decode(kept[0][1]), 'aaaa', 'the first store still holds the first write');
+  assert.equal(dec.decode(kept[1][1]), 'bbbb', 'and the second holds the second');
+  assert.ok(!(kept[0][1].buffer instanceof WebAssembly.Memory), 'not a view of the guest');
+});
+
 test('a failed hostFs write leaves the old contents alone', () => {
   const store = wrapStore(memoryFs({ '/f.txt': 'original' }), {
     writeSync: () => { throw fsError('EROFS', '/f.txt'); },
