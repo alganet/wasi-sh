@@ -826,8 +826,18 @@ way:
   hooks as imports), `--wrap fcntl` (F_DUPFD → `__host_dup`),
   `--wrap exit` (applet exit containment, above) and
   `--wrap read/write/readv/writev` (the interrupt's safe points, above).
-- `libbb/xconnect.o` is dropped from Kbuild.src (socket code; no sockets in
-  wasi preview1).
+- `libbb/xconnect.o` is KEPT, and used to be dropped. It is busybox's socket
+  code and wasi preview1 has no sockets — it can neither make one nor dial with
+  it — so three calls are supplied by the shim instead
+  (`env.__host_sock_open`, `__host_sock_connect`, `__host_sock_resolve`) and
+  the reading and writing is ordinary `fd_read`/`fd_write`, because that is
+  what busybox does to the descriptor once it has one.
+  Compiling it needed three things wasi-libc leaves out and
+  `build/shim/wasi_compat.h` now supplies: `POLLPRI` (WASI's poll has no
+  urgent-data bit at all), a `struct sockaddr_un` with a `sun_path` for dead
+  code to mention, and — via `-D__wasilibc_use_wasip2` — the declarations of
+  `getsockname`/`getpeername`, whose absence was the only hard error, because
+  busybox takes their ADDRESS and an implicitly-declared function has none.
 - **Signal-mask stubs must never write through their pointers**: wasi-libc's
   `sigset_t` is a 1-byte placeholder typedef, and a 4-byte store from a stub
   once zeroed the seconds of every `read -t` timespec parked next to it on

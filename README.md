@@ -78,6 +78,8 @@ into the busybox applets compiled into the wasm, never as processes:
 - **Text**: `grep sed awk sort uniq cut tr head tail wc seq paste fold tac
   expr hexdump xxd`
 - **Hashes**: `md5sum sha1sum sha256sum cksum crc32`
+- **Network**: `wget` — real, and it needs a socket you supply; see
+  [Networking](#networking-bring-your-own)
 - **Misc**: `date env printenv basename dirname realpath test printf getopt
   uname nproc stty` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
   globs, functions), and `compgen` for completing a word from outside the
@@ -375,7 +377,7 @@ wrong:
   `time`, `timeout` cannot work. Job control is compiled out rather than merely
   unused, so `jobs`, `fg` and `bg` do not exist here at all. `kill` does — as
   the applet rather than the shell builtin, which is the more honest of the two
-  anyway, since there are no job specs for `%1` to name. Networking (`wget`, `nc`), `/proc` tools
+  anyway, since there are no job specs for `%1` to name. `nc`, `/proc` tools
   (`ps`, `top`), and interactive full-screen tools (`vi`, `less`) are out of
   scope.
 - **Shebangs are read, but there is still no exec.** `./bin/thing` works when
@@ -426,7 +428,9 @@ wrong:
 wasi-sh targets **plain `wasm32-wasi`** on purpose. The alternative,
 [WASIX](https://wasix.org/), extends WASI with real `fork`/`exec`, threads, and
 sockets — so it runs an *unmodified* shell with genuine concurrent pipelines,
-backgrounding, and networking, none of which the constraints above would limit.
+backgrounding, and real sockets — where the networking here is HTTP-shaped
+and supplied from outside (see [Networking](#networking-bring-your-own)) — none of which
+the constraints above would limit.
 We prototyped on WASIX first and moved off it: for this use case it was too slow
 and heavy to start, and the runtime story is narrower. tuish — the TUI framework
 this exists to host — barely uses pipes and never forks, so the fork-free model
@@ -945,6 +949,62 @@ Working example, both directions:
 [`examples/host-port.html`](examples/host-port.html) and its
 [worker](examples/host-port.worker.mjs) — a dev server that is a shell loop,
 driven from the page.
+
+## Networking: bring your own
+
+`wget` is here, and it is busybox's own — no wrapper, no patched-in client.
+What it lacks is a socket, because WASI preview1 has none: it can read and
+write a descriptor somebody handed it, and it cannot originate a connection at
+all. So three calls come from you.
+
+```js
+await run({
+  args: ['wget', '-q', '-O', '-', 'https://example.org/thing'],
+  net,
+});
+```
+
+`net` answers six methods, and a handle is whatever you want it to be — the
+shim only holds it and hands it back:
+
+```js
+const net = {
+  resolve(hostname) { … },        // → dotted quad, or null for "no such name"
+  connect(address, port) { … },   // → handle; throwing refuses the connection
+  send(handle, bytes) { … },      // → count
+  recv(handle, max) { … },        // → bytes; EMPTY is EOF, null is "nothing yet"
+  poll(handle) { … },             // → { readable, writable, hup }
+  close(handle) { … },
+};
+```
+
+Reading and writing are the descriptor's own `read(2)` and `write(2)` — wget
+wraps it in a `FILE*` and never calls `send`/`recv` — so a socket is an
+ordinary fd in the shim's table, and redirection, `poll` and `close` all work
+on it without knowing what it is.
+
+Omit `net` and `socket()` fails with `EAFNOSUPPORT`. Nothing else changes, and
+nothing else ever asks.
+
+**There is no TLS in here, and that is deliberate.** `https://` URLs are spoken
+as **plaintext on port 443** (`build/wget-https.patch`), because the guest is
+not on a wire — it is calling a function you supplied, and whatever carries the
+bytes from there is where the encrypting belongs. Refusing the scheme instead
+would be the one answer that cannot be right: a script does not choose its
+scheme, a redirect hands it one. The port is what a host reads the scheme back
+out of.
+
+**Addresses are aliases.** `resolve()` is asked for one and the shim hands back
+whatever it says; there is no resolver in here and no DNS. Using `172.29.0.0/16`
+keeps it inconspicuous and matches what Emscripten's own DNS invents for the
+same problem, so a script prints the same kind of address wherever it runs.
+
+[`sockfetch`][sockfetch] is one implementation: it parses the HTTP/1.1 request
+the guest wrote and answers it with a real `fetch()`, which reaches any origin
+that allows CORS. A WebSocket to a relay, or a canned reply in a test, satisfy
+the same six methods.
+
+[sockfetch]: https://github.com/alganet/sockfetch
 
 ## API
 
