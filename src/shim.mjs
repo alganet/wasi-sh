@@ -43,6 +43,16 @@
 // interrupted() }.
 // Absent, the shell behaves byte-for-byte as it did before.
 //
+// The `net` port is the fifth seam, and the only one the guest cannot do
+// without: WASI preview1 has `sock_recv`/`sock_send` for descriptors it was
+// already given and no way at all to originate a connection, so socket() and
+// connect() come from here or not at all. Three calls, and the reading and
+// writing is fd_read/fd_write like any other descriptor:
+//   resolve(name) -> dotted quad | null
+//   connect(addr, port) -> handle        (throwing refuses it)
+//   send/recv/poll/close(handle, ...)
+// Absent, socket() is EAFNOSUPPORT and nothing else changes.
+//
 // The `host` port is the fourth seam, and the one aimed outward — at the
 // browser rather than at the shell. One capability object, one virtual device,
 // verbs instead of per-feature plumbing:
@@ -110,6 +120,10 @@ const WASI_ERRNO = {
   ENOTDIR:54, EISDIR:31, EINVAL:28, ENFILE:41, EMFILE:33, ENOSPC:51, EROFS:69,
   EMLINK:34, ENOSYS:52, ENOTEMPTY:55, ELOOP:32, ENAMETOOLONG:37,
   EAGAIN:6, ENOMEM:48, EFBIG:22, ESPIPE:70, EPIPE:64,
+  // What a socket fails with. WASI numbers its errnos alphabetically,
+  // so these are nowhere near their Linux values and guessing is how a
+  // refused connection gets reported as something else entirely.
+  ECONNREFUSED:14, ECONNRESET:15, EHOSTUNREACH:23, EAFNOSUPPORT:5,
 };
 const wasiErrno = (err) => WASI_ERRNO[err && err.code] ?? E.IO;
 
@@ -143,13 +157,23 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, requests, tty=false, suspendable=false }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, net, requests, tty=false, suspendable=false }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
     this.stderr = stderr || this.stdout;
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
     this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
+    // The fifth seam, and the one aimed at the network. Absent, socket() is
+    // EAFNOSUPPORT and nothing else changes — which is what every session that
+    // does not ask for one still gets.
+    //   resolve(name)        -> dotted-quad string | null
+    //   connect(addr, port)  -> handle            (throws to refuse)
+    //   send(handle, bytes)  -> count
+    //   recv(handle, max)    -> Uint8Array | AGAIN sentinel
+    //   poll(handle)         -> { readable, writable, hup }
+    //   close(handle)
+    this.net = net;
     // May a host builtin await? Feature-detected rather than trusted, so an
     // embedder that asks for it on an engine without JSPI gets the shell it
     // always had and a clear refusal the first time a handler returns a
@@ -243,7 +267,9 @@ export class WasiShim {
         if(globalThis.crypto&&globalThis.crypto.getRandomValues){ for(let o=0;o<len;o+=65536) globalThis.crypto.getRandomValues(a.subarray(o,Math.min(o+65536,len))); }
         else { for(let i=0;i<len;i++)a[i]=(Math.random()*256)|0; }
         return 0; },
-      fd_close:(fd)=>{ const f=w.fds.get(fd); w.fds.delete(fd); if(f&&f.type==='pipe') w.gcPipe(f.pipe); return 0; },
+      fd_close:(fd)=>{ const f=w.fds.get(fd); w.fds.delete(fd); if(f&&f.type==='pipe') w.gcPipe(f.pipe);
+        if(f&&f.type==='sock'&&w.net) { try { w.net.close(f.sock); } catch { /* already gone */ } }
+        return 0; },
       // The rights word is where isatty() lives. wasi-libc answers isatty(fd)
       // with "filetype is CHARACTER_DEVICE **and** neither FD_SEEK nor FD_TELL
       // is granted" — a terminal is the thing you cannot seek — so claiming
@@ -400,7 +426,7 @@ export class WasiShim {
       poll_oneoff:(subs,events,nsubs,out)=>{
         // Parse subscriptions: a clock (timeout) and/or fd_read events. Events
         // must ECHO the subscription's userdata (WASI matches by it).
-        let timeoutMs=null, clockUD=null, stdinUD=null, otherRead=null, devUD=null, devPoll=null;
+        let timeoutMs=null, clockUD=null, stdinUD=null, otherRead=null, devUD=null, devPoll=null, sockUD=null, sockOf=null;
         for(let i=0;i<nsubs;i++){ const s=subs+i*48; const ud=w.dv().getBigUint64(s,true); const tag=w.dv().getUint8(s+8);
           if(tag===0){ const t=w.dv().getBigUint64(s+24,true); timeoutMs=Number(t)/1e6; clockUD=ud; }
           else if(tag===1){ const fd=w.dv().getUint32(s+16,true);
@@ -420,12 +446,25 @@ export class WasiShim {
             // happened in the read that followed, where nothing wakes it. A
             // device whose read can block is that same trap with a new door.
             else if(f && f.device && f.device.poll){ devUD=ud; devPoll=f.device; }
+            // A socket is ASKED too, for the device's reason one comment up: a
+            // connection with nothing on it yet is not readable, and saying it
+            // is turns the wait into a read that spins.
+            else if(f && f.type==='sock'){ sockUD=ud; sockOf=f; }
             else otherRead=ud; } }
         let nev=0;
         const emitRead=(ud)=>{ const ev=events+nev*32; w.dv().setBigUint64(ev,ud,true); w.dv().setUint16(ev+8,0,true); w.dv().setUint8(ev+10,1); w.dv().setBigUint64(ev+16,64n,true); w.dv().setUint16(ev+24,0,true); nev++; };
         const emitClock=(ud)=>{ const ev=events+nev*32; w.dv().setBigUint64(ev,ud,true); w.dv().setUint16(ev+8,0,true); w.dv().setUint8(ev+10,0); nev++; };
         // Non-stdin read subs (pipes/files) are regular fds -> always readable.
         if(otherRead!==null) emitRead(otherRead);
+        if(sockOf){
+          let st;
+          try { st=w.net.poll(sockOf.sock); } catch { st={readable:true}; }
+          // A hangup is readable: the read that follows answers EOF, which is
+          // how a caller learns the connection ended rather than waiting on it.
+          if(st.readable||st.hup) emitRead(sockUD);
+          else if(timeoutMs!=null) emitClock(clockUD);
+          else emitRead(sockUD);
+        }
         if(devPoll){
           // Two parkable subscriptions in one poll would each want the whole
           // wait, and nothing here ever asks for both — busybox's `read` polls
@@ -584,6 +623,41 @@ export class WasiShim {
       env: {
         __host_pipe:(fdptr)=>{ const idx=w.pipes.length; w.pipes.push({chunks:[],off:0}); const r=w.nextFd++, wr=w.nextFd++; w.fds.set(r,{type:'pipe',pipe:idx}); w.fds.set(wr,{type:'pipe',pipe:idx}); w.dv().setUint32(fdptr,r,true); w.dv().setUint32(fdptr+4,wr,true); return 0; },
         // F_DUPFD: lowest free fd >= minfd, sharing the source's backing.
+        // Sockets. preview1 can neither make one nor dial with it, so these
+        // three are the whole of what busybox could not do for itself; the
+        // reading and writing is fd_read/fd_write, because that is what it
+        // uses on the descriptor once it has one.
+        __host_sock_open:()=>{
+          if(!w.net) return -1;
+          const fd=w.nextFd++;
+          w.fds.set(fd,{type:'sock',sock:null});
+          return fd;
+        },
+        // The address arrives in NETWORK byte order, exactly as struct in_addr
+        // held it, and is turned back into dotted quad here — the form the net
+        // handed out in the first place.
+        __host_sock_connect:(fd,addr,port)=>{
+          const f=w.fds.get(fd);
+          if(!f||f.type!=='sock'||!w.net) return -1;
+          const a=addr>>>0;
+          const dotted=`${a&0xff}.${(a>>>8)&0xff}.${(a>>>16)&0xff}.${(a>>>24)&0xff}`;
+          try { f.sock=w.net.connect(dotted,port); } catch { return -1; }
+          return 0;
+        },
+        __host_sock_resolve:(namePtr,outPtr)=>{
+          if(!w.net) return -1;
+          let name=''; const b=w.bytes();
+          for(let i=namePtr;b[i];i++) name+=String.fromCharCode(b[i]);
+          let dotted;
+          try { dotted=w.net.resolve(name); } catch { return -1; }
+          if(!dotted) return -1;
+          const parts=dotted.split('.').map(Number);
+          if(parts.length!==4||parts.some((n)=>!Number.isInteger(n)||n<0||n>255)) return -1;
+          // Network order: the first octet is the lowest address, which is what
+          // a little-endian setUint32 of the reversed word produces.
+          w.dv().setUint32(outPtr,(parts[3]<<24)|(parts[2]<<16)|(parts[1]<<8)|parts[0],true);
+          return 0;
+        },
         __host_dup:(fd,minfd)=>{ const src=w.fds.get(fd); if(!src) return -1; let n=Math.max(minfd,4); while(w.fds.has(n)) n++; if(n>=w.nextFd) w.nextFd=n+1; w.fds.set(n,{...src,preopen:false}); return n; },
         __host_dup2:(oldfd,newfd)=>{ const src=w.fds.get(oldfd); if(!src) return -1; const prev=w.fds.get(newfd); if(newfd>=w.nextFd) w.nextFd=newfd+1; w.fds.set(newfd,{...src,preopen:false}); if(prev&&prev.type==='pipe') w.gcPipe(prev.pipe); return newfd; },
         __host_trace:()=>{},   // debug hook (present in traced builds; harmless)
@@ -831,6 +905,18 @@ export class WasiShim {
     // `nonblock` reaches the device too: one that can wait needs to know
     // whether it may. /dev/null ignores both and reads EOF.
     if(f.device) return f.device.read(max,this.pos(f),!!nonblock);
+    if(f.type==='sock'){
+      // `null` is the net's "nothing yet", and it becomes EAGAIN whether or not
+      // the fd asked for non-blocking — because there is nothing to block ON.
+      // The thread is the guest's and the answer would have to arrive on it;
+      // with sockfetch it never happens anyway, since a response is in hand
+      // before the guest stops writing.
+      let data;
+      try { data=this.net.recv(f.sock,max); }
+      catch(e){ return { data:EMPTY, errno: wasiErrno(e) }; }
+      if(data===null) return { data:EMPTY, errno:E.AGAIN };
+      return { data, errno:0 };
+    }
     if(f.type==='pipe'){
       const pi=this.pipes[f.pipe];
       if(!pi) return { data:EMPTY, errno:0 };
@@ -893,6 +979,10 @@ export class WasiShim {
     // Reporting those bytes as written would make a failed request look like a
     // delivered one.
     else if(f.device) return f.device.write(b,this.pos(f))||0;
+    else if(f.type==='sock'){
+      try { this.net.send(f.sock,b); }
+      catch(e){ return wasiErrno(e); }
+    }
     else if(f.type==='pipe'){ const pi=this.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
     else if(f.type==='file'){
       const p=this.pos(f);
