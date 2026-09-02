@@ -282,6 +282,7 @@ export interface WasiShimOptions {
    * "no such thing".
    */
   host?: HostPort;
+  net?: NetPort;
   /**
    * The inbound half of that port: requests the HOST hands to a RUNNING guest,
    * read as lines from /dev/hostreq. A running guest owns its worker and its
@@ -345,4 +346,26 @@ export class WasiShim {
      *  null means park indefinitely, which is what an untimed guest poll does. */
     poll?(ms: number | null): boolean;
   }): this;
+}
+
+/**
+ * Sockets, for a guest that asks for one.
+ *
+ * WASI preview1 can neither create a connection nor dial with it, so this is
+ * the whole of what the shim cannot do for itself. Absent, `socket()` fails
+ * with EAFNOSUPPORT and nothing else changes.
+ *
+ * A handle is whatever this object wants it to be; the shim only holds it.
+ * Reading and writing are the descriptor's own `fd_read`/`fd_write`.
+ */
+export interface NetPort {
+  /** A name's address, dotted quad, or null if it has none. */
+  resolve(hostname: string): string | null;
+  /** Open a connection. Throwing refuses it. */
+  connect(address: string, port: number): unknown;
+  send(handle: unknown, bytes: Uint8Array): number;
+  /** Bytes; empty for EOF, null for "nothing yet". */
+  recv(handle: unknown, max: number): Uint8Array | null;
+  poll(handle: unknown): { readable: boolean; writable: boolean; hup?: boolean };
+  close(handle: unknown): void;
 }

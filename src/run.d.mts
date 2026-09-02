@@ -1,4 +1,4 @@
-import type { Files, HostBuiltins, BuiltinMap, HostPort, HostVerbMap } from './shim.mjs';
+import type { Files, HostBuiltins, BuiltinMap, HostPort, HostVerbMap, NetPort } from './shim.mjs';
 import type { FileSystem } from './fs.mjs';
 
 export type WasmSource =
@@ -91,6 +91,8 @@ export interface RunOptions {
    * it with serve({ host }) inside a worker module and pass it as `workerUrl`.
    */
   host?: HostVerbMap | HostPort | (() => HostVerbMap | HostPort | Promise<HostVerbMap | HostPort>);
+  /** Sockets. See NetPort in ./shim.d.mts — absent, socket() fails. */
+  net?: NetPort;
 }
 
 export interface RunResult {

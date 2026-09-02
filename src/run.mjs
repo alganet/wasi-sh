@@ -37,6 +37,7 @@ async function runInline(options) {
     requests: fixedRequests(toRequestBytes(options.requests)),
     builtins: await resolveBuiltins(options.builtins),
     host: await resolveHost(options.host),
+    net: options.net,
     suspendable: !!options.suspendable,
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
