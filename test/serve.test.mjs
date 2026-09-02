@@ -359,3 +359,67 @@ test('a second startup message is refused, not started', async (t) => {
   assert.equal(self_.posted.filter((m) => m.type === 'exit').length, 1);
   assert.match(r.error, /already has one/);
 });
+
+// The fifth seam, and the one an interactive browser session had no way to be
+// given until now: a net is a live object, so `serve({ net })` is the only
+// route by which a shell in a worker can open a socket at all.
+//
+// A FACTORY, deliberately, because that is the shape the real one needs — a
+// backend may have to spawn a fetcher thread of its own, and serve() is called
+// synchronously with nothing to await into. Answered from memory here, the way
+// net.test.mjs does it: the point is the wiring, not the network.
+test('serve({ net }) gives the worker’s shell a socket', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const conns = new Map();
+  const body = 'over a net in a worker';
+  const reply = [
+    'HTTP/1.1 200 OK', 'Content-Type: text/plain',
+    `Content-Length: ${body.length}`, 'Connection: close', '', body,
+  ].join('\r\n');
+  let next = 1;
+  const seen = [];
+  const net = {
+    resolve: () => '172.29.0.1',
+    connect(addr, port) {
+      seen.push({ addr, port });
+      conns.set(next, { req: '', out: null, off: 0 });
+      return next++;
+    },
+    send(h, bytes) {
+      const c = conns.get(h);
+      c.req += dec.decode(bytes);
+      if (c.req.includes('\r\n\r\n')) c.out = new TextEncoder().encode(reply);
+      return bytes.length;
+    },
+    recv(h, max) {
+      const c = conns.get(h);
+      if (!c.out) return null;
+      const slice = c.out.subarray(c.off, c.off + max);
+      c.off += slice.length;
+      return slice;
+    },
+    poll(h) {
+      const c = conns.get(h);
+      return { readable: !!c.out, writable: true, hup: !!c.out && c.off >= c.out.length };
+    },
+    close(h) { conns.delete(h); },
+  };
+
+  const r = await runInWorker('', { net: async () => net }, {
+    args: ['wget', '-q', '-O', '-', 'http://example.test/thing'],
+  });
+
+  assert.equal(r.exitCode, 0, r.stderr);
+  assert.equal(r.stdout, body);
+  assert.deepEqual(seen, [{ addr: '172.29.0.1', port: 80 }]);
+});
+
+// Absent, nothing changes — which is the half that says this is an addition
+// rather than a new requirement on every serve() module that already exists.
+test('without one, the same shell has no socket to open', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins'); return; }
+  const r = await runInWorker('', {}, {
+    args: ['wget', '-q', '-O', '-', 'http://example.test/thing'],
+  });
+  assert.notEqual(r.exitCode, 0);
+});

@@ -9,7 +9,7 @@
  * Outbound: { type:'out', channel:'stdout'|'stderr', bytes }
  *           { type:'ready' } | { type:'exit', code } | { type:'error', msg }
  */
-import type { HostBuiltins, BuiltinMap, HostPort, HostVerbMap } from './shim.mjs';
+import type { HostBuiltins, BuiltinMap, HostPort, HostVerbMap, NetPort } from './shim.mjs';
 import type { RingInput } from './ring.mjs';
 import type { FileSystem } from './fs.mjs';
 
@@ -41,6 +41,18 @@ export interface ServeOptions {
    * EPERM and the session reaches nothing.
    */
   host?: HostVerbMap | HostPort | (() => HostVerbMap | HostPort | Promise<HostVerbMap | HostPort>);
+  /**
+   * Sockets for this worker's shell — see NetPort in ./shim.d.mts. A port, or
+   * a factory awaited before the shell starts; the port's own calls must be
+   * synchronous, because a guest inside connect() has no event loop turn left
+   * to give.
+   *
+   * A net is a live object, so this is the only way one reaches a browser
+   * session — and the interactive shell in a worker is where it matters, since
+   * that is where somebody types `wget`. Omitted, socket() fails with
+   * EAFNOSUPPORT and nothing else changes.
+   */
+  net?: NetPort | (() => NetPort | Promise<NetPort>);
 }
 
 /**

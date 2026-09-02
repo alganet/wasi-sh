@@ -6,11 +6,11 @@
 //   default   run()/spawn() point a plain `new Worker(...)` at this module and
 //             get a shell with no host builtins.
 //   serve()   a CUSTOM worker module imports it to register host builtins, a
-//             filesystem, or the host port. Handlers are FUNCTIONS and
+//             filesystem, the host port or a net. Handlers are FUNCTIONS and
 //             postMessage structured-clones its payload, so registering them
-//             HERE, inside the worker, is the only way `builtins`, `fs` and
-//             `host` can reach a browser session. Point run()/spawn() at your
-//             module with `workerUrl`.
+//             HERE, inside the worker, is the only way `builtins`, `fs`,
+//             `host` and `net` can reach a browser session. Point run()/spawn()
+//             at your module with `workerUrl`.
 //
 // serve() must be called SYNCHRONOUSLY at module evaluation, before any
 // top-level await. A task can never interleave with synchronous script
@@ -32,7 +32,7 @@
 // own — a SharedArrayBuffer for serve({ fs }) is the one that forces it.
 import { WasiShim, WasiExit } from './shim.mjs';
 import { RingReader } from './ring.mjs';
-import { fixedInput, fixedRequests, resolveBuiltins, resolveHost } from './options.mjs';
+import { fixedInput, fixedRequests, resolveBuiltins, resolveHost, resolveNet } from './options.mjs';
 
 let config = {};
 let started = false;
@@ -93,7 +93,7 @@ self.addEventListener('message', async (e) => {
     const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
     // Builtin setup and wasm compilation are independent; overlapping them
     // hides an interpreter-sized init behind the compile.
-    const [builtins, host, compiled] = await Promise.all([
+    const [builtins, host, net, compiled] = await Promise.all([
       // `builtins()` is handed the session's own input, which is the only way
       // to reach the things that exist HERE and nowhere else — the signal cell
       // a hosted runtime polls, the terminal geometry it may want at startup.
@@ -103,6 +103,12 @@ self.addEventListener('message', async (e) => {
       }),
       resolveHost(config.host).catch((ex) => {
         throw new Error(`serve({ host }): setup failed: ${(ex && ex.message) || ex}`);
+      }),
+      // In the same group rather than awaited later, because this is the seam
+      // most likely to be slow: a backend that spawns a fetcher thread of its
+      // own belongs behind the wasm compile, not in front of it.
+      resolveNet(config.net).catch((ex) => {
+        throw new Error(`serve({ net }): setup failed: ${(ex && ex.message) || ex}`);
       }),
       module || WebAssembly.compile(wasmBytes),
     ]);
@@ -116,6 +122,11 @@ self.addEventListener('message', async (e) => {
       stdout: post('stdout'),
       stderr: post('stderr'),
       input, builtins, host,
+      // The fifth seam, and the only one a browser session had no way to be
+      // given: a net is a live object like the four above it, so serve() is
+      // where one reaches an interactive shell. Absent, socket() is
+      // EAFNOSUPPORT and nothing else changes.
+      net,
       // A live channel when the session granted one (spawn), the pre-staged
       // queue otherwise (run). The ring reader serves as-is: the inbound
       // channel is stdin's contract aimed the other way, so there is no
