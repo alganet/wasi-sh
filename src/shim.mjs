@@ -157,7 +157,7 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, net, requests, tty=false, suspendable=false }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, net, requests, tty=false, suspendable=false, suspendInput=false }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
@@ -183,6 +183,21 @@ export class WasiShim {
     this.suspendable = !!suspendable
       && typeof WebAssembly.Suspending === 'function'
       && typeof WebAssembly.promising === 'function';
+    // The same JSPI machinery, pointed at the WAIT rather than at the call
+    // out. A guest parked on a keystroke owns the thread, and the event loop
+    // under it stops — so a shell that draws its own prompt and a host that
+    // wants to be called cannot both exist. Suspended, the guest's stack is
+    // set aside and the thread goes back to its queue until bytes arrive.
+    //
+    // Both async methods are required, not one: the read path and the poll
+    // path each have their own, and an input with half of them would take the
+    // suspending branch in one place and block in the other.
+    this.suspendInput = !!suspendInput && this.suspendable
+      && !!(input && input.readBlockingAsync && input.pollReadableAsync);
+    // Set only for the length of the delegated call inside that wrapper; read
+    // by poll_oneoff, which must not park a second time on a wait already
+    // spent. Declared here so the field exists before anything reads it.
+    this.pollAlreadyWaited = false;
     this.host = host;                   // { request(verb, payload)->bytes } — see hostDevice()
     this.requests = requests;           // inbound: an `input`-shaped channel of request lines
     this.mem = null; this.view = null; this.u8 = null;
@@ -509,9 +524,12 @@ export class WasiShim {
           // Only an input that can be woken by a non-byte event (winchPending)
           // can park indefinitely; for anything else null would never return.
           const canPark = !!(w.input && w.input.winchPending);
-          // Zero when another subscription is already ready (poll returns now),
-          // and when an input that cannot park was going to be asked to.
-          const waitMs = (nev>0 || (timeoutMs==null && !canPark)) ? 0 : timeoutMs;
+          // Zero when another subscription is already ready, when an input
+          // that cannot park was going to be asked to, and when the suspending
+          // wrapper has ALREADY done this wait on its own — waiting it twice is
+          // what turns `read -t 1.2` into 2.4 seconds, which is half of what
+          // the regression test above this file's `read -t` cases is for.
+          const waitMs = (w.pollAlreadyWaited || nev>0 || (timeoutMs==null && !canPark)) ? 0 : timeoutMs;
           // pollReadable(ms) does the timed wait; when it comes back empty the
           // timeout has fully elapsed — report the clock, do NOT wait again.
           const ready = w.input && (w.input.pollReadable(waitMs) || closed());
@@ -634,6 +652,75 @@ export class WasiShim {
       catch(e){ return builtinThrew(ctx.argv[0]||'',e); }
       return builtinStatus(status);
     };
+    // Swap the two waiting imports for suspending twins.
+    //
+    // The only difference is WHO waits. Sync, a guest with nothing to read
+    // parks the worker thread in Atomics.wait and the event loop under it stops
+    // — which is why a shell that owns its own prompt cannot coexist with a
+    // host builtin the page wants to call. Suspended, the guest's stack is put
+    // aside and the thread goes back to its queue until bytes arrive.
+    //
+    // Memory views are re-fetched AFTER the await (dv()/bytes() do that on
+    // every call): a suspension is an arbitrary amount of other people's code,
+    // and wasm memory can grow underneath it.
+    if (w.suspendInput) {
+      // Captured BEFORE the swap: everything that is not a parked stdin read
+      // still goes through the synchronous one, and reaching for `p1.fd_read`
+      // after the assignment below would be the wrapper calling itself.
+      const readSync = p1.fd_read;
+      const readSuspending = async (fd, iovs, n, out) => {
+        const f = w.fds.get(fd); if (!f) return E.BADF;
+        if (f.type !== 'stdin' || f.nonblock) return readSync(fd, iovs, n, out);
+        const bufs = w.iovecs(iovs, n);
+        const max = bufs.reduce((a, b) => a + b.length, 0);
+        let data = w.input ? w.input.read(max) : EMPTY;
+        if (data.length === 0 && !(w.input && w.input.closed && w.input.closed())) {
+          data = await w.input.readBlockingAsync(max);
+        }
+        const outBufs = w.iovecs(iovs, n);
+        let o = 0;
+        for (const b of outBufs) { const take = Math.min(b.length, data.length - o); b.set(data.subarray(o, o + take)); o += take; if (o >= data.length) break; }
+        w.dv().setUint32(out, o, true);
+        return data.length === 0 ? ((w.input && w.input.closed && w.input.closed()) ? 0 : E.AGAIN) : 0;
+      };
+      p1.fd_read = new WebAssembly.Suspending(readSuspending);
+
+      // And the one that actually matters at a prompt. busybox polls before it
+      // reads — "we must poll even if timeout is -1: we want to be interrupted
+      // if signal arrives" — so an idle shell is parked HERE, not in fd_read.
+      //
+      // The wait is lifted OUT rather than the function rewritten: find the
+      // stdin subscription, await it here, then hand the whole thing to the
+      // synchronous implementation, which now finds the data ready and parks on
+      // nothing. One await, no second copy of the WASI event encoding.
+      const pollSync = p1.poll_oneoff;
+      const pollSuspending = async (subs, events, nsubs, out) => {
+        let timeoutMs = null, wantsStdin = false, others = false;
+        for (let i = 0; i < nsubs; i++) {
+          const s = subs + i * 48;
+          const tag = w.dv().getUint8(s + 8);
+          if (tag === 0) timeoutMs = Number(w.dv().getBigUint64(s + 24, true)) / 1e6;
+          else if (tag === 1) {
+            const f = w.fds.get(w.dv().getUint32(s + 16, true));
+            if (f && f.type === 'stdin') wantsStdin = true; else others = true;
+          }
+        }
+        const input = w.input;
+        if (wantsStdin && !others && input && input.pollReadableAsync
+          && !(input.closed && input.closed())
+          && !(input.pollReadable && input.pollReadable(0))) {
+          await input.pollReadableAsync(timeoutMs);
+          // The wait is spent. Everything below — which event to emit, whether
+          // a pending winch means EINTR — is still the sync implementation's
+          // to decide, but it must decide it without parking again.
+          w.pollAlreadyWaited = true;
+          try { return pollSync(subs, events, nsubs, out); }
+          finally { w.pollAlreadyWaited = false; }
+        }
+        return pollSync(subs, events, nsubs, out);
+      };
+      p1.poll_oneoff = new WebAssembly.Suspending(pollSuspending);
+    }
     return {
       wasi_snapshot_preview1: p1,
       env: {
