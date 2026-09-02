@@ -668,8 +668,28 @@ serve({ builtins: {
 
 It is optional because listing promises more than looking up, and a lazy index
 may genuinely be unable to. Leave it out and your commands still resolve and
-still run — completion just never mentions them. It is read once per session,
-on the first completion.
+still run — completion just never mentions them. It is read once per *walk* —
+one call per completion, not one per candidate — so a namespace that gained or
+lost a name since the last Tab is seen, and one that changes halfway through a
+walk cannot make it skip or repeat entries.
+
+`builtinRegistry()` is that provider, written down: a `lookup`/`run`/`names`
+object with `define`, `remove` and `has` on it, so the set of commands can
+change while the shell is running.
+
+```js
+import { builtinRegistry } from 'wasi-sh';
+
+const commands = builtinRegistry({ hello: (ctx) => { ctx.stdout('hi\n'); return 0; } });
+commands.define('bye', (ctx) => { commands.remove('hello'); return 0; });
+
+await run({ inline: true, builtins: commands, script: 'hello; bye; hello 2>/dev/null; echo $?' });
+// 'hi\n127\n' — the second `hello` is gone, and Tab stops offering it too
+```
+
+It refuses a name ash could never resolve as a command — anything with a slash,
+a NUL or whitespace in it — because a command that silently is not one is worse
+than the mistake it came from.
 
 ### In a browser: register them in the worker
 
@@ -869,7 +889,7 @@ driven from the page.
 
 | import | what |
 |---|---|
-| `wasi-sh` | `run`, `spawn`, `Session`, `fetchTree`, `WasiShim`, `WasiExit`, ring |
+| `wasi-sh` | `run`, `spawn`, `Session`, `fetchTree`, `WasiShim`, `WasiExit`, `builtinRegistry`, ring |
 | `wasi-sh/node` | `run`, `runScript`, `compileWasm`, `readTree` (fs sugar; node-only) |
 | `wasi-sh/shim` | `WasiShim`, `WasiExit` — the WASI machine, pluggable I/O |
 | `wasi-sh/ring` | `createRing`, `RingWriter`, `RingReader`, `frameRequest` — the SAB rings |
