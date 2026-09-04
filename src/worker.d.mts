@@ -6,8 +6,14 @@
  *   sab      → interactive mode (RingReader on the SAB stdin ring)
  *   stdin    → non-interactive mode (fixed buffer, then EOF)
  *   requests → pre-framed inbound host requests for /dev/hostreq
- * Outbound: { type:'out', channel:'stdout'|'stderr', bytes }
+ * Outbound: { type:'out', runs: [{ channel:'stdout'|'stderr', bytes }, ...] }
  *           { type:'ready' } | { type:'exit', code } | { type:'error', msg }
+ *
+ * `runs` is one guest TURN's writes, in order, each with its own channel — so
+ * a page paints once for a redraw rather than once per write(). Replay them in
+ * order and the result is what a per-write message stream said. A handler
+ * written against the older single-`{channel, bytes}` shape reads `undefined`
+ * and drops every byte; `src/spawn.mjs` and `src/run.mjs` accept both.
  */
 import type { HostBuiltins, BuiltinMap, HostPort, HostVerbMap, NetPort } from './shim.mjs';
 import type { RingInput } from './ring.mjs';

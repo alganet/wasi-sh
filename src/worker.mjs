@@ -23,9 +23,14 @@
 // Startup message: { module | wasmBytes, files, args, env, sab?, reqSab?, stdin?, requests? }
 // `requests` is the inbound host-port channel, pre-framed: bytes, so it crosses
 // structured clone exactly as stdin does. Nothing about it is a live object.
-// Outbound:        { type:'out', channel:'stdout'|'stderr', bytes }
+// Outbound:        { type:'out', runs: [{ channel:'stdout'|'stderr', bytes }, ...] }
 //                  { type:'ready' } after instantiation, before _start()
 //                  { type:'exit', code } | { type:'error', msg }
+//
+// `runs` carries a whole guest turn (see the writer below). It replaced a
+// message per write() and is a BREAKING change for an embedder holding its own
+// listener: the old shape's `channel`/`bytes` read `undefined` and the output
+// is silently dropped. spawn() and run() take either.
 //
 // A message carrying no wasm is NOT the startup message and is left alone, so
 // a serve() module can `addEventListener('message', ...)` for handoffs of its
@@ -112,7 +117,67 @@ self.addEventListener('message', async (e) => {
       }),
       module || WebAssembly.compile(wasmBytes),
     ]);
-    const post = (channel) => (b) => self.postMessage({ type: 'out', channel, bytes: b }, [b.buffer]);
+    // ---- output, batched to a guest TURN ------------------------------------
+    //
+    // One postMessage per write() syscall is one `term.write()` per write()
+    // syscall, and a browser is free to paint between any two of them. That is
+    // visible: `^C`-L at a prompt is SEVEN writes — an empty one, ESC[H ESC[J,
+    // a carriage return, the prompt, another empty one, ESC[J — and Firefox
+    // paints each, so the caret is watched travelling to column 0 and back
+    // while the line editor redraws. Chromium coalesces them, which is why this
+    // hid for so long. Every fragment of a tuish repaint has the same problem.
+    //
+    // So a turn's writes travel together. The runs are kept SEPARATE and in
+    // order rather than concatenated: `onOutput(bytes, channel)` is the public
+    // contract — run() splits its stdout and stderr with it — and replaying the
+    // runs on the other side calls it exactly as often as before, with the same
+    // arguments. Only the number of MESSAGES changes, and with it the number of
+    // tasks the page is given to paint between.
+    //
+    // Flushed at four moments, and each covers something the others miss:
+    //   - before the guest PARKS (shim beforeBlock), because the prompt is the
+    //     last thing written before a shell waits for a key. A timer instead
+    //     would leave the terminal blank until it fired — and the synchronous
+    //     park blocks in Atomics.wait with the stack still standing, so no
+    //     microtask is ever going to run there.
+    //   - on a microtask, which covers every OTHER way the thread comes back
+    //     to its queue — a host builtin that awaits, most of all.
+    //   - at a size cap, so `seq 1 100000000` still streams instead of growing
+    //     a buffer nobody asked for.
+    //   - when the guest exits, for whatever it wrote on the way out.
+    let runs = [];
+    let held = 0;
+    let scheduled = false;
+    const HOLD_MAX = 1 << 16;
+    const flush = () => {
+      scheduled = false;
+      if (!runs.length) return;
+      const out = runs;
+      runs = [];
+      held = 0;
+      self.postMessage({ type: 'out', runs: out }, out.map((r) => r.bytes.buffer));
+    };
+    // An empty write is not output. Three of Ctrl-L's seven were empty, and
+    // each cost a message, a structured clone and a paint to say nothing.
+    const post = (channel) => (b) => {
+      if (!b || b.length === 0) return;
+      runs.push({ channel, bytes: b });
+      held += b.length;
+      if (held >= HOLD_MAX) { flush(); return; }
+      // And whenever the thread comes back to its queue at all.
+      //
+      // A microtask cannot run while the guest is executing — that is what
+      // makes the batch a TURN rather than a timer, and it is the whole trick.
+      // But the guest is not the only thing that yields: a host builtin that
+      // awaits (`wide load python` fetching an interpreter) unwinds the stack
+      // and then writes its own progress over many turns of the event loop,
+      // and none of that should sit here until the shell next wants a key.
+      //
+      // It does not cover the SYNCHRONOUS park, where Atomics.wait blocks with
+      // the stack still standing and no microtask will ever run. That is what
+      // beforeBlock is for, and why both exist.
+      if (!scheduled) { scheduled = true; queueMicrotask(flush); }
+    };
     const shim = new WasiShim({
       args, env, files,
       // A store is a live object, so like `builtins` it can only be registered
@@ -122,6 +187,8 @@ self.addEventListener('message', async (e) => {
       stdout: post('stdout'),
       stderr: post('stderr'),
       input, builtins, host,
+      // "The guest is about to wait": see the writer above.
+      beforeBlock: flush,
       // The fifth seam, and the only one a browser session had no way to be
       // given: a net is a live object like the four above it, so serve() is
       // where one reaches an interactive shell. Absent, socket() is
@@ -191,8 +258,12 @@ self.addEventListener('message', async (e) => {
       else instance.exports._start();
     } catch (ex) {
       if (ex instanceof WasiExit) code = ex.code;
-      else { self.postMessage({ type: 'error', msg: String(ex && ex.message || ex) }); return; }
+      else { flush(); self.postMessage({ type: 'error', msg: String(ex && ex.message || ex) }); return; }
     }
+    // Whatever the guest wrote on its way out, before anyone is told it is
+    // gone: a page that hears `exit` first would tear the session down with
+    // the last of its output still held here.
+    flush();
     self.postMessage({ type: 'exit', code });
   } catch (ex) {
     self.postMessage({ type: 'error', msg: String(ex && ex.message || ex) });

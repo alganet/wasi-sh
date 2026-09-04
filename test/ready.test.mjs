@@ -33,7 +33,7 @@ async function probe({ script = 'mark\n', files = {} } = {}) {
   const done = new Promise((resolve, reject) => {
     worker.on('message', (m) => {
       if (m.type === 'twin.ready') return;
-      if (m.type === 'out') out += dec.decode(new Uint8Array(m.bytes));
+      if (m.type === 'out') for (const r of (m.runs || [m])) out += dec.decode(new Uint8Array(r.bytes));
       else if (m.type === 'probe.result') { result = m; if (exit !== undefined) resolve(); }
       else if (m.type === 'exit') { exit = m.code; if (result) resolve(); }
       else if (m.type === 'error') reject(new Error(m.msg));

@@ -157,11 +157,33 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, input, builtins, host, net, requests, tty=false, suspendable=false, suspendInput=false }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, beforeBlock, input, builtins, host, net, requests, tty=false, suspendable=false, suspendInput=false }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
     this.stderr = stderr || this.stdout;
+    // "I am about to stop writing." Called immediately before the guest hands
+    // the thread away, at every point where it can: the two reads, the three
+    // polls, and every call out to embedder code — a host builtin and a
+    // /dev/host verb alike.
+    //
+    // It exists for output. A caller that BATCHES what stdout and stderr hand
+    // it has to know when the batch is finished, and the only honest answer is
+    // "when the guest stops writing": the prompt is the last thing written
+    // before a shell parks on a keystroke, so a batch that waits for a timer
+    // instead would leave the terminal blank until one fired. See serve()'s
+    // writer in worker.mjs, which is the caller this is for.
+    //
+    // The calls out are here for a second reason, and it is ORDERING, not
+    // latency. A handler is free to postMessage to the page itself — the
+    // host-port example answers a request that way — and a batch still being
+    // held when it does lets that message overtake output the guest wrote
+    // BEFORE the call. Measured with the example: both responses arrived ahead
+    // of every line of the script that produced them.
+    //
+    // No-op by default, so a shim used directly — every twin in test/ — writes
+    // through as it always did.
+    this.beforeBlock = typeof beforeBlock === 'function' ? beforeBlock : null;
     this.input = input;                 // { pollReadable(ms)->bool, read(max)->Uint8Array }
     this.builtins = builtins;           // { lookup(name)->bool, run(ctx)->status }
     // The fifth seam, and the one aimed at the network. Absent, socket() is
@@ -501,7 +523,12 @@ export class WasiShim {
           // wait, and nothing here ever asks for both — busybox's `read` polls
           // one fd. So the device only parks when it is alone; beside stdin it
           // is asked without waiting and stdin owns the park.
-          const ready=devPoll.poll((nev>0||stdinUD!==null)?0:timeoutMs);
+          const devWaitMs=(nev>0||stdinUD!==null)?0:timeoutMs;
+          // Parks exactly as the stdin branch below does — /dev/hostreq's poll
+          // is a ring's pollReadable, i.e. Atomics.wait — so it owes the same
+          // "I am about to stop writing".
+          if(devWaitMs!==0 && w.beforeBlock) w.beforeBlock();
+          const ready=devPoll.poll(devWaitMs);
           if(ready) emitRead(devUD);
           else if(timeoutMs!=null) emitClock(clockUD);
           // Untimed, asked to park, and back with nothing: the device declined
@@ -532,6 +559,7 @@ export class WasiShim {
           const waitMs = (w.pollAlreadyWaited || nev>0 || (timeoutMs==null && !canPark)) ? 0 : timeoutMs;
           // pollReadable(ms) does the timed wait; when it comes back empty the
           // timeout has fully elapsed — report the clock, do NOT wait again.
+          if(waitMs !== 0 && w.beforeBlock) w.beforeBlock();
           const ready = w.input && (w.input.pollReadable(waitMs) || closed());
           if(ready) emitRead(stdinUD);
           else if(timeoutMs!=null) emitClock(clockUD);
@@ -545,7 +573,7 @@ export class WasiShim {
         // out. A device sub counts as something: it has already done this
         // poll's waiting and reported for itself, and sleeping the timeout a
         // second time here would double it.
-        } else if(otherRead===null && devPoll===null && timeoutMs!=null){ if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
+        } else if(otherRead===null && devPoll===null && timeoutMs!=null){ if(w.beforeBlock) w.beforeBlock(); if(w.input && w.input.wait) w.input.wait(timeoutMs); emitClock(clockUD); }
         w.dv().setUint32(out,nev,true); return 0; },
     };
     // ---- host builtins: everything the two shapes of the run import share ----
@@ -631,6 +659,9 @@ export class WasiShim {
       if(!w.builtins) return -1;
       const ctx=builtinCtx(cwdPtr,argc,argvPtr,envpPtr);
       let status;
+      // Synchronous, so nothing is waiting — but a handler may still post to
+      // the page, and held output must not arrive after what it says.
+      if(w.beforeBlock) w.beforeBlock();
       try { status=w.builtins.run(ctx); }
       catch(e){ return builtinThrew(ctx.argv[0]||'',e); }
       if(status&&typeof status.then==='function'){
@@ -648,6 +679,11 @@ export class WasiShim {
       if(!w.builtins) return -1;
       const ctx=builtinCtx(cwdPtr,argc,argvPtr,envpPtr);
       let status;
+      // A handler that awaits yields the thread exactly as a park does, and for
+      // an unbounded time — `wide load python` fetches an interpreter. Anything
+      // written before it (its own progress line, most of all) has to be on the
+      // screen while it runs, not batched until the shell next waits for a key.
+      if(w.beforeBlock) w.beforeBlock();
       try { status=await w.builtins.run(ctx); }
       catch(e){ return builtinThrew(ctx.argv[0]||'',e); }
       return builtinStatus(status);
@@ -675,7 +711,8 @@ export class WasiShim {
         const max = bufs.reduce((a, b) => a + b.length, 0);
         let data = w.input ? w.input.read(max) : EMPTY;
         if (data.length === 0 && !(w.input && w.input.closed && w.input.closed())) {
-          data = await w.input.readBlockingAsync(max);
+          if(w.beforeBlock) w.beforeBlock();
+        data = await w.input.readBlockingAsync(max);
         }
         const outBufs = w.iovecs(iovs, n);
         let o = 0;
@@ -709,6 +746,7 @@ export class WasiShim {
         if (wantsStdin && !others && input && input.pollReadableAsync
           && !(input.closed && input.closed())
           && !(input.pollReadable && input.pollReadable(0))) {
+          if(w.beforeBlock) w.beforeBlock();
           await input.pollReadableAsync(timeoutMs);
           // The wait is spent. Everything below — which event to emit, whether
           // a pending winch means EINTR — is still the sync implementation's
@@ -990,7 +1028,7 @@ export class WasiShim {
   readInput(src,max,nonblock){
     let data=src?src.read(max):EMPTY;
     if(data.length===0){
-      if(!nonblock && src && src.readBlocking){ data=src.readBlocking(max); }
+      if(!nonblock && src && src.readBlocking){ if(this.beforeBlock) this.beforeBlock(); data=src.readBlocking(max); }
       if(data.length===0){
         return { data:EMPTY, errno:(src && src.closed && src.closed()) ? 0 : E.AGAIN };
       }
@@ -1225,6 +1263,9 @@ export class WasiShim {
       // Contained exactly as a host builtin's throw is: a JS exception out of a
       // wasm import unwinds the entire guest stack and the instance is dead.
       // A broken verb costs one write.
+      // Before the port hears the verb: a handler that answers by posting to
+      // the page must not have its message overtake what the guest wrote first.
+      if(w.beforeBlock) w.beforeBlock();
       try { out=w.host.request(verb,payload); }
       catch(e){ complain(verb,(e&&e.message)||e); return E.IO; }
       if(out&&typeof out.then==='function'){

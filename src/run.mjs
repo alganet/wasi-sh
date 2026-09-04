@@ -117,9 +117,14 @@ async function runInWorker(options) {
     worker.addEventListener('message', (e) => {
       const m = e.data;
       if (m.type === 'out') {
-        const bytes = new Uint8Array(m.bytes);
-        chunks[m.channel].push(bytes);
-        if (options.onOutput) options.onOutput(bytes, m.channel);
+        // Both shapes, for the reason spawn.mjs gives: serve() batches a guest
+        // turn into `runs`, and each run is still delivered on its own.
+        const take = (bytes, channel) => {
+          chunks[channel].push(bytes);
+          if (options.onOutput) options.onOutput(bytes, channel);
+        };
+        if (m.runs) for (const r of m.runs) take(new Uint8Array(r.bytes), r.channel);
+        else take(new Uint8Array(m.bytes), m.channel);
       } else if (m.type === 'exit') {
         resolve({
           stdout: decodeAll(chunks.stdout),

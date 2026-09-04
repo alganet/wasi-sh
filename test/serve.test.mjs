@@ -53,7 +53,13 @@ async function loadExample(specifier) {
 const dec = new TextDecoder();
 function collect(posted) {
   const out = { stdout: '', stderr: '' };
-  for (const m of posted) if (m.type === 'out') out[m.channel] += dec.decode(new Uint8Array(m.bytes));
+  // Two shapes: serve() batches a guest turn into `runs` (see worker.mjs), and
+  // a single run still travels on its own. Both carry the same channels.
+  for (const m of posted) {
+    if (m.type !== 'out') continue;
+    if (m.runs) for (const r of m.runs) out[r.channel] += dec.decode(new Uint8Array(r.bytes));
+    else out[m.channel] += dec.decode(new Uint8Array(m.bytes));
+  }
   const exit = posted.find((m) => m.type === 'exit');
   const err = posted.find((m) => m.type === 'error');
   return { ...out, exitCode: exit ? exit.code : undefined, error: err && err.msg };

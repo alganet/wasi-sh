@@ -145,8 +145,21 @@ export class Session {
     worker.addEventListener('message', (e) => {
       const m = e.data;
       if (m.type === 'out') {
-        const bytes = new Uint8Array(m.bytes);
-        for (const fn of this._outputFns) fn(bytes, m.channel);
+        // Two shapes, and both are current. `runs` is a whole guest turn, which
+        // is what serve() sends so that a page paints once for a redraw rather
+        // than once per write() (see worker.mjs); the single-run form is what a
+        // worker module posts when it has something of its own to put on the
+        // terminal. Either way each run reaches onOutput exactly as it always
+        // did, in order, with its own channel.
+        if (m.runs) {
+          for (const r of m.runs) {
+            const bytes = new Uint8Array(r.bytes);
+            for (const fn of this._outputFns) fn(bytes, r.channel);
+          }
+        } else {
+          const bytes = new Uint8Array(m.bytes);
+          for (const fn of this._outputFns) fn(bytes, m.channel);
+        }
       } else if (m.type === 'ready') {
         readyResolve(this);
       } else if (m.type === 'exit') {
