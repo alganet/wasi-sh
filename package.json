@@ -60,6 +60,6 @@
     "webassembly"
   ],
   "devDependencies": {
-    "@zenfs/core": "2.6.3"
+    "@zenfs/core": "2.7.0"
   }
 }

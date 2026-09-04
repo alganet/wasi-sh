@@ -293,9 +293,9 @@ if (!zenfs) {
   // under this backing IS an InMemory, so it is the same three, for the same
   // reason, and that file carries the argument.
   const KNOWN_DEVIATIONS = new Map([
-    ['directories refuse file operations', 'upstream: writeSync to a directory overwrites its index (@zenfs/core 2.6.4)'],
-    ['readdirSync lists entry names, and a file is not a directory', 'upstream: readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.6.4)'],
-    ['touchSync changes permission bits and leaves the type alone', 'upstream: touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.6.4)'],
+    ['directories refuse file operations', 'upstream: writeSync to a directory overwrites its index (@zenfs/core 2.7.0)'],
+    ['readdirSync lists entry names, and a file is not a directory', 'upstream: readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.7.0)'],
+    ['touchSync changes permission bits and leaves the type alone', 'upstream: touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.7.0)'],
   ]);
   const { make } = makeBacking(zenfs);
   const prepared = await persistentFs(await make());

@@ -39,9 +39,9 @@ try {
 // and is fixed: `StoreFS` owns its data nodes, so a caller of `fs.truncateSync`
 // hits it and it is upstream's to answer.
 const KNOWN_DEVIATIONS = new Map([
-  ['directories refuse file operations', 'upstream: InMemory writeSync to a directory overwrites its index (@zenfs/core 2.6.4)'],
-  ['readdirSync lists entry names, and a file is not a directory', 'upstream: InMemory readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.6.4)'],
-  ['touchSync changes permission bits and leaves the type alone', 'upstream: InMemory touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.6.4)'],
+  ['directories refuse file operations', 'upstream: InMemory writeSync to a directory overwrites its index (@zenfs/core 2.7.0)'],
+  ['readdirSync lists entry names, and a file is not a directory', 'upstream: InMemory readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.7.0)'],
+  ['touchSync changes permission bits and leaves the type alone', 'upstream: InMemory touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.7.0)'],
 ]);
 
 if (!zenfs) {
