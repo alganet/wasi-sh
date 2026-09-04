@@ -428,7 +428,7 @@ int host_builtin_lookup(const char *name)
 	return __host_builtin_lookup(name, (int)strlen(name)) ? 1 : 0;
 }
 
-/* Enumerate the registry, for tab completion (build/ash-compgen.patch).
+/* Enumerate the registry, for tab completion (build/ash-complete-hostbuiltin.patch).
  *
  * lookup() answers one name at a time, which is all find_command() ever needs
  * and all a lazy namespace can promise — so listing is a SEPARATE, OPTIONAL

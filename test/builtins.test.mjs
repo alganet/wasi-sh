@@ -317,7 +317,7 @@ test('ctx.interrupted() is false when the session has no interrupt channel', () 
 // ─── the hooks: enumeration, for tab completion ──────────────────────────────
 // lookup() answers one name at a time — all find_command() needs, and all a
 // lazy namespace can promise. Listing is therefore a SEPARATE optional method,
-// and its presence is the signal: see build/ash-compgen.patch.
+// and its presence is the signal: see build/ash-complete-hostbuiltin.patch.
 
 // Read the i'th name the way host_builtin_name() does: into a guest buffer,
 // with the returned length deciding where it ends.

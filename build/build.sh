@@ -149,11 +149,11 @@ patch -p1 -d "$BB" < "$here/applet-interrupt.patch"
 # also touches, and shebang_expand(), which ash-shebang.patch introduces.
 patch -p1 -d "$BB" < "$here/ash-shebang-path.patch"
 
-# `compgen`, so a terminal that edits its lines in the HOST can still ask this
-# shell what completes a word. Depends on ash-hostbuiltin.patch (host builtins
-# are one of the kinds of name it lists) and follows ash-shebang.patch's `env`
-# in how it keeps builtintab's hand-counted offsets honest.
-patch -p1 -d "$BB" < "$here/ash-compgen.patch"
+# Host builtins as a name TAB can offer. Depends on ash-hostbuiltin.patch: it
+# extends ash_command_name(), upstream's enumerator for completion, with the one
+# kind of name the shell cannot list for itself. Without it `php` is a command
+# this shell runs and its own Tab has never heard of.
+patch -p1 -d "$BB" < "$here/ash-complete-hostbuiltin.patch"
 
 # wget's https:// URLs, spoken as plaintext on 443. Without it wget refuses the
 # scheme most of the web answers on — and a script does not choose its scheme,

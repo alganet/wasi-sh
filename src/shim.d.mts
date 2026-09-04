@@ -154,9 +154,9 @@ export interface HostBuiltins {
   /** Execute; the return value becomes `$?`. */
   run(ctx: BuiltinContext): number;
   /**
-   * Every registered name, for tab completion — `compgen -c` and the guest's
-   * own Tab both list them beside the applets, this shell's builtins, its
-   * functions and its aliases.
+   * Every registered name, for tab completion — the guest's own Tab lists
+   * them beside the applets, this shell's builtins, its functions and its
+   * aliases.
    *
    * OPTIONAL, and deliberately so: listing is a bigger promise than looking
    * up, and a lazy namespace that can answer `lookup('php')` may have no way
