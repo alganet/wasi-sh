@@ -399,3 +399,108 @@ test('a non-blocking socket is still non-blocking', e2e, async () => {
   t.env.__host_sock_connect(fd, 0x0100007f, 80);
   assert.equal(readFd(t, fd).errno, 6, 'EAGAIN');
 });
+
+// ─── ^C during a download, on both doors ─────────────────────────────────────
+
+import { WasiExit } from '../src/shim.mjs';
+import { compileWasm } from '../src/node.mjs';
+import { fixedInput, mergeEnv } from '../src/options.mjs';
+
+/**
+ * A net whose body arrives in many chunks, and which raises a ^C partway.
+ *
+ * The interrupt comes from the net only because something has to stand in for
+ * the page pressing the key at the right moment; what it writes is the same
+ * monotonic count `ring.mjs` writes, read through the same `interruptCount`.
+ */
+function chunkedNet({ chunks, interruptAfter, awaited }) {
+  const body = 'x'.repeat(64);
+  const head = [
+    'HTTP/1.1 200 OK', 'Content-Type: text/plain',
+    `Content-Length: ${body.length * chunks}`, 'Connection: close', '', '',
+  ].join('\r\n');
+  const state = { interrupts: 0, delivered: 0 };
+  const conns = new Map();
+  let next = 1;
+
+  const takeOne = (h) => {
+    const c = conns.get(h);
+    if (!c.started) return null;                       // still writing its request
+    if (c.sentHead === false) { c.sentHead = true; return enc.encode(head); }
+    if (c.left === 0) return new Uint8Array(0);        // EOF
+    c.left--;
+    state.delivered++;
+    if (state.delivered === interruptAfter) state.interrupts++;
+    return enc.encode(body);
+  };
+
+  const net = {
+    state,
+    resolve: () => '172.29.0.1',
+    connect() { const h = next++; conns.set(h, { started: false, sentHead: false, left: chunks }); return h; },
+    send(h, bytes) {
+      const c = conns.get(h);
+      c.req = (c.req || '') + dec.decode(bytes);
+      if (c.req.includes('\r\n\r\n')) c.started = true;
+      return bytes.length;
+    },
+    recv: takeOne,
+    poll(h) { const c = conns.get(h); return { readable: c.started, writable: true, hup: c.started && c.left === 0 }; },
+    close(h) { conns.delete(h); },
+  };
+  if (awaited) net.recvAsync = async (h, max) => { await new Promise((r) => setTimeout(r, 0)); return takeOne(h, max); };
+  return net;
+}
+
+/** runInline(), opened up enough to give the session an interrupt source. */
+async function runInterruptible(net) {
+  const module = await compileWasm();
+  let stdout = '';
+  const shim = new WasiShim({
+    // Through the SHELL, not as the entry applet. The interrupt machinery is
+    // installed by run_nofork_applet (build/applet-interrupt.patch) and
+    // deliberately not at the shell itself — outside an applet there is no
+    // die_func to longjmp to. A `busybox wget ...` invocation never enters that
+    // path at all, so it is uninterruptible by construction and would prove
+    // nothing about the doors.
+    args: ['busybox', 'ash', '-c', 'wget -q -O - http://example.test/thing'],
+    env: mergeEnv({}),
+    stdout: (b) => { stdout += dec.decode(b); },
+    stderr: () => {},
+    // A fixed stdin that also carries a ^C count, which is the one thing
+    // run()'s cannot: with no `interruptCount` the applet's safe points read a
+    // constant and nothing is ever cancellable.
+    input: { ...fixedInput(''), interruptCount: () => net.state.interrupts },
+    net,
+    suspendable: true,
+  });
+  const instance = await WebAssembly.instantiate(module, shim.imports());
+  shim.bindMemory(instance.exports.memory);
+  let exitCode = 0;
+  try { await WebAssembly.promising(instance.exports._start)(); }
+  catch (e) { if (e instanceof WasiExit) exitCode = e.code; else throw e; }
+  return { exitCode, stdout, delivered: net.state.delivered };
+}
+
+for (const [door, awaited] of [['parked', false], ['awaited', true]]) {
+  test(`a ^C mid-download stops it, on the ${door} door`, e2e, async () => {
+    // Both doors, and the answer has to be the same. The interrupt is
+    // cooperative and entirely guest-side — busybox checks a monotonic count at
+    // its own I/O safe points, which sit BEFORE each read — so what decides
+    // whether a download can be stopped is that reads RETURN, chunk by chunk,
+    // not which thread was waiting for them. Suspending the guest does not make
+    // this better and parking it did not make it worse.
+    const r = await runInterruptible(chunkedNet({ chunks: 40, interruptAfter: 3, awaited }));
+    assert.equal(r.exitCode, 130, `expected 128+SIGINT, got ${r.exitCode}`);
+    assert.ok(r.delivered < 40, `it stopped early: ${r.delivered} of 40 chunks`);
+  });
+}
+
+test('and an uninterrupted download of the same shape finishes', e2e, async () => {
+  // The control. Without it, a wget that failed for any other reason would
+  // read as a successful interrupt.
+  const r = await runInterruptible(chunkedNet({ chunks: 40, interruptAfter: 0, awaited: true }));
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.delivered, 40);
+  assert.equal(r.stdout.length, 40 * 64);
+});
