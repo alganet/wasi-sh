@@ -759,6 +759,15 @@ export class WasiShim {
         if (f.type === 'sock' && w.suspendNet && !f.nonblock) {
           if (f.sock === null) return readSync(fd, iovs, n, out);
           const max = w.iovecs(iovs, n).reduce((a, b) => a + b.length, 0);
+          // Unconditionally, unlike the stdin path below, which can see for
+          // itself whether it is about to wait. Here it cannot be known without
+          // asking the net — and asking through the SYNCHRONOUS read would send
+          // the request down the parked door, which is the thing being avoided.
+          //
+          // It costs nothing worth having. A download to a file writes no
+          // stdout, so there is nothing to flush; a `wget -O -` writes some
+          // between reads, and flushing it per chunk is progressive output
+          // rather than a batch at the end.
           if(w.beforeBlock) w.beforeBlock();
           let data;
           try { data = await w.net.recvAsync(f.sock, max); }
