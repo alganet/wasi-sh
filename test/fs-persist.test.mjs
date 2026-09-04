@@ -289,12 +289,13 @@ if (!zenfs) {
   });
 
   // Same claim fs-zenfs.test.mjs makes about InMemory, one layer out: the
-  // deviations are the backend's, and preparing it adds none.
+  // deviations are the backend's, and preparing it adds none. The sync cache
+  // under this backing IS an InMemory, so it is the same three, for the same
+  // reason, and that file carries the argument.
   const KNOWN_DEVIATIONS = new Map([
-    ['touchSync truncates, both shorter and longer', 'upstream: the cache truncate is metadata-only (@zenfs/core 2.6.3)'],
-    ['directories refuse file operations', 'upstream: writes bytes into the directory index (@zenfs/core 2.6.3)'],
-    ['readdirSync lists entry names, and a file is not a directory', 'upstream: readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.6.3)'],
-    ['touchSync changes permission bits and leaves the type alone', 'upstream: touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.6.3)'],
+    ['directories refuse file operations', 'upstream: writeSync to a directory overwrites its index (@zenfs/core 2.6.4)'],
+    ['readdirSync lists entry names, and a file is not a directory', 'upstream: readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.6.4)'],
+    ['touchSync changes permission bits and leaves the type alone', 'upstream: touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.6.4)'],
   ]);
   const { make } = makeBacking(zenfs);
   const prepared = await persistentFs(await make());

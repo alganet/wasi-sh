@@ -19,35 +19,29 @@ try {
   if (err?.code !== 'ERR_MODULE_NOT_FOUND') throw err;
 }
 
-// Known deviations in the backend, not gaps in the contract — recorded as
-// todo so they stay visible and re-check themselves on every upgrade, without
-// turning a third-party bug into our red build.
+// Three cases are recorded as `todo` rather than run for a verdict: they are
+// the backend's deviations, not gaps in the contract, so they stay visible and
+// re-check themselves on every upgrade without turning a third-party bug into
+// our red build.
 //
-// All four are in @zenfs/core 2.6.3's InMemory backend, and all four are
-// upstreamable:
+// All three are `StoreFS` not reading the type of the inode it just resolved —
+// a `readdir` of a file parses the file as a listing, a `write` to a directory
+// overwrites that listing, and `touchSync({mode})` clears S_IFREG. They are
+// **not filed upstream and deliberately so.** ZenFS's supported surface is the
+// `fs` API, the VFS refuses all three before a backend ever sees them, and
+// `FileSystem` is documented `@internal` for people extending it rather than
+// calling it. A caller holding a backend directly — this one — is outside what
+// upstream promises, and nothing that reaches this shell can arrive here
+// anyway: `path_open` reads the type before a write, and `fd_readdir` before a
+// listing. So the deviation is real, ours to know about, and no one's bug.
 //
-//   truncate — shrinking is metadata-only. 'abcdefgh' truncated to 3 and back
-//   to 5 reads 'abcde', where POSIX ftruncate discards the extra data and
-//   zero-fills the extension. Ours must zero-fill: O_TRUNC followed by a short
-//   write goes straight through it, so a store that does not would show the
-//   guest bytes it believes it deleted.
-//
-//   directory writes — writeSync against a directory path is accepted and
-//   overwrites the directory's own serialized index, so `echo hi > /dir`
-//   destroys the directory rather than failing with EISDIR.
-//
-//   readdir of a file — throws a SyntaxError from parsing the file as an
-//   index, with no .code or .errno for the shim to translate.
-//
-//   chmod — touchSync({mode}) replaces the whole mode rather than only the
-//   permission bits, so a chmod clears S_IFREG and leaves a node that is
-//   neither a file nor a directory. Nothing in the shell chmods today (there
-//   is no chmod applet), but a second guest over the same store does.
+// The fourth, `touchSync` truncating the data as well as the size, WAS filed
+// and is fixed: `StoreFS` owns its data nodes, so a caller of `fs.truncateSync`
+// hits it and it is upstream's to answer.
 const KNOWN_DEVIATIONS = new Map([
-  ['touchSync truncates, both shorter and longer', 'upstream: InMemory truncate is metadata-only (@zenfs/core 2.6.3)'],
-  ['directories refuse file operations', 'upstream: InMemory writes bytes into the directory index (@zenfs/core 2.6.3)'],
-  ['readdirSync lists entry names, and a file is not a directory', 'upstream: InMemory readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.6.3)'],
-  ['touchSync changes permission bits and leaves the type alone', 'upstream: InMemory touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.6.3)'],
+  ['directories refuse file operations', 'upstream: InMemory writeSync to a directory overwrites its index (@zenfs/core 2.6.4)'],
+  ['readdirSync lists entry names, and a file is not a directory', 'upstream: InMemory readdir of a file throws SyntaxError, not ENOTDIR (@zenfs/core 2.6.4)'],
+  ['touchSync changes permission bits and leaves the type alone', 'upstream: InMemory touchSync replaces the whole mode, clearing S_IFREG (@zenfs/core 2.6.4)'],
 ]);
 
 if (!zenfs) {
