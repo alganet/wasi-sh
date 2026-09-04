@@ -351,6 +351,30 @@ fi
 #   write alone leaves everything that printf()s uninterruptible. Wrapped at
 #   libc so no applet needs an edit; see wasistubs.c's bb_intr_check().
 #
+# --stack-first -z stack-size: the shadow stack, moved to the bottom of linear
+#   memory and given room to be a SHELL's stack.
+#
+#   wasm-ld's default puts the stack directly ABOVE the data segments and grows
+#   it DOWN into them, with no guard page — so an overflow does not fault, it
+#   quietly rewrites globals. That is what it did. The default 64 KB was enough
+#   for every script this build had been asked to run and about 30 KB short of
+#   tuish's website hosting one of its own examples, and the symptom was never
+#   a stack message: ash's own variable table came back with an empty name
+#   (`eval: : bad variable name`), or wasi-libc's preopen table did, and open()
+#   trapped somewhere far away. Bisecting reached a commit that only added a
+#   `struct termios` to .bss — 60 bytes of layout, not a defect, which is the
+#   signature of this kind of bug.
+#
+#   --stack-first puts the stack at [0, size) instead, so an overflow runs off
+#   the bottom of memory and TRAPS. Rebuilding the same failure with it turned
+#   an unexplained corruption into an immediate fault at the overflow itself.
+#
+#   1 MB, against a measured peak between 64 KB and 96 KB for that page. The
+#   margin is not padding: recursion here is unbounded by design — shell
+#   functions, `eval`, the fork-free command substitution that runs a subshell
+#   on this same stack, and nested shells up to ASH_NEST_MAX. It costs 16 pages
+#   of linear memory reserved at instantiation and nothing in the file.
+#
 # --strip-debug: DWARF dominated this binary — about 1.05 MB of a 1.55 MB
 #   module, two thirds of what every browser had to download, for debug info
 #   describing busybox internals that no consumer of this package steps
@@ -358,7 +382,8 @@ fi
 #   script. The `name` section is deliberately kept (~15 KB): it costs little
 #   and keeps wasm stack traces readable. Build with --debug to keep DWARF.
 OUT="$work/busybox.wasm"
-$WASM_LD --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
+$WASM_LD --stack-first -z stack-size=1048576 \
+  --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
   --wrap raise --wrap read --wrap write --wrap readv --wrap writev \
   --wrap __wasilibc_fd_renumber \
   $([ "$DEBUG" = yes ] || echo --strip-debug) \

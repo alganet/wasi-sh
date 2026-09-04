@@ -795,3 +795,22 @@ test('and jobs/fg/bg really are gone, as the docs say', async () => {
   const r = await sh('for c in jobs fg bg; do command -v "$c" || echo "no $c"; done\n');
   assert.equal(r.stdout, 'no jobs\nno fg\nno bg\n');
 });
+
+// ─── the shadow stack ────────────────────────────────────────────────────────
+// wasm-ld's default puts the stack directly above the data segments and grows
+// it DOWN into them, with no guard page: an overflow does not fault, it
+// rewrites globals. At the default 64 KB this shell overflowed at a recursion
+// depth of about SIXTY, and never said so — the pre-fix binary answers depth 60
+// correctly, corrupts something on the way, and HANGS at 80. What it broke
+// elsewhere was ash's own variable table (`eval: : bad variable name`) and
+// wasi-libc's preopen table (a trap inside open(), far from the cause).
+//
+// build/build.sh now links with --stack-first and a 1 MB stack, so the stack
+// sits at the bottom of memory and an overflow traps at the overflow. This
+// asserts the room; --stack-first is what makes any future shortfall loud.
+test('a shell function may recurse deeper than the default wasm stack', async () => {
+  const r = await sh('f () { test $1 -le 0 && { echo bottom; return 0; }; f $(( $1 - 1 )); }\nf 200\necho ok\n');
+  assert.equal(r.stdout, 'bottom\nok\n');
+  assert.equal(r.stderr, '');
+  assert.equal(r.exitCode, 0);
+});
