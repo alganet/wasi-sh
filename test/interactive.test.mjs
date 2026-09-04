@@ -529,6 +529,38 @@ test('^C leaves 130 behind, the way an interrupted command does', async () => {
   writer.end();
 });
 
+test('a resize does not eat the keystroke after it', async () => {
+  // poll() leaves errno alone when it SUCCEEDS, so whatever was in there
+  // stands — and after a resize that is EINTR, left by the poll the resize
+  // interrupted. libbb's lineedit_read_key checks errno after a successful
+  // read_key and treats EINTR as "that was not a key, read another", so the
+  // key was read cleanly and thrown away.
+  //
+  // Measured before the fix: EVERY resize ate the keystroke that followed it,
+  // and a page that resizes while laying itself out ate the first key of the
+  // session. See the errno line in __wrap_poll (build/shim/wasistubs.c).
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('ab'));
+  await settle();
+  assert.match(screen(live()), /# ab$/, 'both keys, with no resize in play');
+
+  writer.resize(100, 30);
+  await settle();
+  writer.write(enc.encode('cd'));
+  await settle();
+  assert.match(screen(live()), /# abcd$/, 'and both again, across a resize');
+
+  // Twice, because the first one is the one a page pays at startup and the
+  // second is the one somebody pays for dragging a splitter.
+  writer.resize(70, 20);
+  await settle();
+  writer.write(enc.encode('ef'));
+  await settle();
+  assert.match(screen(live()), /# abcdef$/);
+  writer.end();
+});
+
 test('without a tty none of that happens, and that is the default', async () => {
   // The compatibility guarantee: an embedder that edits lines in the page (both
   // of ours do) must not suddenly get a second echo of every line from the
