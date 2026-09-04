@@ -1102,6 +1102,22 @@ wraps it in a `FILE*` and never calls `send`/`recv` — so a socket is an
 ordinary fd in the shim's table, and redirection, `poll` and `close` all work
 on it without knowing what it is.
 
+A seventh is optional, and worth having:
+
+```js
+  async recvAsync(handle, max) { … },   // → the same answer, once there is one
+```
+
+Where the engine has JSPI and the session is `suspendable`, a socket read that
+would have to wait suspends the guest instead of holding the thread. A download
+is the longest wait a shell here can have, and the thread it holds is the thread
+everything else in that worker is answered on — an editor's file reads, a
+preview frame's requests, the page's own messages. Parked, they all wait for it.
+
+Nothing is configured: the shim looks for the method, and its **absence** is
+what keeps the synchronous read. The same session works on an engine without
+JSPI, and `ready({ suspendNet })` reports what was actually granted.
+
 In a browser the net goes in the **worker module**, beside the other live
 objects, because that is the only place one can be given at all — a port is
 methods, and `postMessage` structured-clones them away:

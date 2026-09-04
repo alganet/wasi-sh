@@ -181,6 +181,23 @@ test('without a net, a socket cannot be made at all', () => {
   assert.equal(t.env.__host_sock_resolve(0x100, 0x300), -1);
 });
 
+// ─── the awaited door ────────────────────────────────────────────────────────
+
+test('a socket read suspends only where both halves say it can', () => {
+  // Feature-detected from the port rather than asked for: an embedder is handed
+  // a net and cannot know whether it has an awaited door. Both halves are
+  // required — an engine that can suspend, and a net with something to await —
+  // and the ABSENCE of either is what keeps today's synchronous read.
+  const plain = recordingNet();
+  const awaited = { ...recordingNet(), recvAsync: async () => null };
+
+  assert.equal(new WasiShim({ net: awaited }).suspendNet, false,
+    'a session not entered through WebAssembly.promising cannot suspend at all');
+  assert.equal(new WasiShim({ net: plain, suspendable: true }).suspendNet, false,
+    'and a net with nothing to await has nothing to suspend on');
+  assert.equal(new WasiShim({ net: awaited, suspendable: true }).suspendNet, true);
+});
+
 // ─── end to end: the real applet, over a net that answers from memory ────────
 
 import { run } from '../src/run.mjs';
@@ -300,4 +317,85 @@ test("wget reports the server's error as its own", e2e, async () => {
 test('without a net, wget fails rather than hanging', e2e, async () => {
   const r = await run({ inline: true, args: ['wget', '-q', '-O', '-', 'http://example.test/thing'] });
   assert.notEqual(r.exitCode, 0);
+});
+
+// ─── the awaited door, end to end ────────────────────────────────────────────
+
+/**
+ * The same canned net, with an awaited door that really does yield.
+ *
+ * `recvAsync` waits a macrotask before answering, which is the honest shape: a
+ * real one is waiting on `fetch`, and what the shim has to get right is that
+ * the thread is GIVEN BACK in the meantime rather than held.
+ */
+function awaitedNet(respond) {
+  const net = cannedNet(respond);
+  net.recvAsync = async (h, max) => {
+    await new Promise((r) => setTimeout(r, 0));
+    return net.recv(h, max);
+  };
+  return net;
+}
+
+test('wget fetches through the awaited door too', e2e, async () => {
+  const net = awaitedNet(() => httpOk('hello from a suspended read'));
+  const r = await run({
+    inline: true, net, suspendable: true,
+    args: ['wget', '-q', '-O', '-', 'http://example.test/thing'],
+  });
+  assert.equal(r.exitCode, 0, r.stderr);
+  assert.equal(r.stdout, 'hello from a suspended read');
+});
+
+test('and the thread it used to own keeps turning while it does', e2e, async () => {
+  // The whole point, and the only assertion that can show it. A guest parked on
+  // a socket owns its worker outright: the event loop under it stops, so an
+  // editor's file read, a preview frame's request and the page's own messages
+  // all wait for the download to finish. Suspended, they do not.
+  //
+  // Asked of the loop itself rather than of a clock. A macrotask is queued when
+  // the request goes out and the answer is taken when the guest closes the
+  // socket — still inside the run — so this is "did anything else get to run
+  // between the two", which has one right answer per door and does not depend
+  // on how busy the machine is.
+  const observed = (awaited) => {
+    const net = awaited
+      ? awaitedNet(() => httpOk('body'))
+      : cannedNet(() => httpOk('body'));
+    let ran = false;
+    const send = net.send.bind(net);
+    const close = net.close.bind(net);
+    net.send = (h, b) => { setTimeout(() => { ran = true; }, 0); return send(h, b); };
+    net.close = (h) => { net.ranBeforeClose = ran; return close(h); };
+    return net;
+  };
+
+  const parked = observed(false);
+  const r1 = await run({
+    inline: true, net: parked, suspendable: true,
+    args: ['wget', '-q', '-O', '-', 'http://example.test/thing'],
+  });
+  assert.equal(r1.exitCode, 0, r1.stderr);
+  assert.equal(parked.ranBeforeClose, false,
+    'a parked read holds the thread: nothing else can have run');
+
+  const suspended = observed(true);
+  const r2 = await run({
+    inline: true, net: suspended, suspendable: true,
+    args: ['wget', '-q', '-O', '-', 'http://example.test/thing'],
+  });
+  assert.equal(r2.exitCode, 0, r2.stderr);
+  assert.equal(suspended.ranBeforeClose, true,
+    'an awaited read hands the thread back, and the queue behind it drains');
+});
+
+test('a non-blocking socket is still non-blocking', e2e, async () => {
+  // An fd that asked not to wait must not be made to wait by the door being
+  // open. The suspending twin hands those straight to the synchronous read,
+  // EAGAIN and all — otherwise O_NONBLOCK would mean its opposite whenever the
+  // engine happened to have JSPI.
+  const t = makeShim({ ...recordingNet(), recvAsync: async () => { throw new Error('must not be reached'); } });
+  const fd = t.env.__host_sock_open();
+  t.env.__host_sock_connect(fd, 0x0100007f, 80);
+  assert.equal(readFd(t, fd).errno, 6, 'EAGAIN');
 });

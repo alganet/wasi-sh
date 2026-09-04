@@ -242,6 +242,10 @@ self.addEventListener('message', async (e) => {
           // What the engine actually granted, rather than what was asked for.
           suspendable: shim.suspendable,
           suspendInput: shim.suspendInput,
+          // Whether a socket read suspends rather than owning the thread. Not
+          // asked for — it is read off the net's own shape — so this is the
+          // only place an embedder can find out that it got it.
+          suspendNet: shim.suspendNet,
         });
       } catch (ex) {
         throw new Error(`serve({ ready }): failed: ${(ex && ex.message) || ex}`);

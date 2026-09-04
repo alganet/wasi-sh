@@ -51,7 +51,15 @@
 //   resolve(name) -> dotted quad | null
 //   connect(addr, port) -> handle        (throwing refuses it)
 //   send/recv/poll/close(handle, ...)
+//   recvAsync?(handle, max) -> Promise   optional; see below
 // Absent, socket() is EAFNOSUPPORT and nothing else changes.
+//
+// `recvAsync` is the same answer `recv` gives, once there is one to give. Where
+// the engine has JSPI and the net offers it, a guest reading a socket suspends
+// instead of owning the thread for the length of a download — which is the same
+// trade `suspendInput` makes for a keystroke, and matters for the same reason:
+// the thread a guest holds is the thread everything else in that worker is
+// answered on. A net without it is read synchronously, as it always was.
 //
 // The `host` port is the fourth seam, and the one aimed outward — at the
 // browser rather than at the shell. One capability object, one virtual device,
@@ -216,6 +224,16 @@ export class WasiShim {
     // suspending branch in one place and block in the other.
     this.suspendInput = !!suspendInput && this.suspendable
       && !!(input && input.readBlockingAsync && input.pollReadableAsync);
+    // The same trade, on the other blocking descriptor there is. Not gated on
+    // `suspendInput`: the two are independent — a session may have a net that
+    // can be awaited and an input that cannot — and both are feature-detected
+    // off the port rather than asked for, because an embedder cannot know
+    // whether the net it was handed has an awaited door.
+    //
+    // A socket read is the longer of the two waits by far. A keystroke arrives
+    // when someone presses a key; a download takes as long as the network says,
+    // and for the whole of it a parked guest answers nothing.
+    this.suspendNet = this.suspendable && !!(net && typeof net.recvAsync === 'function');
     // Set only for the length of the delegated call inside that wrapper; read
     // by poll_oneoff, which must not park a second time on a wait already
     // spent. Declared here so the field exists before anything reads it.
@@ -708,14 +726,51 @@ export class WasiShim {
     // Memory views are re-fetched AFTER the await (dv()/bytes() do that on
     // every call): a suspension is an arbitrary amount of other people's code,
     // and wasm memory can grow underneath it.
-    if (w.suspendInput) {
-      // Captured BEFORE the swap: everything that is not a parked stdin read
-      // still goes through the synchronous one, and reaching for `p1.fd_read`
-      // after the assignment below would be the wrapper calling itself.
+    if (w.suspendInput || w.suspendNet) {
+      // Captured BEFORE the swap: everything that is not a parked read still
+      // goes through the synchronous one, and reaching for `p1.fd_read` after
+      // the assignment below would be the wrapper calling itself.
       const readSync = p1.fd_read;
+      /**
+       * Scatter what the await produced into the guest's buffers.
+       *
+       * The iovecs are re-read here rather than reused from before the await.
+       * A suspension is an arbitrary amount of other people's code and wasm
+       * memory can grow underneath it, which detaches every view taken earlier
+       * — writing through one of those writes into a buffer nobody owns.
+       */
+      const scatter = (iovs, n, out, data) => {
+        const bufs = w.iovecs(iovs, n);
+        let o = 0;
+        for (const b of bufs) { const take = Math.min(b.length, data.length - o); b.set(data.subarray(o, o + take)); o += take; if (o >= data.length) break; }
+        w.dv().setUint32(out, o, true);
+        return o;
+      };
       const readSuspending = async (fd, iovs, n, out) => {
         const f = w.fds.get(fd); if (!f) return E.BADF;
-        if (f.type !== 'stdin' || f.nonblock) return readSync(fd, iovs, n, out);
+        // A socket read is the longer wait of the two and the one that used to
+        // hold the thread outright: `recv` answers from a connection table
+        // whose backend parks, so a download owned this worker for its whole
+        // length. Awaited, the thread goes back to its queue between chunks and
+        // everything else it serves keeps being served.
+        //
+        // Non-blocking is still non-blocking: an fd that asked not to wait gets
+        // the synchronous answer, EAGAIN and all.
+        if (f.type === 'sock' && w.suspendNet && !f.nonblock) {
+          if (f.sock === null) return readSync(fd, iovs, n, out);
+          const max = w.iovecs(iovs, n).reduce((a, b) => a + b.length, 0);
+          if(w.beforeBlock) w.beforeBlock();
+          let data;
+          try { data = await w.net.recvAsync(f.sock, max); }
+          catch (e) { return wasiErrno(e); }
+          // `null` is the net's "nothing yet" and it survives the await: the
+          // guest has not finished writing its request, which no amount of
+          // waiting on this end will change.
+          if (data === null) { w.dv().setUint32(out, 0, true); return E.AGAIN; }
+          scatter(iovs, n, out, data);
+          return 0;
+        }
+        if (f.type !== 'stdin' || f.nonblock || !w.suspendInput) return readSync(fd, iovs, n, out);
         const bufs = w.iovecs(iovs, n);
         const max = bufs.reduce((a, b) => a + b.length, 0);
         let data = w.input ? w.input.read(max) : EMPTY;
@@ -723,10 +778,7 @@ export class WasiShim {
           if(w.beforeBlock) w.beforeBlock();
         data = await w.input.readBlockingAsync(max);
         }
-        const outBufs = w.iovecs(iovs, n);
-        let o = 0;
-        for (const b of outBufs) { const take = Math.min(b.length, data.length - o); b.set(data.subarray(o, o + take)); o += take; if (o >= data.length) break; }
-        w.dv().setUint32(out, o, true);
+        scatter(iovs, n, out, data);
         return data.length === 0 ? ((w.input && w.input.closed && w.input.closed()) ? 0 : E.AGAIN) : 0;
       };
       p1.fd_read = new WebAssembly.Suspending(readSuspending);
@@ -740,6 +792,10 @@ export class WasiShim {
       // synchronous implementation, which now finds the data ready and parks on
       // nothing. One await, no second copy of the WASI event encoding.
       const pollSync = p1.poll_oneoff;
+      // Stdin only, deliberately. A socket subscription needs no wait lifted
+      // out of here: poll() reports a queued request as readable — the bytes
+      // are not here, but asking for them is this side's work — so the guest
+      // goes straight to the read, and the read is where the await belongs.
       const pollSuspending = async (subs, events, nsubs, out) => {
         let timeoutMs = null, wantsStdin = false, others = false;
         for (let i = 0; i < nsubs; i++) {
@@ -766,7 +822,7 @@ export class WasiShim {
         }
         return pollSync(subs, events, nsubs, out);
       };
-      p1.poll_oneoff = new WebAssembly.Suspending(pollSuspending);
+      if (w.suspendInput) p1.poll_oneoff = new WebAssembly.Suspending(pollSuspending);
     }
     return {
       wasi_snapshot_preview1: p1,

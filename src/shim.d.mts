@@ -390,6 +390,17 @@ export interface NetPort {
   send(handle: unknown, bytes: Uint8Array): number;
   /** Bytes; empty for EOF, null for "nothing yet". */
   recv(handle: unknown, max: number): Uint8Array | null;
+  /**
+   * The same answer, once there is one to give.
+   *
+   * Optional, and its ABSENCE is the signal: a net that offers it is read
+   * through a suspending import where the engine has JSPI, so a guest waiting
+   * on a download hands the thread back instead of owning it for the length of
+   * the transfer. A net without it is read synchronously, as before. Nothing
+   * has to be configured either way — see `WasiShimOptions.suspendable`, which
+   * is what decides whether the engine can suspend at all.
+   */
+  recvAsync?(handle: unknown, max: number): Promise<Uint8Array | null>;
   poll(handle: unknown): { readable: boolean; writable: boolean; hup?: boolean };
   close(handle: unknown): void;
 }
