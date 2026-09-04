@@ -158,6 +158,22 @@ export class RingWriter {
     Atomics.notify(this.ctrl, IDX_SEQ);
   }
 
+  // Wake a parked consumer without changing anything it can read.
+  //
+  // Every other producer call wakes as a consequence of saying something —
+  // bytes, EOF, a resize, a signal. This one says nothing at all, and it exists
+  // because the seq word is the ONLY futex a parked guest is waiting on: a
+  // second channel the same thread serves (see RingReader.toInput's
+  // `whileBlocked`) has no way to end that wait for itself. So the producer
+  // that filled the other channel bumps this one, and the park re-checks
+  // everything it was told to check.
+  //
+  // It cannot invent readable bytes, so a consumer woken by it finds exactly
+  // what it found before — which is what makes it safe to call at any time.
+  wake() {
+    this._wake();
+  }
+
   // Append bytes and wake the consumer. Returns the byte count written.
   write(bytes) {
     if (this.ended) throw new Error(`${this.channel} ring already ended`);
@@ -409,9 +425,56 @@ export class RingReader {
     return this.read(max);
   }
 
+  /**
+   * Park on this ring with somebody else's work inside the wait.
+   *
+   * The synchronous park owns the thread — that is what it is for, and it is
+   * why a guest waiting for a keystroke cannot be asked anything by its own
+   * worker. `whileBlocked` is the exception, and it is a narrow one: the
+   * embedder says WHEN it has work (`pending()`) and does it (`run()`), and
+   * both are called on this thread with the guest's stack standing below.
+   *
+   * The order is the whole correctness argument, and it is `_waitFor`'s:
+   *
+   *   1. run(), so nothing that arrived before the park sits through it;
+   *   2. check the guest's own condition — bytes, EOF, a resize — and return
+   *      if it is met, because that is what the caller asked about;
+   *   3. park on seq for cond() OR pending(), which loads seq BEFORE either is
+   *      read, so an arrival between the check and the wait bumps the word the
+   *      wait is watching and returns immediately instead of being missed;
+   *   4. woken by neither — a spurious wake, a keystroke that lost a race —
+   *      round again, on a fresh seq.
+   *
+   * **`run()` must consume what `pending()` reports.** A hook that leaves it
+   * pending turns step 3 into a wait that returns at once, for ever: the park
+   * becomes a spin, at full CPU, under an idle prompt. Nothing here can check
+   * that for the embedder — pending() is theirs to answer — so it is said here
+   * instead.
+   *
+   * A timeout is honoured across the whole loop rather than restarted per
+   * park, so work done in the middle does not extend the wait it interrupted.
+   */
+  _park(whileBlocked, cond, ms) {
+    const deadline = ms == null ? null : Date.now() + ms;
+    for (;;) {
+      whileBlocked.run();
+      if (cond()) return true;
+      const left = deadline == null ? null : deadline - Date.now();
+      if (left != null && left <= 0) return false;
+      this._waitFor(() => cond() || whileBlocked.pending(), left);
+      if (deadline != null && Date.now() >= deadline) { whileBlocked.run(); return cond(); }
+    }
+  }
+
   // The WasiShim `input` contract, bound to this reader.
-  toInput() {
-    return {
+  //
+  // `whileBlocked` wraps the three SYNCHRONOUS waits and nothing else. The
+  // suspending twins beside them are untouched on purpose: a suspended guest
+  // has already handed the thread back, so its worker's event loop turns and
+  // an ordinary message is the way in. This hook is for the engine where that
+  // is not true. See `_park`.
+  toInput({ whileBlocked = null } = {}) {
+    const input = {
       pollReadable: (ms) => this.pollReadable(ms),
       read: (max) => this.read(max),
       readBlocking: (max) => this.readBlocking(max),
@@ -424,6 +487,32 @@ export class RingReader {
       takeWinch: () => this.takeWinch(),
       interruptCount: () => this.interruptCount(),
       signalBuffer: () => this.signalBuffer(),
+    };
+    if (!whileBlocked) return input;
+    return {
+      ...input,
+      // The prompt: an untimed poll parks here for as long as nobody types.
+      pollReadable: (ms) => {
+        if (ms === 0) { whileBlocked.run(); return this.readable; }
+        this._park(whileBlocked, () => this.readable || this.closed || this.winchPending(), ms);
+        return this.readable;
+      },
+      // And the read behind it, which parks on bytes alone — a resize does not
+      // end a read, so neither does anything here.
+      readBlocking: (max) => {
+        this._park(whileBlocked, () => this.readable || this.ended, null);
+        return this.read(max);
+      },
+      // A bare timeout: `sleep 1` with nothing subscribed. It ends early on
+      // everything it ended early on before — a keystroke, EOF, a resize, a ^C
+      // — and on a host request it does NOT, because a request that shortened
+      // a sleep would be a page turning the guest's clock.
+      wait: (ms) => {
+        const intr = this.interruptCount();
+        this._park(whileBlocked,
+          () => this.readable || this.closed || this.winchPending() || this.interruptCount() !== intr,
+          ms);
+      },
     };
   }
 

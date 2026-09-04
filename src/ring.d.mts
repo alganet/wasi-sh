@@ -45,6 +45,13 @@ export class RingWriter {
   write(bytes: Uint8Array): number;
   /** Signal stdin EOF: the consumer drains, then reads EOF. */
   end(): void;
+  /**
+   * Wake a parked consumer without changing anything it can read. The seq word
+   * is the only futex a parked guest waits on, so a second channel the same
+   * thread serves has no other way to end that wait — see
+   * `RingReader.toInput({ whileBlocked })`.
+   */
+  wake(): void;
   /** Post a terminal resize: store geometry, raise pending-winch, and wake. */
   resize(cols: number, rows: number): void;
   /**
@@ -106,5 +113,15 @@ export class RingReader {
   takeWinch(): boolean;
   interruptCount(): number;
   signalBuffer(): Uint8Array;
-  toInput(): RingInput;
+  /**
+   * The `input` contract, bound to this reader.
+   *
+   * `whileBlocked` puts the embedder's own work inside the three SYNCHRONOUS
+   * waits — the untimed poll at a prompt, the read behind it, and a bare
+   * timeout. `pending()` is re-checked under the seq protocol, so nothing that
+   * arrives between the check and the park is missed, and `run()` must consume
+   * what it reports or the park spins. The suspending twins are untouched: a
+   * suspended guest has already handed the thread back.
+   */
+  toInput(options?: { whileBlocked?: { pending(): boolean; run(): void } | null }): RingInput;
 }

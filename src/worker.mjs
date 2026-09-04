@@ -6,7 +6,8 @@
 //   default   run()/spawn() point a plain `new Worker(...)` at this module and
 //             get a shell with no host builtins.
 //   serve()   a CUSTOM worker module imports it to register host builtins, a
-//             filesystem, the host port or a net. Handlers are FUNCTIONS and
+//             filesystem, the host port, a net, or work to do at the guest's
+//             blocking points (`whileBlocked`). Handlers are FUNCTIONS and
 //             postMessage structured-clones its payload, so registering them
 //             HERE, inside the worker, is the only way `builtins`, `fs`,
 //             `host` and `net` can reach a browser session. Point run()/spawn()
@@ -77,6 +78,30 @@ export function serve(options = {}) {
   config = options;
 }
 
+/**
+ * serve({ whileBlocked }), checked before it is silently useless.
+ *
+ * The hook is a pair — `pending()` says there is work, `run()` does it — and
+ * half a pair is not a smaller version of it: a `pending` with no `run` parks
+ * on a condition nothing clears, and a `run` with no `pending` is never woken
+ * to be called. Either would look exactly like a worker whose second channel
+ * has gone quiet, which is the failure this refuses to hand out.
+ *
+ * Only the SAB path takes it. run()'s stdin is a fixed buffer that never
+ * parks, so a hook there would be asked at no blocking point at all.
+ */
+function resolveWhileBlocked(hook) {
+  if (!hook) return null;
+  if (typeof hook.pending !== 'function' || typeof hook.run !== 'function') {
+    throw new Error(
+      'serve({ whileBlocked }) must be { pending(): boolean, run(): void }: pending() says '
+      + 'whether there is work waiting — it is what ends the guest\'s park — and run() does it. '
+      + 'run() must consume everything pending() reports, or the park spins.'
+    );
+  }
+  return hook;
+}
+
 self.addEventListener('message', async (e) => {
   if (!isStartup(e.data)) return;   // not ours — the module's own listener has it
   // One worker, one guest. A second startup message would build a second shim
@@ -95,7 +120,9 @@ self.addEventListener('message', async (e) => {
   started = true;
   const { module, wasmBytes, files, args, env, sab, reqSab, stdin, requests, tty, suspendInput } = e.data;
   try {
-    const input = sab ? new RingReader(sab).toInput() : fixedInput(stdin);
+    const input = sab
+      ? new RingReader(sab).toInput({ whileBlocked: resolveWhileBlocked(config.whileBlocked) })
+      : fixedInput(stdin);
     // Builtin setup and wasm compilation are independent; overlapping them
     // hides an interpreter-sized init behind the compile.
     const [builtins, host, net, compiled] = await Promise.all([

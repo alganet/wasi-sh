@@ -11,6 +11,8 @@
 //   session.post(request)     hand the RUNNING guest a host request (opt-in,
 //                             via requestBufferSize; read at /dev/hostreq)
 //   session.endRequests()     no more of them: the guest's loop ends
+//   session.wake()            end the guest's park so the WORKER can do work of
+//                             its own — see serve({ whileBlocked })
 // plus lifecycle: onExit/onError subscriptions and the `exited` promise.
 // A terminal is anything that feeds write() and renders onOutput — geometry
 // is just env: { COLUMNS, LINES }, passed by whoever owns the terminal.
@@ -276,6 +278,21 @@ export class Session {
     }
     return this._requests.write(frameRequest(request));
   }
+
+  // Wake the guest's park without giving it anything to read.
+  //
+  // For a worker that serves a SECOND channel of its own — a page's fetches,
+  // an editor's reads — answered on the worker's thread by
+  // serve({ whileBlocked }) rather than by the guest. Such a channel can be
+  // filled from here at any time, and on an engine with no JSPI the guest's
+  // park owns that thread: the work would sit there until somebody typed. The
+  // stdin ring's seq word is the only futex that park is watching, so this
+  // bumps it and the park re-checks everything it was told to check.
+  //
+  // It is not a keystroke and cannot be mistaken for one — nothing about what
+  // the guest can read changes — so a session with no such hook is woken,
+  // finds what it found before, and parks again.
+  wake() { this._ring.wake(); }
 
   // No more requests are coming. The guest's read hits EOF, so
   // `while read -r req <&3; do ...; done` ends and the script carries on —

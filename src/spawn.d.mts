@@ -97,6 +97,14 @@ export class Session {
    */
   endRequests(): void;
   /**
+   * Wake the guest's park without giving it anything to read — for a worker
+   * that answers a second channel with serve({ whileBlocked }). The stdin
+   * ring's seq word is the only futex that park watches, so this is what ends
+   * it; nothing the guest can read changes, so a session with no such hook
+   * simply parks again.
+   */
+  wake(): void;
+  /**
    * Report a terminal resize (cols × rows). Stores live geometry and
    * synthesizes SIGWINCH in the guest, so a `trap ... WINCH` handler runs and
    * `stty size` / ioctl(TIOCGWINSZ) return the new size. Call from the

@@ -59,6 +59,25 @@ export interface ServeOptions {
    * EAFNOSUPPORT and nothing else changes.
    */
   net?: NetPort | (() => NetPort | Promise<NetPort>);
+  /**
+   * Work this worker does at the guest's own blocking points.
+   *
+   * A synchronous park owns the thread — that is what makes `read` behave like
+   * a terminal's — so a worker with a second channel of its own (a page's
+   * fetches, an editor's reads) cannot be asked anything while the guest waits
+   * for a key. With JSPI it does not have to be: the guest suspends and an
+   * ordinary message arrives. Without it, this is the way in.
+   *
+   * `pending()` is the wake condition — it is re-checked under the ring's own
+   * seq protocol, so work that arrives between a check and the park is not
+   * missed — and `run()` does the work, on this thread, with the guest's stack
+   * standing below. **run() must consume everything pending() reports**, or the
+   * park becomes a spin. The producer ends the park by calling
+   * `session.wake()` after filling its channel.
+   *
+   * Interactive sessions only: run()'s stdin never parks.
+   */
+  whileBlocked?: { pending(): boolean; run(): void };
 }
 
 /**
