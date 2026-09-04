@@ -2,18 +2,56 @@
 #ifndef SIGWINCH
 #define SIGWINCH 28
 #endif
+#ifndef SIGINT
+#define SIGINT 2
+#endif
 /* ash installs its signal catcher through sigaction(). We deliver no real
- * signals, but for SIGWINCH we CAPTURE the handler ash registers (its own
- * static signal_handler) so the poll wrapper below can invoke it when the host
- * posts a resize — a synthesized SIGWINCH with no signal layer. SIG_DFL(0) and
- * SIG_IGN(1) mean "no live trap"; store only a real function. */
+ * signals, but we CAPTURE the handlers ash registers (its own static
+ * signal_handler) so the two places that can synthesize one have somebody to
+ * call: the poll wrapper below, when the host posts a resize, and raise()
+ * beneath it. SIG_DFL(0) and SIG_IGN(1) mean "no live trap"; store only a real
+ * function. */
 static void (*winch_handler)(int);
+static void (*int_handler)(int);
 int sigaction(int s, const struct sigaction *a, struct sigaction *o){
-  if (s == SIGWINCH && a) {
+  if (a) {
     void (*h)(int) = a->sa_handler;
-    winch_handler = (h == (void(*)(int))0 || h == (void(*)(int))1) ? 0 : h;
+    void (*live)(int) = (h == (void(*)(int))0 || h == (void(*)(int))1) ? 0 : h;
+    if (s == SIGWINCH) winch_handler = live;
+    else if (s == SIGINT) int_handler = live;
   }
   (void)o; return 0;
+}
+
+/* raise(), which wasi-libc answers by ABORTING.
+ *
+ * That is defensible for a process that cannot handle a signal and indefensible
+ * here, because the caller is usually the shell raising a signal at ITSELF and
+ * the "process" is the whole session. Measured before this existed: `^C` at an
+ * interactive prompt ended the shell with a wasm trap and took the terminal,
+ * the filesystem and every warm runtime with it. ash does
+ *
+ *     write(STDOUT_FILENO, "^C\n", 3);
+ *     raise(SIGINT);   // here non-blocked SIGINT will longjmp
+ *
+ * on an abandoned line, and had no way to survive its own answer.
+ *
+ * So: deliver it, the way __wrap_poll delivers a synthesized SIGWINCH. The
+ * handler is ash's own, it is called on ash's own stack from ash's own call,
+ * and for SIGINT it does not come back — it longjmps to the top of the command
+ * loop, which is exactly what the comment above that raise() expects.
+ *
+ * A signal nobody registered a handler for RETURNS instead of ending anything.
+ * Upstream ash already writes for that case — "raise(SIGINT) did not work!
+ * (e.g. if SIGINT is SIG_IGNed on startup, it stays SIG_IGNed)" — and takes the
+ * bash behaviour of a fresh prompt with 130 in $?. Killing the session would be
+ * the only worse answer available. */
+int __wrap_raise(int sig){
+  void (*h)(int) = 0;
+  if (sig == SIGINT) h = int_handler;
+  else if (sig == SIGWINCH) h = winch_handler;
+  if (h) h(sig);
+  return 0;
 }
 /* Signal-mask stubs must NEVER write through their pointers: wasi-libc's
  * sigset_t is `typedef unsigned char` (a 1-byte placeholder), so callers

@@ -490,6 +490,45 @@ test('a nested shell does not take the outer shell prompt with it', async () => 
   writer.end();
 });
 
+test('^C at the prompt abandons the line, and the shell survives it', async () => {
+  // ash answers an abandoned line by raising SIGINT AT ITSELF:
+  //
+  //     write(STDOUT_FILENO, "^C\n", 3);
+  //     raise(SIGINT);   /* here non-blocked SIGINT will longjmp */
+  //
+  // wasi-libc answers raise() by aborting, so for as long as `tty: true` has
+  // existed, one ^C at a prompt ended the session with a wasm trap — the
+  // terminal, the filesystem and every warm runtime with it. wasistubs.c
+  // delivers it to the handler sigaction() captured instead; see --wrap raise.
+  const { writer, live, exited } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('half-typed'));
+  await settle();
+  assert.match(screen(live()), /# half-typed$/);
+  writer.write(enc.encode('\x03'));
+  await settle();
+  assert.match(live(), /half-typed\^C/, 'the line is shown abandoned, as every shell shows it');
+  assert.match(screen(live()), /# $/, 'and a fresh prompt came back');
+  // The claim is survival, so ask the shell to prove it is still there.
+  writer.write(enc.encode('echo alive\r'));
+  await settle();
+  assert.match(live(), /^alive$/m);
+  writer.end();
+  const m = await exited;
+  assert.equal(m.code, 0, 'and it ends when its input does, not when a ^C lands');
+});
+
+test('^C leaves 130 behind, the way an interrupted command does', async () => {
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('\x03'));
+  await settle();
+  writer.write(enc.encode('echo "rc=$?"\r'));
+  await settle();
+  assert.match(live(), /^rc=130$/m, '128 + SIGINT, which is what a script reads as interrupted');
+  writer.end();
+});
+
 test('without a tty none of that happens, and that is the default', async () => {
   // The compatibility guarantee: an embedder that edits lines in the page (both
   // of ours do) must not suddenly get a second echo of every line from the

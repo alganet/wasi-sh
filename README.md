@@ -611,6 +611,13 @@ term.onData((d) => {                                // tty: true
 });
 ```
 
+At the prompt the byte alone does the whole job, and it is safe to send: ash
+shows the abandoned line, comes back with a fresh prompt and leaves 130 in `$?`.
+That is newer than it sounds. ash answers an abandoned line by raising SIGINT at
+ITSELF, and wasi-libc answers `raise()` by aborting — so until this build
+started delivering it to the handler `sigaction()` captured, one `^C` at a
+prompt ended the session with a wasm trap.
+
 **Applets look on your behalf.** A runaway `seq`, `cat`, `grep`, `sort`, `awk`
 or `sed` stops at its next read, write or loop turn and the shell reads 130 in
 `$?`, with its filesystem and every warm instance intact. **Host builtins look
