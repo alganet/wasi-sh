@@ -228,6 +228,22 @@ export interface WasiShimOptions {
   fs?: FileSystem;
   stdout?: (bytes: Uint8Array) => void;
   stderr?: (bytes: Uint8Array) => void;
+  /**
+   * Called immediately before the guest stops writing — every read and poll it
+   * can park in, and every call out to your own code (`builtins`, `host`).
+   *
+   * For a caller that BATCHES what `stdout` and `stderr` hand it: the batch is
+   * finished when the guest stops writing, because the prompt is the last
+   * thing a shell writes before it parks on a keystroke. A timer instead would
+   * leave the terminal blank until one fired.
+   *
+   * The calls out are about ORDER rather than latency. A handler that posts to
+   * the page itself would otherwise have its message overtake output the guest
+   * wrote before calling it.
+   *
+   * Omit it and every write goes through as it happens.
+   */
+  beforeBlock?: () => void;
   input?: ShimInput;
   /**
    * Report fds 0/1/2 as a terminal, i.e. make `isatty()` true on them by

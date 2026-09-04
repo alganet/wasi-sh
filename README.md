@@ -460,6 +460,24 @@ term.onData((d) => session.write(d));            // keyboard → shell
 session.onOutput((b) => term.write(b));          // shell → screen
 ```
 
+`onOutput` is called once per `write()` the guest made, in order, with the
+channel it went to — but a **whole guest turn crosses in one message**, and
+that matters more than it sounds. A redraw is made of fragments: `^L` at a
+prompt is `ESC[H ESC[J`, a carriage return, the prompt, then `ESC[J`. Delivered
+one message at a time, a browser is free to paint between any two of them, and
+the caret is then watched travelling to column 0 and back. Measured in Firefox;
+Chromium happened to coalesce the paints, which is how it hid. So the writes
+are batched until the guest waits — the prompt is the last thing written before
+a shell parks — and your `onOutput` calls all land in one task, with nothing
+able to paint through the middle of a redraw.
+
+Nothing about your handler changes. If you keep your own shim rather than using
+`serve()`, `WasiShim` takes a `beforeBlock` callback for the same purpose — it
+fires wherever the guest stops writing, which is every park and every call out
+to a host builtin or a `/dev/host` verb, so a handler that talks to the page
+itself cannot have its message overtake output the guest wrote first. Omit it
+and every write goes through as it happens.
+
 ### `tty: true`, and who edits the line
 
 Those really are the only two lines, because **`tty: true` gives the shell its
