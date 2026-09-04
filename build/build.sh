@@ -334,6 +334,13 @@ fi
 #   answers it and returns ENOTTY for any other request (busybox needs no other
 #   ioctl once size works — modes go through tcgetattr/tcsetattr). --wrap avoids
 #   colliding with wasi-libc's own ioctl symbol.
+# --wrap raise: wasi-libc answers raise() by ABORTING, which is the wrong end
+#   of the telescope here — the caller is the shell raising a signal at ITSELF,
+#   and the "process" is the whole session. `^C` at an interactive prompt ended
+#   the shell with a wasm trap until this existed. wasistubs.c delivers it to
+#   the handler sigaction() captured instead. Wrapped rather than defined,
+#   because libc's raise is already linked by the time ours would be.
+#
 # --wrap poll: the chokepoint for a synthesized SIGWINCH. tuish's `read -t`
 #   waits in poll(); __wrap_poll runs winch_dispatch() after every poll so a
 #   host-posted resize fires ash's captured WINCH handler. Covers ppoll.c too
@@ -352,7 +359,7 @@ fi
 #   and keeps wasm stack traces readable. Build with --debug to keep DWARF.
 OUT="$work/busybox.wasm"
 $WASM_LD --import-undefined --wrap fcntl --wrap exit --wrap ioctl --wrap poll \
-  --wrap read --wrap write --wrap readv --wrap writev \
+  --wrap raise --wrap read --wrap write --wrap readv --wrap writev \
   --wrap __wasilibc_fd_renumber \
   $([ "$DEBUG" = yes ] || echo --strip-debug) \
   "$CRT" "$BB/libbb/appletlib.o" "$BB/applets/applets.o" \
