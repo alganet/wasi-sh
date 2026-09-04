@@ -797,7 +797,7 @@ export class WasiShim {
           // A throwing lookup() must not cost the session a `type foo`.
           try { return w.builtins.lookup(len>0?w.str(namePtr,len):w.cstr(namePtr))?1:0; } catch { return 0; }
         },
-        // Enumeration, for tab completion (build/ash-compgen.patch): write the
+        // Enumeration, for tab completion (build/ash-complete-hostbuiltin.patch): write the
         // i'th registered name into the guest's buffer and return its length,
         // 0 once the list is out. `names()` is the contract's OPTIONAL third
         // method, so a provider that only knows how to look one name up

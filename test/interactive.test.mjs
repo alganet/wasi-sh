@@ -19,6 +19,7 @@ const TWIN = `
   const { WasiShim, WasiExit } = await import(workerData.shimUrl);
   const { RingReader } = await import(workerData.ringUrl);
   const { hostBuiltins } = await import(workerData.optionsUrl);
+  const { builtinRegistry } = await import(workerData.indexUrl);
   const { module, files, args, env, sab, tty } = workerData;
   const dec = new TextDecoder();
   let out = '';
@@ -33,7 +34,17 @@ const TWIN = `
     tty,
     // Constructed HERE, not passed in: a function does not survive
     // structured clone, so a builtin can only be registered inside the worker.
-    builtins: hostBuiltins({ mytool: (ctx) => { ctx.stdout('mytool ran\\n'); return 0; } }),
+    //
+    // A REGISTRY rather than a plain map, because one case below is about a
+    // namespace that changes while the shell runs: "load" defines a second
+    // command, and Tab has to see it. (No backticks in here — this whole
+    // worker is a template literal.)
+    builtins: (() => {
+      const registry = builtinRegistry();
+      registry.define('mytool', (ctx) => { ctx.stdout('mytool ran\\n'); return 0; });
+      registry.define('load', () => { registry.define('appeared', () => 0); return 0; });
+      return registry;
+    })(),
   });
   const instance = await WebAssembly.instantiate(module, shim.imports());
   shim.bindMemory(instance.exports.memory);
@@ -61,6 +72,7 @@ function spawnTwin(script, { env = {}, tty = false, files = {} } = {}) {
       shimUrl: new URL('../src/shim.mjs', import.meta.url).href,
       ringUrl: new URL('../src/ring.mjs', import.meta.url).href,
       optionsUrl: new URL('../src/options.mjs', import.meta.url).href,
+      indexUrl: new URL('../src/index.mjs', import.meta.url).href,
     },
   });
   // `live()` is output SO FAR: the winch tests below assert on what the guest
@@ -282,7 +294,12 @@ test('repeated resizes each fire (bb_got_signal is cleared, no read -t spin)', a
 // The editor redraws with \r + erase, so what is on screen is the tail of the
 // stream, not a substring of it. Strip the control sequences and take the last
 // prompt line.
-const screen = (s) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/[\r\n]/).filter(Boolean).pop() || '';
+const screen = (s) => s
+  .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+  // A lone BEL is the editor saying "nothing completes that". Audible, not
+  // visible, and not part of the line.
+  .replace(/\x07/g, '')
+  .split(/[\r\n]/).filter(Boolean).pop() || '';
 const settle = (ms = 400) => new Promise((res) => setTimeout(res, ms));
 
 test('a tty gives the guest a prompt, and it echoes its own keystrokes', async () => {
@@ -349,6 +366,28 @@ test('completion sees host builtins, which no other name source knows about', as
   writer.write(enc.encode('\r'));
   await settle();
   assert.match(live(), /mytool ran/, 'and the name it completed to actually runs');
+  writer.end();
+});
+
+test('Tab sees a command registered after the shell started', async () => {
+  // The names() snapshot this replaces was taken once, for the life of the
+  // session — so a command a builtin defined mid-run was invisible to Tab for
+  // ever after. The list is rebuilt per completion walk instead; see the
+  // enumeration hook in shim.mjs.
+  //
+  // This used to be asked with `compgen -c`, back when the completion engine
+  // was exposed as a command for a page that edited lines itself. Pressing Tab
+  // is the same question with nothing extra built to ask it.
+  const { writer, live } = spawnTwin(null, { tty: true });
+  await settle();
+  writer.write(enc.encode('appear\t'));
+  await settle();
+  assert.match(screen(live()), /# appear$/, 'nothing completes it yet');
+  writer.write(enc.encode('\x15load\r'));      // ^U clears the line
+  await settle();
+  writer.write(enc.encode('appear\t'));
+  await settle();
+  assert.match(screen(live()), /# appeared $/, 'and now it does');
   writer.end();
 });
 

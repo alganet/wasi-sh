@@ -82,8 +82,7 @@ into the busybox applets compiled into the wasm, never as processes:
   [Networking](#networking-bring-your-own)
 - **Misc**: `date env printenv basename dirname realpath test printf getopt
   uname nproc stty` — plus every ash builtin (`echo`, `read`, `[`, arithmetic,
-  globs, functions), and `compgen` for completing a word from outside the
-  shell's own line editor
+  globs, functions)
 
 You can add to that list: see [Host builtins](#host-builtins-your-own-commands)
 for registering your own commands, written in JS.
@@ -550,30 +549,7 @@ sharing a line with `$ ` makes the editor wrap after 25 characters instead of
 So: escapes above the last line, plain text on it. The same arithmetic rules
 out a colour escape around the visible prompt — there is nowhere to put it.
 
-### Completion for a terminal that edits its own lines
-
-Keeping your own line editor is a legitimate choice, and sometimes the only one
-— a guest parked at a prompt is parked on **stdin**, so a session that also has
-to answer something else (a request channel, a dev server) cannot host one.
-
-`compgen` is the same completion engine, callable as a command:
-
-```
-compgen -c WORD    command names: applets, builtins, functions, aliases,
-                   host builtins, and a PATH scan
-compgen -f WORD    files and directories
-compgen -d WORD    directories only
-```
-
-One candidate per line on stdout, status 1 when there are none. Two things to
-know, both inherited from the editor so that the two agree:
-
-- candidates are **basenames, not paths** — `compgen -f src/te` answers
-  `terminal.mjs`, and you re-attach `src/`;
-- a **directory carries a trailing slash**, a file does not (so completing a
-  directory should not append a space).
-
-Use `--` when the word may start with a dash: `compgen -f -- -l`.
+### Line endings, and resize
 
 One knob matters: the guest has no tty line discipline (no ONLCR), so its
 output is LF-only — set `convertEol: true` so the terminal supplies the
@@ -720,7 +696,7 @@ path search. Applets win, so registering `grep` does nothing: what the shipped
 toolbox means cannot be changed out from under a script.
 
 **They complete like any other command.** A map's keys are the list, so Tab at a
-`tty: true` prompt and `compgen -c` both offer your names with no extra wiring.
+`tty: true` prompt offers your names with no extra wiring.
 
 If you registered a *provider* instead of a map — the extension point for a
 dynamic namespace, an object with its own `lookup(name)` and `run(ctx)` — add an
@@ -730,7 +706,7 @@ optional `names()` to be completable:
 serve({ builtins: {
   lookup: (name) => index.has(name),
   run: (ctx) => index.get(ctx.argv[0])(ctx),
-  names: () => [...index.keys()],     // optional: what Tab and compgen offer
+  names: () => [...index.keys()],     // optional: what Tab offers
 } });
 ```
 

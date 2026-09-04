@@ -1,0 +1,70 @@
+wasi-sh: host builtins are a name completion can offer.
+
+Depends on ash-hostbuiltin.patch, whose registry is one of the kinds of name a
+command can be in this build.
+
+libbb/lineedit.c already knows how to complete a word — applet names, this
+shell's builtins, its functions, its aliases, a PATH scan, directory-vs-file,
+and an ESC-injection filter on every candidate. It learns them from ash through
+ash_command_name(), upstream's enumerator for completion, which walks builtins,
+then functions, then aliases.
+
+Host builtins are the FOURTH kind of name find_command() resolves here, and the
+only kind the shell cannot enumerate for itself: the registry lives in JS,
+behind a lookup(name) that answers one question at a time. Without this,
+`php` is a command the shell runs and Tab has never heard of.
+
+The far end is optional. The JS contract's names() is opt-in, because an
+embedder may register a lazy namespace with nothing to list; then
+host_builtin_name(0) is NULL and the walk simply ends, exactly as it does in a
+build with no host builtins at all.
+
+HISTORY, because the shape of what was here explains what is not. This began as
+a much larger patch that ALSO exposed the completion engine as a `compgen`
+command, for "a terminal that edits its lines in the host" — and its stated
+reason was that wide's guest "has no choice, because it is parked on a
+/dev/hostreq verb loop". That was a choice, not a constraint, and it was
+unwound: the guest is a terminal now, its own Tab is the completion, and the
+command nothing typed is gone. What is left is the arm that was always real.
+
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -8813,6 +8813,13 @@
+  *                                    own exceptions and returns -1). */
+ extern int host_builtin_lookup(const char *name);
+ extern int host_builtin_run(char **argv, char **envp);
++/*   host_builtin_name(i)          -> the i'th registered name, or NULL past the
++ *                                    end (and always NULL if the embedder did
++ *                                    not implement the optional names()).
++ *                                    Points into a static buffer, valid until
++ *                                    the next call — every caller here xstrdup's
++ *                                    it immediately. */
++extern const char *host_builtin_name(int i);
+ 
+ /*
+  * Resolve a command name.  If you change this routine, you may have to
+@@ -11430,6 +11526,24 @@
+ 	}
+ #endif
+ 
++	/* wasi-sh: host builtins are the fourth kind of name find_command() can
++	 * resolve here, and the only kind a host cannot enumerate for itself —
++	 * the registry lives in JS, behind a lookup(name) that answers one
++	 * question at a time. Without this arm, `php` is a command the shell runs
++	 * and completion has never heard of.
++	 *
++	 * Optional at the far end: the contract's names() is opt-in, because an
++	 * embedder may register a lazy namespace with nothing to list. Then this
++	 * returns NULL at index 0 and the list simply ends, which is also what a
++	 * build with no builtins at all does. */
++	for (n = 0;; n++) {
++		const char *hb = host_builtin_name(n);
++		if (!hb)
++			break;
++		if (--i < 0)
++			return hb;
++	}
++
+ 	return NULL;
+ }
+ #endif

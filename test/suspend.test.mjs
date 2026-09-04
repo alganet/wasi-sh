@@ -121,16 +121,3 @@ test('a command can be removed, and stops being one', only, async () => {
   assert.equal(result.stdout, 'still here\nafter=127\n');
 });
 
-// Completion has to see the change too, or a loaded command is invisible to
-// Tab for the rest of the session — which is what the old names() snapshot did.
-test('compgen lists a command defined after the shell started', only, async () => {
-  const registry = builtinRegistry();
-  registry.define('load', async () => { await sleep(1); registry.define('appeared', () => 0); return 0; });
-  const result = await run({
-    script: 'compgen -c -- appeared\nload\ncompgen -c -- appeared',
-    builtins: registry,
-    suspendable: true,
-    inline: true,
-  });
-  assert.equal(result.stdout, 'appeared\n');
-});
