@@ -1209,6 +1209,14 @@ npm test
 rebuild, run `npm test` and the downstream consumer checks before trusting
 it.
 
+The module reserves a **1 MB shadow stack** at the bottom of linear memory
+(`--stack-first -z stack-size=1048576`). wasm-ld's 64 KB default sat directly
+above the data segments and grew down into them with no guard page, so an
+overflow rewrote globals instead of faulting — and a shell overflows it at a
+function-recursion depth of about sixty. `--stack-first` puts the stack where
+running off it traps, so a future shortfall is a fault at the overflow rather
+than a corrupted variable table somewhere else.
+
 The shipped module is stripped of DWARF — that was two thirds of its size —
 but keeps its `name` section, so wasm stack traces still symbolicate. Pass
 `build/build.sh --debug` if you need the debug info while working on the
