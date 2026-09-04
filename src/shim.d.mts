@@ -308,6 +308,16 @@ export interface WasiShimOptions {
   host?: HostPort;
   net?: NetPort;
   /**
+   * Called when a hosted application takes a port or gives one back.
+   *
+   * Emitted by the shim rather than by the net, because the shim is what
+   * mediates every `listen(2)` and every close — a net asked to report its own
+   * would be a second bookkeeper for a fact this one already has. A throw is
+   * caught and reported on stderr: this runs inside a wasm import, where an
+   * exception would unwind the whole guest stack.
+   */
+  onPort?(event: PortEvent): void;
+  /**
    * The inbound half of that port: requests the HOST hands to a RUNNING guest,
    * read as lines from /dev/hostreq. A running guest owns its worker and its
    * event loop never turns, so nothing reaches a live session by postMessage —
@@ -403,4 +413,48 @@ export interface NetPort {
   recvAsync?(handle: unknown, max: number): Promise<Uint8Array | null>;
   poll(handle: unknown): { readable: boolean; writable: boolean; hup?: boolean };
   close(handle: unknown): void;
+
+  /**
+   * Take a port, so that an application this shell HOSTS can be a server.
+   *
+   * Throwing refuses it, which is what a port already taken looks like from
+   * the guest: `listen(2)` fails with EADDRINUSE. Optional — a net without it
+   * is the outbound-only net every session had before, and `listen(2)` is
+   * ENOTSUP.
+   */
+  listen?(address: string, port: number): unknown;
+  /**
+   * The next connection on a listening handle, or null for "nobody yet".
+   *
+   * What comes back is an ORDINARY handle: `send`, `recv`, `poll` and `close`
+   * already serve it, which is why nothing new is needed to read or write an
+   * accepted connection. Never blocks — the waiting belongs in `wait`, where a
+   * guest can also be interrupted.
+   */
+  accept?(handle: unknown): unknown | null;
+  /**
+   * Park the calling thread until something on this net changes, or `ms`
+   * elapses — whichever comes first.
+   *
+   * Optional, and its ABSENCE is the signal, exactly as `recvAsync`'s is: a
+   * net without it keeps the old behaviour, where a poll reports readable and
+   * lets the caller find out. With it, a guest waiting on a socket parks.
+   *
+   * That is the difference between an accept loop that idles and one that
+   * spins at full CPU and never yields to the JS that would hand it a
+   * connection — so a net that offers `listen` and not this can be served
+   * from, but only by a guest that is willing to burn a core.
+   *
+   * It carries `whileBlocked`'s contract: whatever it wakes for, it must have
+   * consumed, or the next park returns immediately for ever.
+   */
+  wait?(ms: number): void;
+}
+
+/** A port taken or given back by something this shell hosts. */
+export interface PortEvent {
+  type: 'open' | 'close';
+  /** The bind address, dotted quad — `0.0.0.0` for "anywhere". */
+  address: string;
+  port: number;
 }

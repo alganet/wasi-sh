@@ -139,6 +139,13 @@ export class Session {
     this._outputFns = new Set();
     this._exitFns = new Set();
     this._errorFns = new Set();
+    this._portFns = new Set();
+    // Keyed by address:port, so the list is what is open RIGHT NOW rather than
+    // a log of what has been. A caller that arrives late reads ports() and a
+    // caller that was here all along hears onPort(); both see the same set,
+    // which is the only way a watcher can be correct without having to have
+    // been listening since the session started.
+    this._ports = new Map();
     let readyResolve, readyReject;
     this._ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
     this.exited = new Promise((res) => { this._exitResolve = res; });
@@ -162,6 +169,8 @@ export class Session {
           const bytes = new Uint8Array(m.bytes);
           for (const fn of this._outputFns) fn(bytes, m.channel);
         }
+      } else if (m.type === 'port') {
+        this._port(m.event);
       } else if (m.type === 'ready') {
         readyResolve(this);
       } else if (m.type === 'exit') {
@@ -313,10 +322,55 @@ export class Session {
   onExit(fn) { this._exitFns.add(fn); return () => this._exitFns.delete(fn); }
   onError(fn) { this._errorFns.add(fn); return () => this._errorFns.delete(fn); }
 
+  /**
+   * The ports this session has open, right now.
+   *
+   * A fresh array of fresh objects, because this is the answer to a question
+   * and not a handle on the bookkeeping: a caller that held the live map would
+   * see it change under a render.
+   */
+  ports() { return [...this._ports.values()].map((p) => ({ ...p })); }
+
+  /**
+   * Called when a hosted application opens or closes one.
+   *
+   * The listener is caught up first, with an `open` for everything already
+   * listening. Otherwise every caller would need a ports() call beside its
+   * subscribe and a rule for which of the two won a race — and the two orders
+   * disagree exactly when a server starts during boot, which is when this is
+   * most likely to be subscribed.
+   */
+  onPort(fn) {
+    this._portFns.add(fn);
+    for (const p of this.ports()) { try { fn({ type: 'open', ...p }); } catch { /* the caller's */ } }
+    return () => this._portFns.delete(fn);
+  }
+
+  _port(event) {
+    if (!event || (event.type !== 'open' && event.type !== 'close')) return;
+    const key = `${event.address}:${event.port}`;
+    if (event.type === 'open') {
+      if (this._ports.has(key)) return;            // already reported; not news
+      this._ports.set(key, { address: event.address, port: event.port, since: Date.now() });
+    } else if (!this._ports.delete(key)) {
+      return;                                      // never open; nothing to say
+    }
+    const out = { type: event.type, address: event.address, port: event.port };
+    for (const fn of this._portFns) fn(out);
+  }
+
   // Single exit path (worker exit message OR terminate) — first caller wins.
   _exit(code) {
     if (this._exited) return;
     this._exited = true;
+    // A dead session has no ports. proc_exit reports its own on the way out,
+    // but a trap and terminate() do not — and a watcher left pointed at a port
+    // with nothing behind it is worse than one told twice, which _port already
+    // refuses to do.
+    for (const key of [...this._ports.keys()]) {
+      const p = this._ports.get(key);
+      this._port({ type: 'close', address: p.address, port: p.port });
+    }
     this._exitResolve(code);
     for (const fn of this._exitFns) fn(code);
     this._dispose();

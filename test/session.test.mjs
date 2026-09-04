@@ -95,3 +95,97 @@ test('a worker error event settles exited (134) too', async () => {
   assert.equal(await s.exited, 134);
   assert.deepEqual(errs, ['worker blew up']);
 });
+
+// ─── ports ───────────────────────────────────────────────────────────────────
+
+const openPort = (port, address = '0.0.0.0') => ({ type: 'port', event: { type: 'open', address, port } });
+const closePort = (port, address = '0.0.0.0') => ({ type: 'port', event: { type: 'close', address, port } });
+
+test('ports() is what is open now, not a log of what has been', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  w.emit(openPort(8000));
+  w.emit(openPort(5173));
+  assert.deepEqual(s.ports().map((p) => p.port).sort(), [5173, 8000]);
+  w.emit(closePort(8000));
+  assert.deepEqual(s.ports().map((p) => p.port), [5173]);
+});
+
+test('ports() hands back a copy, so a render cannot be changed underneath', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  w.emit(openPort(8000));
+  const before = s.ports();
+  before[0].port = 9999;
+  w.emit(closePort(8000));
+  assert.equal(before.length, 1, 'the array taken earlier still describes then');
+  assert.deepEqual(s.ports(), []);
+});
+
+test('onPort is caught up with what is already listening', async () => {
+  // Otherwise every caller needs a ports() beside its subscribe and a rule for
+  // which won the race — and the two orders disagree exactly when a server
+  // starts during boot.
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  w.emit(openPort(8000));
+  const seen = [];
+  s.onPort((e) => seen.push(`${e.type}:${e.port}`));
+  assert.deepEqual(seen, ['open:8000']);
+  w.emit(openPort(5173));
+  assert.deepEqual(seen, ['open:8000', 'open:5173']);
+});
+
+test('the same port opened twice is reported once', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  const seen = [];
+  s.onPort((e) => seen.push(e.type));
+  w.emit(openPort(8000));
+  w.emit(openPort(8000));
+  assert.deepEqual(seen, ['open']);
+});
+
+test('a close for a port that never opened says nothing', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  const seen = [];
+  s.onPort((e) => seen.push(e.type));
+  w.emit(closePort(8000));
+  assert.deepEqual(seen, []);
+});
+
+test('the same port on two addresses is two ports', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  w.emit(openPort(8000, '127.0.0.1'));
+  w.emit(openPort(8000, '0.0.0.0'));
+  assert.equal(s.ports().length, 2);
+  w.emit(closePort(8000, '127.0.0.1'));
+  assert.deepEqual(s.ports().map((p) => p.address), ['0.0.0.0']);
+});
+
+test('a session that ends closes its ports', async () => {
+  // A trap and terminate() report nothing on the way out, and a watcher left
+  // pointed at a port with nothing behind it is worse than one told twice.
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  const seen = [];
+  w.emit(openPort(8000));
+  s.onPort((e) => seen.push(`${e.type}:${e.port}`));
+  s.terminate();
+  await s.exited;
+  assert.deepEqual(seen, ['open:8000', 'close:8000']);
+  assert.deepEqual(s.ports(), []);
+});
+
+test('unsubscribing stops the reports', async () => {
+  const w = fakeWorker();
+  const s = new Session(w, null, true);
+  const seen = [];
+  const off = s.onPort((e) => seen.push(e.port));
+  w.emit(openPort(8000));
+  off();
+  w.emit(openPort(5173));
+  assert.deepEqual(seen, [8000]);
+});

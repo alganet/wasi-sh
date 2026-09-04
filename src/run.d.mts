@@ -1,4 +1,4 @@
-import type { Files, HostBuiltins, BuiltinMap, HostPort, HostVerbMap, NetPort } from './shim.mjs';
+import type { Files, HostBuiltins, BuiltinMap, HostPort, HostVerbMap, NetPort, PortEvent } from './shim.mjs';
 import type { FileSystem } from './fs.mjs';
 
 export type WasmSource =
@@ -93,6 +93,8 @@ export interface RunOptions {
   host?: HostVerbMap | HostPort | (() => HostVerbMap | HostPort | Promise<HostVerbMap | HostPort>);
   /** Sockets. See NetPort in ./shim.d.mts — absent, socket() fails. */
   net?: NetPort;
+  /** Called when this run takes a port or gives one back. */
+  onPort?: (event: PortEvent) => void;
 }
 
 export interface RunResult {

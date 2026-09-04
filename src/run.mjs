@@ -38,6 +38,10 @@ async function runInline(options) {
     builtins: await resolveBuiltins(options.builtins),
     host: await resolveHost(options.host),
     net: options.net,
+    // A one-shot run can host a server too — `busybox httpd -i` is one — so it
+    // gets the same report a session does. Directly, because there is no
+    // worker boundary here for it to cross.
+    onPort: options.onPort,
     suspendable: !!options.suspendable,
     // run() has a fixed stdin, which never blocks and so never suspends —
     // passed through only so a caller cannot be surprised by it being ignored.
