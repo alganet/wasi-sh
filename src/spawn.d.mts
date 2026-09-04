@@ -1,4 +1,4 @@
-import type { Files } from './shim.mjs';
+import type { Files, PortEvent } from './shim.mjs';
 import type { WasmSource, OutputChannel } from './run.mjs';
 
 export interface SpawnOptions {
@@ -145,6 +145,23 @@ export class Session {
   onOutput(fn: (bytes: Uint8Array, channel: OutputChannel) => void): () => void;
   onExit(fn: (code: number) => void): () => void;
   onError(fn: (err: Error) => void): () => void;
+
+  /**
+   * The ports this session has open, right now — a fresh array of fresh
+   * objects, so a caller cannot be changed underneath mid-render.
+   */
+  ports(): Array<{ address: string; port: number; since: number }>;
+  /**
+   * Called when a hosted application opens or closes one.
+   *
+   * The listener is caught up first, with an `open` for everything already
+   * listening — otherwise every caller would need a `ports()` beside its
+   * subscribe and a rule for which won the race, and the two orders disagree
+   * exactly when a server starts during boot.
+   *
+   * Returns an unsubscribe.
+   */
+  onPort(fn: (event: PortEvent) => void): () => void;
   /**
    * Resolves with the guest's exit code (137 after terminate(), 134 if the
    * worker errored or the guest trapped — onError carries the detail). Always

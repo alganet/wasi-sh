@@ -571,6 +571,8 @@ int host_builtin_run(char **argv, char **envp)
 extern int __host_sock_open(void);
 extern int __host_sock_connect(int fd, unsigned addr, int port);
 extern int __host_sock_resolve(const char *name, unsigned *addr);
+extern int __host_sock_bind(int fd, unsigned addr, int port);
+extern int __host_sock_listen(int fd);
 
 int socket(int domain, int type, int protocol)
 {
@@ -600,6 +602,96 @@ int connect(int fd, const struct sockaddr *sa, socklen_t len)
 	}
 	return 0;
 }
+
+/*
+ * The inbound half. An application this shell hosts can be a server, which
+ * preview1 has no vocabulary for at all — and neither did the four calls above,
+ * because a client never binds.
+ *
+ * bind() carries the address and listen() carries a backlog, so the address is
+ * handed over at bind time and parked on the fd by the shim. Splitting it that
+ * way rather than deferring both to listen() keeps a side table out of this
+ * file: the shim's fd map already holds every other fact about a descriptor.
+ */
+int bind(int fd, const struct sockaddr *sa, socklen_t len)
+{
+	const struct sockaddr_in *in = (const struct sockaddr_in *) sa;
+
+	if (sa == NULL || len < (socklen_t) sizeof(*in) || sa->sa_family != AF_INET) {
+		errno = EAFNOSUPPORT;
+		return -1;
+	}
+	if (__host_sock_bind(fd, (unsigned) in->sin_addr.s_addr, ntohs(in->sin_port)) != 0) {
+		errno = EBADF;
+		return -1;
+	}
+	return 0;
+}
+
+/* The backlog is dropped, and nothing here can honour one: what queues an
+ * accepted connection is the embedder's net, on the other side of a call that
+ * has already returned. EADDRINUSE is the refusal that matters — a net says so
+ * by throwing, and a port already taken is the one failure a caller acts on. */
+int listen(int fd, int backlog)
+{
+	(void) backlog;
+	if (__host_sock_listen(fd) != 0) { errno = EADDRINUSE; return -1; }
+	return 0;
+}
+
+/*
+ * Three that wasi-libc does not have and a server reaches for anyway. All
+ * three are answered locally rather than crossing the boundary, because the
+ * honest answer to each is already known here.
+ *
+ * setsockopt: every option a server sets is about a wire — SO_REUSEADDR,
+ * SO_KEEPALIVE, TCP_NODELAY — and there is no wire. Succeeding is right and
+ * failing is not: httpd and php -S both set options they never check, and a
+ * refusal would be a failure report about something that was never going to
+ * matter. getsockopt answers zero for the same reason.
+ *
+ * getpeername: there is no peer to name. ENOTCONN is what a socket with no
+ * remote address says, and busybox's inetd path already tolerates it — "NB:
+ * can fail if user runs it by hand and types in http cmds" is the comment
+ * above its own call.
+ *
+ * fork() is NOT here — it is already stubbed to ENOSYS at the top of this
+ * file, which is what makes `httpd -i` (one request on stdin, no fork) the
+ * mode that works and httpd's standalone accept loop the one that does not.
+ */
+int setsockopt(int fd, int level, int optname, const void *val, socklen_t len)
+{
+	(void) fd; (void) level; (void) optname; (void) val; (void) len;
+	return 0;
+}
+
+int getsockopt(int fd, int level, int optname, void *val, socklen_t *len)
+{
+	(void) fd; (void) level; (void) optname;
+	if (val != NULL && len != NULL && *len >= (socklen_t) sizeof(int)) {
+		*(int *) val = 0;
+		*len = (socklen_t) sizeof(int);
+	}
+	return 0;
+}
+
+int getpeername(int fd, struct sockaddr *sa, socklen_t *len)
+{
+	(void) fd; (void) sa; (void) len;
+	errno = ENOTCONN;
+	return -1;
+}
+
+/*
+ * accept() is NOT here, and that is the one call of the six that already
+ * existed: wasi-libc implements it over preview1's own `sock_accept`
+ * (libc-bottom-half/sources/accept-wasip1.c), so defining one here would be a
+ * duplicate symbol rather than a gap being filled. The shim answers the import
+ * instead — see sock_accept in src/shim.mjs — which is also why the peer
+ * address needs no invention on this side: wasi-libc zeroes the sockaddr and
+ * reports AF_UNSPEC, which is the truth. The connection did not come off a
+ * wire, and there is no remote address to name.
+ */
 
 /*
  * `service` is always NULL here and `node` is never a numeric address:

@@ -181,6 +181,266 @@ test('without a net, a socket cannot be made at all', () => {
   assert.equal(t.env.__host_sock_resolve(0x100, 0x300), -1);
 });
 
+// ─── listening ───────────────────────────────────────────────────────────────
+
+/**
+ * A net that can be listened on. `arrive()` is the embedder handing a
+ * connection in — the whole point of the inbound half — and `waited` records
+ * what the guest asked to be parked for.
+ */
+function listeningNet(reply = () => 'ok') {
+  const seen = { bound: [], closed: [], waited: [] };
+  const conns = new Map();
+  const queues = new Map();
+  let next = 1;
+  const net = {
+    seen,
+    resolve: (n) => `172.29.0.1`,
+    connect() { throw new Error('outbound is not what this net is for'); },
+    listen(addr, port) {
+      // A port is taken or free for the whole net, which is what makes the
+      // table one table rather than several that agree.
+      for (const b of seen.bound) if (b.port === port && !b.gone) throw new Error('EADDRINUSE');
+      const h = next++;
+      seen.bound.push({ addr, port, handle: h, gone: false });
+      queues.set(h, []);
+      return h;
+    },
+    accept(h) {
+      const q = queues.get(h);
+      if (!q || !q.length) return null;
+      return q.shift();
+    },
+    send(h, bytes) { conns.get(h).out = enc.encode(reply(dec.decode(bytes))); return bytes.length; },
+    recv(h, max) {
+      const c = conns.get(h);
+      if (!c) return null;
+      if (c.inOff < c.in.length) {
+        const slice = c.in.subarray(c.inOff, c.inOff + max);
+        c.inOff += slice.length;
+        return slice;
+      }
+      if (!c.out) return null;
+      const slice = c.out.subarray(c.outOff, c.outOff + max);
+      c.outOff += slice.length;
+      return slice;
+    },
+    poll(h) {
+      const q = queues.get(h);
+      if (q) return { readable: q.length > 0, writable: false, hup: false };
+      const c = conns.get(h);
+      return { readable: !!c && c.inOff < c.in.length, writable: true, hup: false };
+    },
+    close(h) {
+      seen.closed.push(h);
+      const b = seen.bound.find((x) => x.handle === h);
+      if (b) b.gone = true;
+      queues.delete(h);
+      conns.delete(h);
+    },
+    wait(ms) { seen.waited.push(ms); },
+    /** The embedder's door: a connection lands on a listening handle. */
+    arrive(listenHandle, request) {
+      const h = next++;
+      conns.set(h, { in: enc.encode(request), inOff: 0, out: null, outOff: 0 });
+      queues.get(listenHandle).push(h);
+      return h;
+    },
+  };
+  return net;
+}
+
+/** bind + listen on a fresh socket, returning its fd. 127.0.0.1 by default. */
+function listenOn(t, port, addr = 0x0100007f) {
+  const fd = t.env.__host_sock_open();
+  assert.equal(t.env.__host_sock_bind(fd, addr, port), 0);
+  assert.equal(t.env.__host_sock_listen(fd), 0);
+  return fd;
+}
+
+/** sock_accept, as wasi-libc's accept(2) calls it. Returns fd or the errno. */
+function acceptFd(t, fd) {
+  const errno = t.p1.sock_accept(fd, 0, 0xA00);
+  return errno === 0 ? t.view().getUint32(0xA00, true) : -errno;
+}
+
+test('bind carries the address and listen opens the port', () => {
+  const t = makeShim(listeningNet());
+  listenOn(t, 8000);
+  assert.deepEqual(t.net.seen.bound.map(({ addr, port }) => ({ addr, port })),
+    [{ addr: '127.0.0.1', port: 8000 }]);
+});
+
+test('listen without bind refuses rather than inventing an address', () => {
+  const t = makeShim(listeningNet());
+  const fd = t.env.__host_sock_open();
+  assert.equal(t.env.__host_sock_listen(fd), -1);
+});
+
+test('a port already taken is refused, not silently shared', () => {
+  const t = makeShim(listeningNet());
+  listenOn(t, 8000);
+  const second = t.env.__host_sock_open();
+  assert.equal(t.env.__host_sock_bind(second, 0x0100007f, 8000), 0);
+  assert.equal(t.env.__host_sock_listen(second), -1, 'the net threw and it became a failure');
+});
+
+test('closing a listening socket gives the port back', () => {
+  const t = makeShim(listeningNet());
+  const fd = listenOn(t, 8000);
+  t.p1.fd_close(fd);
+  assert.equal(t.net.seen.closed.length, 1);
+  // Provable rather than asserted about internals: the port binds again.
+  listenOn(t, 8000);
+});
+
+test('accept with nobody there is EAGAIN', () => {
+  const t = makeShim(listeningNet());
+  const fd = listenOn(t, 8000);
+  assert.equal(acceptFd(t, fd), -6, 'EAGAIN');
+});
+
+test('accept on a socket that never listened is EBADF', () => {
+  const t = makeShim(listeningNet());
+  const fd = t.env.__host_sock_open();
+  assert.equal(acceptFd(t, fd), -8, 'EBADF');
+});
+
+test('an accepted connection is an ordinary descriptor', () => {
+  // The whole reason accept hands back a handle rather than some second kind
+  // of thing: read and write already work on it, unchanged.
+  const t = makeShim(listeningNet((req) => `echo:${req}`));
+  const fd = listenOn(t, 8000);
+  t.net.arrive(t.net.seen.bound[0].handle, 'GET / HTTP/1.1\r\n\r\n');
+
+  const conn = acceptFd(t, fd);
+  assert.ok(conn > fd, 'a fresh descriptor, not the listening one');
+
+  assert.equal(readFd(t, conn).text, 'GET / HTTP/1.1\r\n\r\n');
+  assert.equal(writeFd(t, conn, 'HTTP/1.1 200 OK\r\n\r\nhi').errno, 0);
+  assert.equal(readFd(t, conn).text, 'echo:HTTP/1.1 200 OK\r\n\r\nhi');
+});
+
+test('a listening socket polls readable only once somebody is waiting', () => {
+  const t = makeShim(listeningNet());
+  const fd = listenOn(t, 8000);
+
+  // A zero timeout is a probe: it must not park, and it must not lie.
+  const sub = 0x800;
+  t.view().setBigUint64(sub, 11n, true);
+  t.view().setUint8(sub + 8, 1);
+  t.view().setUint32(sub + 16, fd, true);
+  const clock = sub + 48;
+  t.view().setBigUint64(clock, 12n, true);
+  t.view().setUint8(clock + 8, 0);
+  t.view().setBigUint64(clock + 24, 0n, true);
+
+  t.p1.poll_oneoff(sub, 0x900, 2, 0x9F0);
+  assert.equal(t.view().getBigUint64(0x900, true), 12n, 'the clock, not the socket');
+  assert.deepEqual(t.net.seen.waited, [], 'a zero timeout never parks');
+
+  t.net.arrive(t.net.seen.bound[0].handle, 'GET / HTTP/1.1\r\n\r\n');
+  t.p1.poll_oneoff(sub, 0x900, 2, 0x9F0);
+  assert.equal(t.view().getBigUint64(0x900, true), 11n, 'now the socket');
+});
+
+test('a poll with nothing to accept parks on the net instead of spinning', () => {
+  // The difference between an accept loop that idles and one that owns the CPU
+  // and never yields to the JS that would hand it a connection.
+  const t = makeShim(listeningNet());
+  const fd = listenOn(t, 8000);
+  const sub = 0x800;
+  t.view().setBigUint64(sub, 11n, true);
+  t.view().setUint8(sub + 8, 1);
+  t.view().setUint32(sub + 16, fd, true);
+  const clock = sub + 48;
+  t.view().setBigUint64(clock, 12n, true);
+  t.view().setUint8(clock + 8, 0);
+  t.view().setBigUint64(clock + 24, 50n * 1000000n, true);   // 50ms
+
+  t.p1.poll_oneoff(sub, 0x900, 2, 0x9F0);
+  assert.ok(t.net.seen.waited.length > 0, 'it parked');
+  assert.ok(t.net.seen.waited.every((ms) => ms > 0 && ms <= 50), 'never longer than asked');
+  assert.equal(t.view().getBigUint64(0x900, true), 12n, 'and reported the timeout');
+});
+
+test('a net with no wait keeps the behaviour it always had', () => {
+  // Its ABSENCE is the signal, exactly as recvAsync's is.
+  const net = listeningNet();
+  delete net.wait;
+  const t = makeShim(net);
+  const fd = listenOn(t, 8000);
+  const sub = 0x800;
+  t.view().setBigUint64(sub, 11n, true);
+  t.view().setUint8(sub + 8, 1);
+  t.view().setUint32(sub + 16, fd, true);
+  // No timeout, nothing pending: it reports readable rather than spinning, and
+  // the caller finds out from accept.
+  t.p1.poll_oneoff(sub, 0x900, 1, 0x9F0);
+  assert.equal(t.view().getUint32(0x9F0, true), 1);
+  assert.equal(t.view().getBigUint64(0x900, true), 11n);
+});
+
+test('opening a port is reported, and so is giving it back', () => {
+  // The event a watcher acts on, and the only one: it is listen(2) returning,
+  // not a command line and not a convention.
+  const seen = [];
+  const net = listeningNet();
+  const shim = new WasiShim({ net, onPort: (e) => seen.push(e), stderr: () => {} });
+  const memory = new WebAssembly.Memory({ initial: 4 });
+  shim.bindMemory(memory);
+  const t = { shim, net, env: shim.imports().env, p1: shim.imports().wasi_snapshot_preview1,
+    view: () => new DataView(memory.buffer), bytes: () => new Uint8Array(memory.buffer) };
+
+  const fd = listenOn(t, 8000);
+  assert.deepEqual(seen, [{ type: 'open', address: '127.0.0.1', port: 8000 }]);
+
+  t.p1.fd_close(fd);
+  assert.deepEqual(seen[1], { type: 'close', address: '127.0.0.1', port: 8000 });
+});
+
+test('a server that dies holding its port still gives it back', () => {
+  // Otherwise whoever is watching stays pointed at a port with nothing behind
+  // it for the rest of the session.
+  const seen = [];
+  const net = listeningNet();
+  const shim = new WasiShim({ net, onPort: (e) => seen.push(e), stderr: () => {} });
+  const memory = new WebAssembly.Memory({ initial: 4 });
+  shim.bindMemory(memory);
+  const t = { shim, net, env: shim.imports().env, p1: shim.imports().wasi_snapshot_preview1,
+    view: () => new DataView(memory.buffer), bytes: () => new Uint8Array(memory.buffer) };
+
+  listenOn(t, 8000);
+  assert.throws(() => t.p1.proc_exit(130), (e) => e.name === 'WasiExit' || e instanceof Error);
+  assert.deepEqual(seen.map((e) => e.type), ['open', 'close']);
+  assert.equal(net.seen.closed.length, 1, 'and the net was told, not just the watcher');
+});
+
+test('a listener that throws does not take the shell down with it', () => {
+  // This runs inside a wasm import: an exception would unwind the guest stack.
+  const errs = [];
+  const net = listeningNet();
+  const shim = new WasiShim({ net, onPort: () => { throw new Error('boom'); },
+    stderr: (b) => errs.push(dec.decode(b)) });
+  const memory = new WebAssembly.Memory({ initial: 4 });
+  shim.bindMemory(memory);
+  const t = { shim, net, env: shim.imports().env, p1: shim.imports().wasi_snapshot_preview1,
+    view: () => new DataView(memory.buffer), bytes: () => new Uint8Array(memory.buffer) };
+
+  assert.doesNotThrow(() => listenOn(t, 8000));
+  assert.match(errs.join(''), /a port listener threw: boom/);
+});
+
+test('without listen on the net, a guest cannot open a port', () => {
+  // An embedder with an outbound-only net is unchanged: the six methods it
+  // always had still work, and the seventh simply is not there.
+  const t = makeShim(recordingNet());
+  const fd = t.env.__host_sock_open();
+  assert.equal(t.env.__host_sock_bind(fd, 0x0100007f, 8000), 0);
+  assert.equal(t.env.__host_sock_listen(fd), -1);
+  assert.equal(acceptFd(t, fd), -8, 'EBADF: nothing ever started listening');
+});
+
 // ─── the awaited door ────────────────────────────────────────────────────────
 
 test('a socket read suspends only where both halves say it can', () => {
@@ -503,4 +763,118 @@ test('and an uninterrupted download of the same shape finishes', e2e, async () =
   assert.equal(r.exitCode, 0);
   assert.equal(r.delivered, 40);
   assert.equal(r.stdout.length, 40 * 64);
+});
+
+// ─── a real server, for real ─────────────────────────────────────────────────
+
+test('busybox httpd answers a request, unmodified', e2e, async () => {
+  // The whole point of the capability, with no PHP and no Emscripten in it:
+  // an application this shell HOSTS is a server. Inetd mode needs no socket at
+  // all — a request on stdin, a response on stdout — so this pins the half
+  // that works today without a wire, and it is a real binary answering.
+  const r = await run({
+    inline: true,
+    files: { '/www/index.html': '<h1>served</h1>\n' },
+    command: 'httpd -i -h /www',
+    stdin: 'GET /index.html HTTP/1.0\r\n\r\n',
+  });
+  assert.equal(r.exitCode, 0);
+  assert.match(r.stdout, /^HTTP\/1\.1 200 OK\r\n/);
+  assert.match(r.stdout, /Content-Length: 16\r\n/);
+  assert.match(r.stdout, /\r\n\r\n<h1>served<\/h1>\n$/);
+});
+
+test('httpd binds through the net, address and port intact', e2e, async () => {
+  // socket(2) -> bind(2) -> listen(2), from an unmodified binary, all the way
+  // to the embedder's port. A refusal is what proves the round trip carried
+  // real values: busybox prints the errno the C stub chose, from the throw the
+  // net made, about the address the guest asked for.
+  const asked = [];
+  const r = await run({
+    inline: true,
+    net: {
+      resolve: () => null,
+      connect() { throw new Error('outbound is not what this is'); },
+      listen(address, port) { asked.push({ address, port }); throw new Error('taken'); },
+      accept: () => null,
+      send: () => 0,
+      recv: () => null,
+      poll: () => ({ readable: false, writable: true, hup: false }),
+      close: () => {},
+    },
+    files: { '/www/index.html': 'hi\n' },
+    command: 'httpd -p 8000 -h /www -f',
+  });
+  assert.deepEqual(asked, [{ address: '0.0.0.0', port: 8000 }]);
+  assert.equal(r.exitCode, 1);
+  assert.match(r.stderr, /listen: Address in use/);
+});
+
+test('a port opened by a real binary is reported, and given back', e2e, async () => {
+  // listen(2) returning IS the event — not a command line, not a convention.
+  //
+  // httpd binds and listens in openServer() and only then daemonizes, and this
+  // shell is fork-free, so it dies holding the port. That makes one command
+  // prove both halves: the open, and the close that a server which never
+  // cleaned up still owes whoever is watching.
+  const ports = [];
+  const r = await run({
+    inline: true,
+    onPort: (e) => ports.push(e),
+    net: {
+      resolve: () => null,
+      connect() { throw new Error('outbound is not what this is'); },
+      listen: () => 'L',
+      accept: () => null,
+      send: () => 0,
+      recv: () => null,
+      poll: () => ({ readable: false, writable: true, hup: false }),
+      close: () => {},
+    },
+    files: { '/www/index.html': 'hi\n' },
+    command: 'httpd -p 8000 -h /www',       // no -f: it daemonizes, and cannot
+  });
+  // Its own words. The status is 0 because httpd sets xfunc_error_retval = 0
+  // just above the daemonize, so stderr is the only thing that says what
+  // happened — which is the point worth pinning.
+  assert.match(r.stderr, /fork: Function not implemented/);
+  assert.deepEqual(ports.map((e) => `${e.type} ${e.address}:${e.port}`),
+    ['open 0.0.0.0:8000', 'close 0.0.0.0:8000']);
+});
+
+// ─── sock_shutdown ───────────────────────────────────────────────────────────
+
+test('a half-close succeeds, because the close is what the net acts on', () => {
+  // There is no direction to shut down independently here: a connection is one
+  // exchange over a handle the net owns. Succeeding is right rather than
+  // lenient — a server that shuts its write side and then closes has said the
+  // same thing twice, and refusing would turn the first into a failure report
+  // about something that was never going to matter.
+  const t = makeShim(listeningNet());
+  const listen = listenOn(t, 8000);
+  t.net.arrive(t.net.seen.bound[0].handle, 'GET / HTTP/1.0\r\n\r\n');
+  const fd = acceptFd(t, listen);
+  assert.equal(t.p1.sock_shutdown(fd, 1), 0, 'SHUT_WR');
+  assert.equal(t.p1.sock_shutdown(fd, 2), 0, 'SHUT_RDWR');
+});
+
+test('and the socket still works afterwards, since nothing was shut', () => {
+  const t = makeShim(listeningNet(() => 'answered'));
+  const listen = listenOn(t, 8000);
+  t.net.arrive(t.net.seen.bound[0].handle, 'ask');
+  const fd = acceptFd(t, listen);
+  assert.equal(readFd(t, fd).text, 'ask', 'the request the embedder handed in');
+  assert.equal(t.p1.sock_shutdown(fd, 1), 0);
+  assert.equal(writeFd(t, fd, 'ask').errno, 0);
+  assert.equal(readFd(t, fd).text, 'answered');
+});
+
+test('shutting down something that is not a socket is ENOTSOCK', () => {
+  const t = makeShim(listeningNet());
+  assert.equal(t.p1.sock_shutdown(1, 1), 57, 'ENOTSOCK on stdout');
+});
+
+test('and on a descriptor that is not open at all, EBADF', () => {
+  const t = makeShim(listeningNet());
+  assert.equal(t.p1.sock_shutdown(99, 1), 8, 'EBADF');
 });

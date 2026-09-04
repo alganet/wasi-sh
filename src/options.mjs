@@ -268,7 +268,7 @@ export async function resolveHost(spec) {
 }
 
 // The public `net` option: a port, or a factory returning one. There is no
-// normalization to do — a net is a fixed set of six methods and not a map that
+// normalization to do — a net is a fixed set of methods and not a map that
 // could also be a provider — so this is only about the factory, and the factory
 // is the whole point: a backend may have to spawn a thread of its own before it
 // can answer anything, and `serve()` is called synchronously with no chance to

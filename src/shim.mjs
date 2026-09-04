@@ -54,6 +54,24 @@
 //   recvAsync?(handle, max) -> Promise   optional; see below
 // Absent, socket() is EAFNOSUPPORT and nothing else changes.
 //
+// Three more make the port answerable in the other direction, so that an
+// application this shell HOSTS can be a server rather than only a client:
+//   listen(addr, port) -> handle         (throwing refuses it: port taken)
+//   accept(handle) -> handle | null      (null is "nobody yet")
+//   wait?(ms) -> void                    optional; park until something changes
+// An accepted connection is an ORDINARY handle — send, recv, poll and close
+// already serve it, so nothing new is needed to read or write one. That is the
+// whole reason accept returns a handle rather than some second kind of thing.
+//
+// `wait` is what makes a server possible rather than merely expressible. An
+// accept loop that cannot block spins at full CPU and never yields to the JS
+// that would hand it a connection, so a net without `wait` gets the old
+// behaviour — poll reports readable and lets the caller find out — and one with
+// it parks. Its PRESENCE is the signal, exactly as `recvAsync`'s is, and it
+// carries whileBlocked's contract: what it wakes for, it must have consumed.
+//
+// Absent all three, listen() is ENOTSUP and nothing else changes.
+//
 // `recvAsync` is the same answer `recv` gives, once there is one to give. Where
 // the engine has JSPI and the net offers it, a guest reading a socket suspends
 // instead of owning the thread for the length of a download — which is the same
@@ -107,8 +125,18 @@ const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
+// A struct in_addr, as the guest holds it, back to the dotted quad the net
+// handed out in the first place. NETWORK byte order: the first octet is the
+// lowest address. Shared by connect and listen so the two cannot disagree about
+// which end of the word an address starts at — they did not, and one of them
+// being edited alone is exactly how they would.
+const dottedQuad = (addr) => {
+  const a = addr >>> 0;
+  return `${a & 0xff}.${(a >>> 8) & 0xff}.${(a >>> 16) & 0xff}.${(a >>> 24) & 0xff}`;
+};
+
 const errnoName = (n) => Object.keys(E).find((k) => E[k] === n) || String(n);
-const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70, NOTSOCK:57 };
 const FT = { CHAR:2, DIR:3, REG:4 };
 // FD_SEEK (bit 2) | FD_TELL (bit 5) of the WASI rights word. Their ABSENCE on a
 // character device is how wasi-libc's isatty() recognizes a terminal, so these
@@ -165,7 +193,7 @@ const HOST_LINE_MAX = 1 << 20;
 const HOST_QUEUE_MAX = 1 << 24;
 
 export class WasiShim {
-  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, beforeBlock, input, builtins, host, net, requests, tty=false, suspendable=false, suspendInput=false }) {
+  constructor({ args=['busybox'], env={}, files={}, fs, stdout, stderr, beforeBlock, input, builtins, host, net, onPort, requests, tty=false, suspendable=false, suspendInput=false }) {
     this.args = args;
     this.env = Object.entries(env).map(([k,v]) => `${k}=${v}`);
     this.stdout = stdout || (() => {});
@@ -203,7 +231,25 @@ export class WasiShim {
     //   recv(handle, max)    -> Uint8Array | AGAIN sentinel
     //   poll(handle)         -> { readable, writable, hup }
     //   close(handle)
+    // and, for a guest that is a SERVER rather than a client:
+    //   listen(addr, port)   -> handle            (throws to refuse)
+    //   accept(handle)       -> handle | null
+    //   wait(ms)             -> void              optional; park, don't spin
     this.net = net;
+    // "A hosted application opened a port", and "it gave one back".
+    //
+    // Scoped to THIS SHELL, which is what makes it worth having beside whatever
+    // the net reports. The net is shared — an embedder may hand the same one to
+    // guests that never come through here at all — so its view is the session's
+    // and this one is the shell's. An embedder with a single guest can read
+    // either; one with several wants the net's for the whole picture and this
+    // for "what did the shell start".
+    //
+    // It is emitted here rather than inferred from the net because this is what
+    // mediates every listen and every close for its own guest: a fd table, a
+    // dup, an exit that never closed anything. Absent, nothing is reported and
+    // nothing else changes.
+    this.onPort = typeof onPort === 'function' ? onPort : null;
     // May a host builtin await? Feature-detected rather than trusted, so an
     // embedder that asks for it on an engine without JSPI gets the shell it
     // always had and a clear refusal the first time a handler returns a
@@ -293,6 +339,16 @@ export class WasiShim {
     this.nextFd = 4;
     this.pipes = [];
   }
+  // A port opened or closed. Swallowing a listener's throw is deliberate: this
+  // runs inside a wasm import, and an exception from it would unwind the whole
+  // guest stack — killing the shell over a bad callback in something that is
+  // only watching.
+  emitPort(type, bind){
+    if(!this.onPort || !bind) return;
+    try { this.onPort({ type, address: bind.addr, port: bind.port }); }
+    catch(e) { this.stderr(strBytes(`wasi-sh: a port listener threw: ${(e&&e.message)||e}\n`)); }
+  }
+
   bindMemory(memory){ this.mem = memory; this.refresh(); }
   refresh(){ this.view = new DataView(this.mem.buffer); this.u8 = new Uint8Array(this.mem.buffer); }
   dv(){ if (this.view.buffer !== this.mem.buffer) this.refresh(); return this.view; }
@@ -315,6 +371,16 @@ export class WasiShim {
       proc_exit:(code)=>{
         try { w.store.syncSync(); }
         catch(e) { w.stderr(strBytes(`wasi-sh: flushing the filesystem failed: ${(e&&e.message)||e}\n`)); }
+        // A port outlives nothing. A server that closed its own listening
+        // socket has already been reported; one that died holding it has not,
+        // and leaving that open would leave whoever is watching pointed at a
+        // port with nothing behind it for the rest of the session.
+        for(const f of w.fds.values()){
+          if(!f.listening) continue;
+          if(w.net) { try { w.net.close(f.sock); } catch { /* already gone */ } }
+          f.listening=false;
+          w.emitPort('close',f.bind);
+        }
         throw new WasiExit(code);
       },
       sched_yield:()=>0,
@@ -324,6 +390,10 @@ export class WasiShim {
         return 0; },
       fd_close:(fd)=>{ const f=w.fds.get(fd); w.fds.delete(fd); if(f&&f.type==='pipe') w.gcPipe(f.pipe);
         if(f&&f.type==='sock'&&w.net) { try { w.net.close(f.sock); } catch { /* already gone */ } }
+        // A dup'd listening fd shares this fate, because net.close above
+        // already ended the handle both copies point at — the same thing a
+        // dup'd CONNECTED socket has always done here.
+        if(f&&f.listening) w.emitPort('close',f.bind);
         return 0; },
       // The rights word is where isatty() lives. wasi-libc answers isatty(fd)
       // with "filetype is CHARACTER_DEVICE **and** neither FD_SEEK nor FD_TELL
@@ -375,6 +445,35 @@ export class WasiShim {
         const { data, errno } = w.readFd(fd, bufs.reduce((a,b)=>a+b.length,0), f.nonblock);
         let o=0; for(const b of bufs){ const take=Math.min(b.length,data.length-o); b.set(data.subarray(o,o+take)); o+=take; if(o>=data.length)break; }
         w.dv().setUint32(out,o,true); return errno; },
+      // pread(2): a read at an explicit offset that does not move the
+      // descriptor. Implemented by LENDING readFd the offset and putting the
+      // position back, rather than by a second reader — every rule about an
+      // unlinked file, a store that failed and a short read lives in there,
+      // and a copy of them would drift from it.
+      //
+      // ESPIPE for anything else, as fd_seek says: a pipe, a socket and a
+      // character device have no offset to read at.
+      fd_pread:(fd,iovs,n,off,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF;
+        // `f.device` as well as the type, because a device fd IS type 'file' —
+        // path_open builds it that way so every read reaches readFd. Its
+        // second argument to read() is an owner token and not a position, so a
+        // pread that got this far would ignore the offset and CONSUME input,
+        // answering a read(2) where the guest asked for a pread(2).
+        if(f.type!=='file'||f.device) return E.SPIPE;
+        const bufs=w.iovecs(iovs,n);
+        const p=w.pos(f), was=p.v;
+        p.v=Number(off);
+        const { data, errno } = w.readFd(fd, bufs.reduce((a,b)=>a+b.length,0), f.nonblock);
+        p.v=was;
+        let o=0; for(const b of bufs){ const take=Math.min(b.length,data.length-o); b.set(data.subarray(o,o+take)); o+=take; if(o>=data.length)break; }
+        w.dv().setUint32(out,o,true); return errno; },
+      // A half-close, which this stack cannot express: a connection is one
+      // exchange over a handle the net owns, and there is no direction to shut
+      // down independently. Succeeding is right rather than lenient — a server
+      // that shuts its write side and then closes has said the same thing
+      // twice, and the close is what the net acts on.
+      sock_shutdown:(fd,how)=>{ void how; const f=w.fds.get(fd); if(!f) return E.BADF;
+        return f.type==='sock'?0:E.NOTSOCK; },
       // A failing writeFd used to be impossible past the BADF check, so its
       // return value was dropped. A store can genuinely refuse — read-only,
       // out of space, a revoked directory handle — and reporting those bytes
@@ -494,6 +593,27 @@ export class WasiShim {
       path_readlink:()=>E.INVAL,
       path_symlink:()=>E.NOSYS,
       path_link:()=>E.NOSYS,
+      // The one inbound call preview1 already has a name for, and the reason
+      // accept() is not among the stubs in build/shim/wasistubs.c: wasi-libc
+      // implements accept(2) over THIS (libc-bottom-half/sources/accept-wasip1.c),
+      // so the seam belongs here rather than beside socket() and connect().
+      //
+      // Non-blocking, always. The wait belongs in poll_oneoff, which is where a
+      // guest can also be interrupted; AGAIN is what a listening socket with an
+      // empty queue says, and a guest that polled first never sees it.
+      sock_accept:(fd,flags,out)=>{
+        void flags;   // SOCK_NONBLOCK is the only bit, and this never blocks
+        const f=w.fds.get(fd);
+        if(!f||f.type!=='sock'||!f.listening) return E.BADF;
+        if(!w.net||typeof w.net.accept!=='function') return E.NOSYS;
+        let h;
+        try { h=w.net.accept(f.sock); } catch(e){ return wasiErrno(e); }
+        if(h===null||h===undefined) return E.AGAIN;
+        const n=w.nextFd++;
+        w.fds.set(n,{type:'sock',sock:h});
+        w.dv().setUint32(out,n,true);
+        return 0;
+      },
       poll_oneoff:(subs,events,nsubs,out)=>{
         // Parse subscriptions: a clock (timeout) and/or fd_read events. Events
         // must ECHO the subscription's userdata (WASI matches by it).
@@ -528,8 +648,33 @@ export class WasiShim {
         // Non-stdin read subs (pipes/files) are regular fds -> always readable.
         if(otherRead!==null) emitRead(otherRead);
         if(sockOf){
-          let st;
-          try { st=w.net.poll(sockOf.sock); } catch { st={readable:true}; }
+          const ask=()=>{ try { return w.net.poll(sockOf.sock); } catch { return {readable:true}; } };
+          let st=ask();
+          // A net that can be WAITED on parks here rather than reporting
+          // readable and letting the caller find out. For a connected socket
+          // that was merely tidy; for a LISTENING one it is the difference
+          // between an accept loop that idles and one that spins at full CPU
+          // and never yields to the JS that would hand it a connection.
+          //
+          // Only when this poll has nothing else parkable in it: two parkable
+          // subscriptions would each want the whole wait, which is the same
+          // rule the device branch below states and for the same reason.
+          const canPark=typeof w.net.wait==='function'&&!w.pollAlreadyWaited
+            &&nev===0&&stdinUD===null&&devPoll===null&&timeoutMs!==0;
+          if(canPark&&!st.readable&&!st.hup){
+            if(w.beforeBlock) w.beforeBlock();
+            const deadline=timeoutMs==null?null:Date.now()+timeoutMs;
+            for(;;){
+              // Capped like RingReader._waitFor's, and for its reason: a wait
+              // that can be woken spuriously has to re-ask something, and one
+              // that never returns cannot be cancelled at all.
+              const left=deadline==null?30000:Math.min(deadline-Date.now(),30000);
+              if(left<=0) break;
+              w.net.wait(left);
+              st=ask();
+              if(st.readable||st.hup) break;
+            }
+          }
           // A hangup is readable: the read that follows answers EOF, which is
           // how a caller learns the connection ended rather than waiting on it.
           if(st.readable||st.hup) emitRead(sockUD);
@@ -854,9 +999,34 @@ export class WasiShim {
         __host_sock_connect:(fd,addr,port)=>{
           const f=w.fds.get(fd);
           if(!f||f.type!=='sock'||!w.net) return -1;
-          const a=addr>>>0;
-          const dotted=`${a&0xff}.${(a>>>8)&0xff}.${(a>>>16)&0xff}.${(a>>>24)&0xff}`;
-          try { f.sock=w.net.connect(dotted,port); } catch { return -1; }
+          try { f.sock=w.net.connect(dottedQuad(addr),port); } catch { return -1; }
+          return 0;
+        },
+        // The other direction, and it is two calls because POSIX is: bind(2)
+        // carries the address and listen(2) carries nothing but a backlog. The
+        // address waits HERE, on the fd, rather than in a side table in C —
+        // every other fact about an fd is already in this map, and a second
+        // place to keep one is a second place to lose it.
+        __host_sock_bind:(fd,addr,port)=>{
+          const f=w.fds.get(fd);
+          if(!f||f.type!=='sock'||!w.net) return -1;
+          f.bind={addr:dottedQuad(addr),port};
+          return 0;
+        },
+        // `listening` is recorded on the fd rather than inferred from the
+        // handle, because the two poll DIFFERENTLY — a listening socket is
+        // readable when accept would answer, a connected one when bytes would
+        // — and the net cannot be asked which kind it just handed back.
+        __host_sock_listen:(fd)=>{
+          const f=w.fds.get(fd);
+          if(!f||f.type!=='sock'||!f.bind||!w.net||typeof w.net.listen!=='function') return -1;
+          // A second listen on one fd would strand the first handle with
+          // nothing left pointing at it, so the port stays taken for the life
+          // of the session and no close can ever free it.
+          if(f.sock!==null) return -1;
+          try { f.sock=w.net.listen(f.bind.addr,f.bind.port); } catch { return -1; }
+          f.listening=true;
+          w.emitPort('open',f.bind);
           return 0;
         },
         __host_sock_resolve:(namePtr,outPtr)=>{

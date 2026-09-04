@@ -161,7 +161,7 @@ self.addEventListener('message', async (e) => {
     // arguments. Only the number of MESSAGES changes, and with it the number of
     // tasks the page is given to paint between.
     //
-    // Flushed at four moments, and each covers something the others miss:
+    // Flushed at five moments, and each covers something the others miss:
     //   - before the guest PARKS (shim beforeBlock), because the prompt is the
     //     last thing written before a shell waits for a key. A timer instead
     //     would leave the terminal blank until it fired — and the synchronous
@@ -172,6 +172,13 @@ self.addEventListener('message', async (e) => {
     //   - at a size cap, so `seq 1 100000000` still streams instead of growing
     //     a buffer nobody asked for.
     //   - when the guest exits, for whatever it wrote on the way out.
+    //   - when a host BUILTIN says it is about to block — `flushOutput` on the
+    //     object serve({ ready }) hands over. Neither of the two above covers
+    //     it: the guest is not parking, a builtin is, so beforeBlock never
+    //     fires; and the stack is standing inside that builtin, so no
+    //     microtask will run either. A server started at the prompt is the
+    //     case — it writes a startup line and an access log per request, and
+    //     without this none of it appears until ^C.
     let runs = [];
     let held = 0;
     let scheduled = false;
@@ -221,6 +228,16 @@ self.addEventListener('message', async (e) => {
       // where one reaches an interactive shell. Absent, socket() is
       // EAFNOSUPPORT and nothing else changes.
       net,
+      // "Something this shell hosts opened a port." It travels to the PAGE
+      // rather than to the worker module, because a port is a fact about the
+      // session — what a browser tab does with one (a pane, a link, nothing)
+      // is the page's business, and the worker has no way to know. A worker
+      // that wants it too can read it off the same message.
+      //
+      // Posted unconditionally: the message costs nothing where no guest ever
+      // listens, and gating it on a net that HAS listen() would report nothing
+      // for a net that grew one later.
+      onPort: (event) => { self.postMessage({ type: 'port', event }); },
       // A live channel when the session granted one (spawn), the pre-staged
       // queue otherwise (run). The ring reader serves as-is: the inbound
       // channel is stdin's contract aimed the other way, so there is no
@@ -273,6 +290,19 @@ self.addEventListener('message', async (e) => {
           // asked for — it is read off the net's own shape — so this is the
           // only place an embedder can find out that it got it.
           suspendNet: shim.suspendNet,
+          /**
+           * Post what has been written so far, now.
+           *
+           * For a host builtin that is about to block for a long time on
+           * something of its own — a server waiting for a connection is the
+           * case this exists for. Everything it wrote is sitting in a batch
+           * that nothing else is going to flush: the guest has not parked, so
+           * the shim's beforeBlock has not run, and the stack is still
+           * standing inside the builtin, so the microtask cannot.
+           *
+           * Costs nothing when there is nothing held.
+           */
+          flushOutput: flush,
         });
       } catch (ex) {
         throw new Error(`serve({ ready }): failed: ${(ex && ex.message) || ex}`);

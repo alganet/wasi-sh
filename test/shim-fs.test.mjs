@@ -668,3 +668,57 @@ test('every creation names uid and gid, which ZenFS also requires', () => {
     assert.equal(options.gid, 0, `${path}: gid`);
   }
 });
+
+// ─── fd_pread ────────────────────────────────────────────────────────────────
+
+/** pread at `off`, returning what came back and where the descriptor ended up. */
+function preadFd(t, fd, off, max = 256) {
+  t.view().setUint32(0x300, 0x400, true);
+  t.view().setUint32(0x304, max, true);
+  const errno = t.p1.fd_pread(fd, 0x300, 1, BigInt(off), 0x308);
+  const n = t.view().getUint32(0x308, true);
+  return { errno, text: dec.decode(t.bytes().slice(0x400, 0x400 + n)) };
+}
+
+test('pread reads at the offset it was given', () => {
+  const t = makeShim({ files: { '/f.txt': 'abcdefghij' } });
+  const fd = openPath(t, '/f.txt');
+  assert.deepEqual(preadFd(t, fd, 4, 3), { errno: 0, text: 'efg' });
+});
+
+test('and leaves the descriptor exactly where it found it', () => {
+  // The whole difference between pread(2) and read(2): a seek that is lent and
+  // given back. A pread that moved the position would make the next read of a
+  // file two readers are sharing return the wrong bytes.
+  const t = makeShim({ files: { '/f.txt': 'abcdefghij' } });
+  const fd = openPath(t, '/f.txt');
+  assert.equal(readFd(t, fd, 2).n, 2, 'the position is now 2');
+  preadFd(t, fd, 7, 2);
+  assert.deepEqual(dec.decode(readFd(t, fd, 2).data), 'cd');
+});
+
+test('a pread past the end is short, not an error', () => {
+  const t = makeShim({ files: { '/f.txt': 'abc' } });
+  const fd = openPath(t, '/f.txt');
+  assert.deepEqual(preadFd(t, fd, 99, 4), { errno: 0, text: '' });
+});
+
+test('pread on a character device is ESPIPE, not a read in disguise', () => {
+  // A device fd is type 'file' — path_open builds it that way so every read
+  // reaches readFd — so the type alone does not separate the two. Without the
+  // device check this consumed the queue and answered as if it were a read(2),
+  // which is the one thing pread must never do.
+  const t = makeShim({ requests: { read: () => 'a request line\n' } });
+  const fd = openPath(t, '/dev/hostreq');
+  assert.equal(preadFd(t, fd, 0, 8).errno, 70, 'ESPIPE');
+});
+
+test('and on a pipe, which has no offset either', () => {
+  const t = makeShim({});
+  assert.equal(t.p1.fd_pread(0, 0x300, 1, 0n, 0x308), 70, 'ESPIPE');
+});
+
+test('pread on a descriptor that is not open is EBADF', () => {
+  const t = makeShim({});
+  assert.equal(t.p1.fd_pread(99, 0x300, 1, 0n, 0x308), 8, 'EBADF');
+});
