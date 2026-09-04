@@ -125,6 +125,10 @@ export class Session {
    * The one-byte cell a guest with its own signal handling polls. Crosses
    * postMessage as a live view, so a worker can be handed it and read it while
    * nothing on this thread is running.
+   *
+   * The shell clears it as it dispatches a host builtin, so a ^C raised at an
+   * idle prompt is not inherited by the next command. An embedder that enters
+   * such a guest by another door owns that moment itself.
    */
   signalBuffer(): Uint8Array;
   /** Hard-kill the worker. Settles `exited` (and fires onExit) with 137. */

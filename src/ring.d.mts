@@ -83,6 +83,10 @@ export interface RingInput {
    * points instead of calling `interruptCount()` — CPython's
    * `setInterruptBuffer()` takes it directly. Handed out rather than read here
    * because nothing on this thread runs while the guest does.
+   *
+   * Cleared as each host builtin is dispatched, which is what gives the byte
+   * the freshness the count gets from its baseline: a ^C raised while nothing
+   * was running is not inherited by the next command.
    */
   signalBuffer(): Uint8Array;
 }

@@ -434,5 +434,12 @@ export class RingReader {
   // Emscripten-hosted runtime is for it to hold this view and check it itself.
   // Point CPython's `setInterruptBuffer()` at it and ^C works with no further
   // wiring; a guest that ignores it is exactly as interruptible as before.
+  //
+  // A byte, unlike the count, is CONSUMED — by whoever reads it, whenever they
+  // next look. So the shim clears it as it dispatches a host builtin, which is
+  // what gives it the freshness `interruptCount()` gets from its baseline. An
+  // embedder that enters such a guest by some OTHER door — a request answered
+  // on a message rather than at the prompt — owns that moment and should clear
+  // it there too, or a ^C nobody aimed at the request is read as one.
   signalBuffer() { return this.signal; }
 }

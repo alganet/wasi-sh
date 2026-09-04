@@ -29,6 +29,9 @@ const INTR_READY = () => imported('__host_interrupt');
 // command that is NOT interrupted still ends the test. `deaf` ignores the
 // interrupt entirely and must not be cancelled: interrupts are cooperative, and
 // a transport that could stop work which never opted in would be terminate().
+// `peek` reports what the SIGNAL CELL held the moment it was dispatched — the
+// other half of raise(), which no ctx method exposes because the guests that
+// read it read memory rather than calling anything.
 const TWIN = `
   import { parentPort, workerData } from 'node:worker_threads';
   const { WasiShim, WasiExit } = await import(workerData.shimUrl);
@@ -45,15 +48,19 @@ const TWIN = `
     while (Date.now() - t0 < deadlineMs) { if (ctx && ctx.interrupted()) return 130; }
     return 7;   // "ran to completion" — never the interrupted answer
   };
+  const reader = new RingReader(sab);
   const shim = new WasiShim({
     args, env, files,
     stdout: emit,
     stderr: emit,
-    input: new RingReader(sab).toInput(),
+    input: reader.toInput(),
     builtins: {
-      lookup: (n) => n === 'spin' || n === 'brief' || n === 'deaf',
+      lookup: (n) => n === 'spin' || n === 'brief' || n === 'deaf' || n === 'peek',
       run: (ctx) => {
         const name = ctx.argv[0];
+        // Read FIRST, before anything else this command does: the question is
+        // what the cell held on the way in.
+        if (name === 'peek') { ctx.stdout('sig=' + reader.signalBuffer()[0] + '\\n'); return 0; }
         ctx.stdout(name + ' running\\n');    // the main thread's cue to post
         return until(name === 'deaf' ? null : ctx, name === 'spin' ? 10000 : 500);
       },
@@ -162,6 +169,38 @@ test('an interrupt with nothing running does not cancel the command after it', a
   writer.interrupt();                     // ^C with nothing running
   const m = await exited;
   assert.match(m.out, /rc=7/, 'brief ran to completion; it did not inherit the earlier ^C');
+});
+
+test('an interrupt with nothing running does not arm the command after it', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins — run npm run build:wasm'); return; }
+  // The same invariant as above, for the OTHER half of raise(). The count is a
+  // baseline, so it was always honest; the signal cell is a byte a guest reads
+  // out of memory, and nothing cleared it. So a ^C typed at an idle prompt sat
+  // in the cell until some later command's runtime happened to look — and read
+  // it as its own. Measured in wide: `^C` at the prompt, then `python foo.py`
+  // came straight back with 130 and no output, and the next page the frame
+  // asked for was a 500 with a KeyboardInterrupt in the log.
+  //
+  // `read -t 1` for the reason the count's test uses it: the interrupt lands
+  // while the shell is demonstrably between commands.
+  const { writer, exited, awaitOutput } = spawnTwin('echo mark; read -t 1 _; peek');
+  await awaitOutput(/mark/);
+  writer.interrupt();                     // ^C with nothing running
+  const m = await exited;
+  assert.match(m.out, /sig=0/, 'peek started on a clear cell; it did not inherit the earlier ^C');
+});
+
+test('a signal raised DURING a command still reaches the cell', async (t) => {
+  if (!HOSTB_READY()) { t.skip('dist/busybox.wasm predates host builtins — run npm run build:wasm'); return; }
+  // The clear above must not become a deaf ear. `spin` holds the guest, the ^C
+  // is written while it holds it, and `peek` — dispatched after — is a fresh
+  // command that must see a clear cell again.
+  const { writer, exited, awaitOutput } = spawnTwin('spin; echo "rc=$?"; peek');
+  await awaitOutput(/spin running/);
+  writer.interrupt();
+  const m = await exited;
+  assert.match(m.out, /rc=130/, 'the ^C landed on the command that was running');
+  assert.match(m.out, /sig=0/, 'and was spent there, not left for the next one');
 });
 
 // ---- the applet half: the same count, read by the guest itself -------------

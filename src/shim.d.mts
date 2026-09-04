@@ -33,6 +33,14 @@ export interface ShimInput {
    * Session.interrupt().
    */
   interruptCount?(): number;
+  /**
+   * The one-byte signal cell raise() writes beside the count, for a guest that
+   * polls memory rather than calling anything of ours. Present, the shim clears
+   * it as each host builtin is dispatched — the same fresh start the count gets
+   * from its baseline, so a ^C raised while nothing was running is not read as
+   * the next command's own.
+   */
+  signalBuffer?(): Uint8Array;
 }
 
 /**
