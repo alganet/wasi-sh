@@ -644,6 +644,19 @@ shell itself: a loop written in shell runs no applet, and a command parked in a
 blocking read has no bytes to wake it. `terminate()` is still the answer for
 those two.
 
+**A guest that handles its own signals reads the byte instead.** `interrupt()`
+is `raise(SIGINT)`, and `raise()` writes both halves: the count above, and a
+one-byte cell at `session.signalBuffer()`. That cell exists because nothing on
+your thread runs while such a guest does — CPython under Emscripten checks it at
+the eval-loop safe point it already runs, so
+`pyodide.setInterruptBuffer(session.signalBuffer())` is the whole wiring, and
+one `^C` reaches both kinds of guest. The shell clears the cell as it dispatches
+each command, which is what gives the byte the freshness the count gets from its
+baseline. **If you enter such a guest by some other door** — answering a request
+on a `postMessage` rather than at the prompt — that moment is yours, and it wants
+the same clear: otherwise a `^C` typed at an idle prompt is still sitting there
+when the request arrives, and comes back as its interrupt.
+
 Any other web terminal integrates the same way — see
 `examples/dumb-terminal.html` for a complete session wired to a bare `<pre>`
 and `<input>` with no terminal library at all, and `examples/repl.html` for

@@ -595,6 +595,15 @@ export class WasiShim {
       // inherit somebody else's cancel. An input with no interrupt channel
       // (run(), a fixed stdin) leaves interrupted() permanently false.
       const intr0=(w.input&&w.input.interruptCount)?w.input.interruptCount():null;
+      // The OTHER half of raise() gets the same fresh start, and needs it more.
+      // The count above is baselined; the signal cell is a byte somebody else
+      // reads, and nothing clears it until a guest that polls memory happens to
+      // run. So a ^C at an idle prompt SAT there — and the next Python command,
+      // or the next request the frame made, died of a KeyboardInterrupt nobody
+      // aimed at it. Zeroed here, where the count is baselined, because this is
+      // the same moment: whatever was raised before this command started was
+      // not raised at this command. A ^C during it still writes the byte.
+      if(w.input&&w.input.signalBuffer) w.input.signalBuffer()[0]=0;
       return {
         argv, cwd,
         // The guest's LIVE environ (exports plus this command's VAR=x
