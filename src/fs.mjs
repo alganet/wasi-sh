@@ -1486,19 +1486,23 @@ export async function journalWriter(backing, options = {}) {
 
   // Resizing has to be done by CONTENT, not by metadata, and that is a
   // backend defect rather than a preference. `@zenfs/core`'s `IndexFS.touch`
-  // updates the index inode and nothing else (2.6.3), so a truncate leaves the
-  // real file its old length: within the session the cache agrees with itself,
-  // and the next hydrate rebuilds the index from the file that is actually
-  // there and hands back the OLD BYTES PAST THE NEW END. Measured through
-  // OPFS, on the commonest write a shell makes — `echo x > file` leaves
-  // `x` followed by whatever the file used to say, after a reload.
+  // updates the index inode and nothing else (still 2.7.0), so a truncate
+  // leaves the real file its old length: within the session the cache agrees
+  // with itself, and the next hydrate rebuilds the index from the file that is
+  // actually there and hands back the OLD BYTES PAST THE NEW END. Measured
+  // through OPFS, on the commonest write a shell makes — `echo x > file`
+  // leaves `x` followed by whatever the file used to say, after a reload.
   //
   // So a resize is replayed as an exact rewrite. Removing and recreating is
   // safe HERE and nowhere else: this store is the writer's alone, no guest
   // holds a descriptor on it, and no inode of it is ever observed. The same
   // fix inside `persistentFs` would change an ino under a running shell.
   //
-  // ZENFS.md finding 2. Drop this the day `touch` resizes the data.
+  // ZENFS.md finding 2. Drop this the day `touch` resizes the data — NOT YET.
+  // Finding 2 shipped in 2.6.6 as `StoreFS.touch`, and `IndexFS.touch` is a
+  // different class that still only updates the inode. `WebAccessFS` extends
+  // `Async(IndexFS)`, so the OPFS case measured above is exactly the one the
+  // upstream fix does not reach.
   const applyResize = (path, metadata) => {
     const before = store.statSync(path);
     if (before.size === metadata.size) { store.touchSync(path, metadata); return; }

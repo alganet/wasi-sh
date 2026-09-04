@@ -172,7 +172,7 @@ export function conformanceCases() {
       run(fs, dir) {
         // `echo hi > /some/dir` reaches writeSync with a directory path. A
         // store that takes the bytes does not merely misbehave — @zenfs/core
-        // 2.6.3's InMemory overwrites the directory's own serialized index
+        // 2.7.0's InMemory overwrites the directory's own serialized index
         // with them, after which the directory cannot be listed at all, and a
         // read hands back pieces of that index as if it were file content.
         fs.mkdirSync(dir, NEW_DIR);
