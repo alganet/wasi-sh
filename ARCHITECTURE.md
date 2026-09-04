@@ -820,6 +820,50 @@ notice a request until something else wakes it — which is fine, because a dev
 server is a script, not a prompt. And a blocking verb freezes that guest for its
 duration, inbound or outbound, exactly like a blocking read.
 
+## A prompt that is somebody's dev server anyway (`whileBlocked`)
+
+The paragraph above holds, and there is a case it leaves stranded: a page whose
+shell is *the terminal* — parked on stdin, drawing its own prompt — and whose
+worker also answers a preview frame's fetches and an editor's reads. There is no
+dev-server loop to wake, because the loop is a person typing.
+
+With JSPI it needs nothing from here: `suspendInput` makes the park a
+suspension, the worker's event loop turns underneath it, and a `postMessage` is
+answered while the prompt sits there. Without JSPI the park is `Atomics.wait`
+and owns the thread outright, so the questions are not slow — they are not
+delivered, which is the same wall `/dev/hostreq` was built for, one door along.
+
+`serve({ whileBlocked: { pending, run } })` opens that door, and it is
+deliberately *not* a second request channel. Nothing is delivered to the guest,
+nothing is framed, and no vocabulary is added: the embedder already owns both
+ends of whatever channel it has, and what it lacks is a moment on the thread.
+The hook is that moment.
+
+Three pieces make it correct, and each is somewhere it has to be:
+
+- **`RingWriter.wake()`** — the producer's half. The stdin ring's `seq` word is
+  the only futex a parked guest waits on, so a second channel cannot end that
+  wait for itself. `wake()` bumps `seq` and notifies, changing nothing the guest
+  can read. `session.wake()` is the same thing from the page.
+- **`pending()` inside the wait condition** — `RingReader._park` loads `seq`,
+  *then* evaluates `cond() || pending()`, then waits on the loaded value. That
+  is the ring's existing lost-wakeup protocol, extended to somebody else's
+  channel: work that lands between the check and the wait bumps the word the
+  wait is watching.
+- **`run()` at every entry and every wake** — so nothing sits through a park it
+  arrived before, and a burst is drained in one visit rather than one per
+  wake. It must consume everything `pending()` reports; a leftover turns the
+  park into a spin, at full CPU, under an idle prompt. Nothing here can check
+  that — `pending()` is the embedder's answer — so `serve()` refuses half a hook
+  and the rule is written where both halves are read.
+
+It wraps the three synchronous waits and no others: the untimed poll at a
+prompt, the read behind it, and a bare timeout. The bare timeout keeps its own
+break conditions — a keystroke, EOF, a resize, a ^C — and does **not** add the
+hook's: a request that shortened a `sleep` would be a page turning the guest's
+clock. The suspending twins are untouched, because a suspended guest has already
+handed the thread back and needs no help getting off it.
+
 ## Build recipe (`build/build.sh`)
 
 Pinned busybox tarball (SHA-256-verified) + the fork-free patch + the

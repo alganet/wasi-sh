@@ -59,6 +59,7 @@ session.write('echo hi\n');                          // you → shell
 session.resize(100, 40);  // terminal resized: live size + a synthesized SIGWINCH
 session.post('GET /');// a host request → the running guest (needs requestBufferSize)
 session.interrupt();  // cooperative ^C into whatever is running
+session.wake();       // end the guest's park so the WORKER can do work of its own
 session.end();        // stdin EOF
 session.terminate();  // hard kill (exited resolves 137, kill -9 style)
 await session.exited; // exit code — always settles, even after terminate()
@@ -1064,6 +1065,53 @@ await run({ inline: true, script, requests: ['GET /a.php', 'GET /b.php'] });
 the guest is a wasm frame below the call. Familiar from any blocking read, and
 worth knowing before a verb does something slow.
 
+### And the case that is neither: a guest at a prompt
+
+`/dev/hostreq` reaches a guest that is *waiting to be told* — a dev-server loop
+parked on the channel. A shell at an interactive prompt is not that guest. It is
+parked on **stdin**, waiting for a key, and it will not look at a request
+channel until somebody types.
+
+With JSPI that is not a problem: `suspendInput` hands the thread back between
+keystrokes, the worker's event loop turns, and an ordinary `postMessage` is
+answered while the prompt sits there. Without JSPI the park owns the thread, and
+`serve({ whileBlocked })` is the way in — the worker's own work, done inside the
+guest's wait:
+
+```js
+// my-worker.mjs — a second channel, answered while the shell waits for a key
+serve({
+  whileBlocked: {
+    pending: () => requests.readable,     // the wake condition
+    run: () => { for (const req of drain()) answer(req); },
+  },
+});
+```
+
+```js
+// the page: fill the channel, then end the park
+requests.write(frame(req));               // a ring of your own (wasi-sh/ring)
+session.wake();                           // not a keystroke: nothing to read changed
+```
+
+`pending()` is re-checked under the ring's own sequence protocol, so a request
+that lands between the check and the park bumps the word the park is watching
+and is answered rather than missed. **`run()` must consume everything
+`pending()` reports** — one left behind means the next park returns immediately,
+for ever, at full CPU under an idle prompt.
+
+It wraps the three synchronous waits and nothing else: the untimed poll at a
+prompt, the read behind it, and a bare timeout. A `read -t 1` interrupted this
+way still runs its full second — the work happens inside the wait, and the wait
+is what the guest asked for. The suspending twins are untouched, because a
+suspended guest has already given the thread back.
+
+Two limits worth knowing. A guest that is **running** — a command, a blocking
+verb, a synchronous socket read — is not parked, so the hook is not called until
+it next waits. And this is the whole of what it does: it does not make the guest
+answer anything. The work is the worker's, on the guest's thread, between two of
+its instructions.
+
 Working example, both directions:
 [`examples/host-port.html`](examples/host-port.html) and its
 [worker](examples/host-port.worker.mjs) — a dev server that is a shell loop,
@@ -1161,7 +1209,7 @@ the same six methods.
 | `wasi-sh/fs` | `memoryFs`, `persistentFs`, `indexedDbFlushPoint`, `journalFs`/`journalWriter` and the `fs` contract — the filesystem, pluggable |
 | `wasi-sh/fs/conformance` | `conformanceCases`, `checkConformance` — prove your own store |
 | `wasi-sh/files` | `fetchTree` — mount remote file trees |
-| `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register builtins, a store, a host port |
+| `wasi-sh/worker` | the Worker entry (reference by URL); `serve` to register builtins, a store, a host port, a net, or `whileBlocked` |
 | `wasi-sh/busybox.wasm` | the shell binary |
 
 **Shared options** (`run` and `spawn`): `wasm` (URL \| string \| `Response` \|
