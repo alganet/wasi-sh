@@ -22,10 +22,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 24 rather than 22, and the reason is `--experimental-wasm-jspi` below:
+      # it is a V8 flag, added in V8 12.9, and node 22 ships 12.4 — which does
+      # not merely lack the flag, it rejects it and the run ends. The suites
+      # that do not need it still run on 22, in the job below.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -105,6 +109,11 @@ jobs:
       # suite needing the dev dependency is missing from the line that names
       # them. The comment this replaces said the suite was complete on its own
       # terms and was wrong by 815 lines.
+      #
+      # `npm test` carries `--experimental-wasm-jspi`. Without it fifteen cases
+      # skip themselves saying so — the whole of suspend.test.mjs and
+      # suspend-input.test.mjs, which is the option `suspendable` and
+      # `suspendInput` are, and which had therefore never run in CI.
       - name: Test
         run: npm test
 
