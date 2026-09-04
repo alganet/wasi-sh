@@ -265,7 +265,23 @@ int __wrap_poll(struct pollfd *f, nfds_t n, int timeout){
     int e = errno;                  /* read it BEFORE the dispatch: the handler
                                      * we are about to call is arbitrary code. */
     int delivered = winch_dispatch();
-    errno = e;
+    /* Restore only what a FAILING poll reported, and say nothing after a
+     * successful one.
+     *
+     * errno is undefined after success, so this used to hand back whatever was
+     * already in it — and after a resize that is EINTR, left there by the poll
+     * the resize interrupted. libbb's lineedit_read_key CHECKS it after a
+     * successful read:
+     *
+     *     ic = read_key(...);
+     *     if (errno != EINTR) break;      // otherwise: read another key
+     *
+     * so a key read cleanly was thrown away and the loop asked for the next
+     * one. Measured: every terminal resize ate the keystroke that followed it,
+     * and a page that resizes at startup ate the first key of the session.
+     * Zero is what read_key's own callers are promised ("read_key sets errno to
+     * 0 on success") and what this now keeps true through the wrapper. */
+    errno = (r < 0) ? e : 0;
     if (r >= 0 || e != EINTR) return r;
     /* EINTR with a handler served: the caller wanted to know. Interactive line
      * editing retries and keeps its half-typed line; `read` reports failure,
